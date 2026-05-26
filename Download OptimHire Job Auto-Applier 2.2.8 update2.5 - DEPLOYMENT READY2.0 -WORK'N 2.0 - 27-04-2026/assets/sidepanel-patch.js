@@ -567,18 +567,40 @@
     }, (AUTO_SKIP_MAX + 1) * 1000);
   }
 
+  /* Per-job countdown rescale. Background ticks autoSkipSeconds from
+     ~180 down to 0 each second; flat-clamping every tick to
+     AUTO_SKIP_MAX would show "15" frozen for ~165s before it
+     actually started decrementing. Instead we track the moment we
+     first saw a >MAX value for each job and serve a real local
+     countdown from AUTO_SKIP_MAX → 0. */
+  var _countdownStartByJob = Object.create(null); // jobKey → start ts (ms)
+
+  function rescaleAutoSkip(msg) {
+    var jobKey = String(msg.url || msg.jobUrl || msg.jobId || msg.id || 'cur');
+    var now = Date.now();
+    if (!_countdownStartByJob[jobKey]) _countdownStartByJob[jobKey] = now;
+    var elapsed = (now - _countdownStartByJob[jobKey]) / 1000;
+    return Math.max(0, Math.round(AUTO_SKIP_MAX - elapsed));
+  }
+
   (function patchOnMessage() {
     const _origAddListener = chrome.runtime.onMessage.addListener.bind(chrome.runtime.onMessage);
     chrome.runtime.onMessage.addListener = function (listener) {
       return _origAddListener(function (msg, sender, sendResponse) {
         if (msg && msg.type === 'AUTO_APPLY_STATE_UPDATE' &&
-            typeof msg.autoSkipSeconds === 'number' &&
-            msg.autoSkipSeconds > AUTO_SKIP_MAX) {
-          if (!isSubmitSuppressed()) {
-            var jobKey = (msg.url || msg.jobUrl || '') + '_' + msg.autoSkipSeconds;
-            scheduleForceSkip(jobKey);
+            typeof msg.autoSkipSeconds === 'number') {
+          if (msg.autoSkipSeconds > AUTO_SKIP_MAX) {
+            if (!isSubmitSuppressed()) {
+              var jobKey = String(msg.url || msg.jobUrl || msg.jobId || msg.id || 'cur');
+              scheduleForceSkip(jobKey);
+            }
+            msg = Object.assign({}, msg, { autoSkipSeconds: rescaleAutoSkip(msg) });
+          } else {
+            /* Value already within cap — clear our local tracking so
+               the next re-trigger restarts from MAX. */
+            var jk = String(msg.url || msg.jobUrl || msg.jobId || msg.id || 'cur');
+            delete _countdownStartByJob[jk];
           }
-          msg = Object.assign({}, msg, { autoSkipSeconds: AUTO_SKIP_MAX });
         }
         return listener(msg, sender, sendResponse);
       });
