@@ -183,30 +183,38 @@
     (document.head || document.documentElement).appendChild(style);
   } catch (_) {}
 
-  /* Hide-by-text: find elements whose OWN text (not descendants')
-     matches one of these phrases, then hide a narrow ancestor.
-     Walk-up is bounded to 4 levels AND requires the ancestor's
-     total text length stay small (< 350 chars) so we never hide
-     the whole page. */
+  /* Hide-by-text patterns. Two passes per element:
+       (a) ownText (direct text-node children only) — most precise,
+           used for short labels and CTAs.
+       (b) textContent (including descendants) — needed when the
+           bundle wraps the variable parts (20, $10, plan name) in
+           child <span>/<strong> nodes, so ownText is missing them.
+     Both passes use the same bounded-walk-up rules so we never
+     hide the React root. */
   var HIDE_TEXT_PATTERNS = [
     'Get unlimited Credits',
     'AI cover letter & more',
     'Earn While You Search',
     'Help your friends avoid applying',
-    'Get 20 Auto-fill Credits',
-    'for each referral who upgrades',
+    'Auto-fill Credits for every signup',
+    'referral who upgrades to premium',
+    'referral who upgrades',
     'One Referral 3 Benefits',
     'Refer your friend to get',
     'commission on hire',
     /* 2.6.0 limit / upgrade banners in the sidepanel */
     'Upgrade to get Unlimited Credits',
     'Upgrade to get unlimited credits',
-    'You will get 3 free Credits daily',
+    'free Credits daily',
     'Auto-fill Credits left today',
     'matching jobs by manually filling',
     'Start Applying Manually',
     'You can still apply to',
-    'Upgrade and save countless hours'
+    'Upgrade and save countless hours',
+    /* Resume-fetch error message — smart-quote variant in bundle */
+    "couldn’t fetch details for this resume",
+    "couldn't fetch details for this resume",
+    'fetch details for this resume right now'
   ];
 
   function ownText(el) {
@@ -264,14 +272,37 @@
 
   function hideMatching() {
     try {
-      var nodes = document.querySelectorAll('h1,h2,h3,h4,p,span,div,a,button');
+      var nodes = document.querySelectorAll('h1,h2,h3,h4,p,li,span,div,a,button');
       for (var i = 0; i < nodes.length; i++) {
         var el = nodes[i];
         if (!el || (el.dataset && el.dataset.ohHidden === '1')) continue;
+        var matched = false;
+        /* Pass 1: ownText (direct text-node children) — fastest, most
+           precise, catches plain labels. */
         var t = ownText(el).trim();
-        if (!t || t.length > 200) continue;
-        for (var j = 0; j < HIDE_TEXT_PATTERNS.length; j++) {
-          if (t.indexOf(HIDE_TEXT_PATTERNS[j]) !== -1) {
+        if (t && t.length <= 200) {
+          for (var j = 0; j < HIDE_TEXT_PATTERNS.length; j++) {
+            if (t.indexOf(HIDE_TEXT_PATTERNS[j]) !== -1) {
+              safeHide(pickAncestorToHide(el));
+              matched = true;
+              break;
+            }
+          }
+        }
+        if (matched) continue;
+        /* Pass 2: textContent (includes child spans) — needed when
+           bundle wraps variable text like "Get [20] Auto-fill
+           Credits" with the number in a child span. Bounded length
+           so we never match a huge container. */
+        var tc = (el.textContent || '').replace(/\s+/g, ' ').trim();
+        if (!tc || tc.length > 300) continue;
+        /* Only check on elements that look like leaf-ish containers
+           (≤ 3 child elements or a list item) to avoid matching a
+           whole sidebar that happens to contain a pattern. */
+        var childElems = el.children ? el.children.length : 0;
+        if (childElems > 3 && el.tagName !== 'LI' && el.tagName !== 'P') continue;
+        for (var k = 0; k < HIDE_TEXT_PATTERNS.length; k++) {
+          if (tc.indexOf(HIDE_TEXT_PATTERNS[k]) !== -1) {
             safeHide(pickAncestorToHide(el));
             break;
           }

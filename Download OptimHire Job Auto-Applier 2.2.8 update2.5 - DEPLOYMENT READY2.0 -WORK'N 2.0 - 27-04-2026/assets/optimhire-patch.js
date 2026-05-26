@@ -628,26 +628,31 @@
       'commission on hire',
       'Earn While You Search',
       'Help your friends avoid applying',
-      'Get 20 Auto-fill Credits',
-      'for each referral who upgrades',
+      'Auto-fill Credits for every signup',
+      'referral who upgrades to premium',
+      'referral who upgrades',
       'One Referral 3 Benefits',
       'Start Earning Now',
       /* 2.6.0 upgrade-modal / limit-reached strings */
       'Upgrade to get Unlimited Credits',
       'Upgrade to get unlimited credits',
       'Upgrade and save countless hours',
-      'You will get 3 free Credits daily',
+      'free Credits daily',
       'Auto-fill Credits left today',
       'matching jobs by manually filling',
       'Start Applying Manually',
-      '3 Days Unlimited Subscription',
-      '1 Month Unlimited Subscription',
-      '3 Months Unlimited Subscription',
+      'Days Unlimited Subscription',
+      'Month Unlimited Subscription',
+      'Months Unlimited Subscription',
       'Apply to Unlimited Jobs',
       'No Premium Benefits',
       'Get unlimited Credits',
       'AI cover letter & more',
       'AI Powered Automated Job Apply',
+      /* Resume-fetch error message */
+      'couldn’t fetch details for this resume',
+      "couldn't fetch details for this resume",
+      'fetch details for this resume right now',
     ];
 
     /* Auto-click "Continue with Free" to dismiss the upgrade pricing
@@ -696,14 +701,37 @@
 
     function tick() {
       try {
-        const nodes = document.querySelectorAll('h1,h2,h3,h4,p,span,div,a,button');
+        const nodes = document.querySelectorAll('h1,h2,h3,h4,p,li,span,div,a,button');
         for (let i = 0; i < nodes.length; i++) {
           const el = nodes[i];
           if (!el || (el.dataset && el.dataset.ohHidden === '1')) continue;
+          let matched = false;
+          /* Pass 1: ownText — fastest, catches plain labels */
           const t = ownText(el).trim();
-          if (!t || t.length > 250) continue;
-          for (let j = 0; j < HIDE_PATTERNS.length; j++) {
-            if (t.indexOf(HIDE_PATTERNS[j]) !== -1) {
+          if (t && t.length <= 250) {
+            for (let j = 0; j < HIDE_PATTERNS.length; j++) {
+              if (t.indexOf(HIDE_PATTERNS[j]) !== -1) {
+                const target = pickAncestor(el);
+                if (target) {
+                  target.style.setProperty('display', 'none', 'important');
+                  if (target.dataset) target.dataset.ohHidden = '1';
+                }
+                matched = true;
+                break;
+              }
+            }
+          }
+          if (matched) continue;
+          /* Pass 2: textContent for elements that wrap variable
+             text (numbers, plan name) in child spans. Constrained
+             to small leaf-ish containers so we never match a huge
+             ancestor that happens to contain a pattern. */
+          const tc = (el.textContent || '').replace(/\s+/g, ' ').trim();
+          if (!tc || tc.length > 350) continue;
+          const childElems = el.children ? el.children.length : 0;
+          if (childElems > 3 && el.tagName !== 'LI' && el.tagName !== 'P') continue;
+          for (let k = 0; k < HIDE_PATTERNS.length; k++) {
+            if (tc.indexOf(HIDE_PATTERNS[k]) !== -1) {
               const target = pickAncestor(el);
               if (target) {
                 target.style.setProperty('display', 'none', 'important');
