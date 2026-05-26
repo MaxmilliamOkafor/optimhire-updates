@@ -2474,11 +2474,17 @@
     const _dismissedFingerprints = new Set();
 
     /* Track when _fillActive transitions true → false without touching
-       the existing transition points (those live in several functions). */
+       the existing transition points. _everFilledOnThisUrl flips true
+       only AFTER a real fill pass completes — gates T41/T43 so they
+       never click Next/Submit on a page autofill never analysed. */
     let _wasFilling = false;
-    let _lastFillCompletedTs = Date.now();
+    let _lastFillCompletedTs = 0;
+    let _everFilledOnThisUrl = false;
     setInterval(() => {
-      if (_wasFilling && !_fillActive) _lastFillCompletedTs = Date.now();
+      if (_wasFilling && !_fillActive) {
+        _lastFillCompletedTs = Date.now();
+        _everFilledOnThisUrl = true;
+      }
       _wasFilling = _fillActive;
     }, 200);
 
@@ -2490,7 +2496,37 @@
 
     function fillStable() {
       if (_fillActive) return false;
+      if (!_everFilledOnThisUrl) return false; // no fill ever happened here
       if (Date.now() - _lastFillCompletedTs < SETTLE_MS) return false;
+      return true;
+    }
+
+    /* Are all visible REQUIRED fields filled? Used to gate T41/T43 so
+       we never advance/submit past a half-filled form even if fill
+       reported completion. */
+    function requiredFieldsSatisfied() {
+      const reqs = $$(
+        'input[required]:not([type=hidden]):not([type=submit]):not([type=button]),' +
+        'input[aria-required="true"]:not([type=hidden]):not([type=submit]):not([type=button]),' +
+        'textarea[required],textarea[aria-required="true"],' +
+        'select[required],select[aria-required="true"]'
+      ).filter(isVisible);
+      for (const el of reqs) {
+        if (el.type === 'checkbox' || el.type === 'radio') {
+          /* For groups, check that at least one member of the same name
+             is checked; that's good enough for required radio groups. */
+          if (el.type === 'radio' && el.name) {
+            const group = document.getElementsByName(el.name);
+            if (![...group].some(r => r.checked)) return false;
+          } else if (el.type === 'checkbox' && !el.checked) {
+            return false;
+          }
+        } else if (el.tagName === 'SELECT') {
+          if (!el.value) return false;
+        } else if (!el.value || !el.value.trim()) {
+          return false;
+        }
+      }
       return true;
     }
 
@@ -2534,6 +2570,12 @@
     async function tickAdvance() {
       if (!await automationActive()) return;
       if (!fillStable() || submitSuppressed()) return;
+      /* Don't advance unless every visible required field on this step
+         is filled — preserves the analyse-and-fill behaviour that was
+         working before. The advance click here is a navigation aid for
+         AFTER autofill succeeded, never a way to skip past empty
+         required fields. */
+      if (!requiredFieldsSatisfied()) return;
 
       /* Don't advance if the page is still showing validation errors */
       const hasErrors = !!document.querySelector(
@@ -2625,13 +2667,49 @@
       try { realClick(btn); } catch (_) { try { btn.click(); } catch (__) {} }
     }
 
-    /* URL-change resets the fingerprint cache so the next step is
-       eligible for advance/dismiss/submit again. */
+    /* ── T44: Missing-required-fields skip ──
+       If autofill ran but required fields are STILL not satisfied,
+       OptimHire's overlay shows "Please fill the missing details and
+       submit the form" with a 15-second countdown. The countdown does
+       fire skipCurrent on its own timer in sidepanel-patch.js, but on
+       sites where autofill genuinely cannot fill a field (uncommon
+       knockout question with no profile data, etc.) we don't need to
+       wait the full window — fire the skip MISSING_SKIP_MS after fill
+       completes if required-fields-satisfied is still false. */
+    const MISSING_SKIP_MS = 6_000;
+    let _missingSkipFiredForUrl = '';
+    async function tickMissingSkip() {
+      if (!await automationActive()) return;
+      if (_fillActive) return;
+      if (!_everFilledOnThisUrl) return;
+      if (submitSuppressed()) return;
+      if (_missingSkipFiredForUrl === location.href) return;
+      /* Only if fill has been stable for long enough AND required
+         fields are still not satisfied AND there ARE required fields
+         (so we don't fire on empty pages or pages with no form). */
+      if (Date.now() - _lastFillCompletedTs < MISSING_SKIP_MS) return;
+      const reqCount = $$(
+        'input[required]:not([type=hidden]),input[aria-required="true"]:not([type=hidden]),' +
+        'textarea[required],textarea[aria-required="true"],' +
+        'select[required],select[aria-required="true"]'
+      ).filter(isVisible).length;
+      if (reqCount === 0) return;
+      if (requiredFieldsSatisfied()) return;
+      _missingSkipFiredForUrl = location.href;
+      LOG(`Flow: missing required fields ${MISSING_SKIP_MS/1000}s after fill — skipCurrent`);
+      try { chrome.runtime.sendMessage({ action: 'skipCurrent' }).catch(() => {}); }
+      catch (_) {}
+    }
+
+    /* URL-change resets the fingerprint cache, the per-URL fill flag,
+       and the missing-skip flag so the next step is eligible again. */
     let _lastUrl = location.href;
     setInterval(() => {
       if (location.href !== _lastUrl) {
         _lastUrl = location.href;
         _dismissedFingerprints.clear();
+        _everFilledOnThisUrl = false;
+        _missingSkipFiredForUrl = '';
       }
     }, 500);
 
@@ -2639,6 +2717,7 @@
       tickAdvance().catch(() => {});
       tickAlreadyApplied().catch(() => {});
       tickGenericSubmit().catch(() => {});
+      tickMissingSkip().catch(() => {});
     }, POLL_MS);
 
     function startObs() {
