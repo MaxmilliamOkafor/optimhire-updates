@@ -2155,12 +2155,15 @@
    * generation finishes), then click via realClick().
    * ─────────────────────────────────────────────────────────────────────── */
   (function installAutoActionClickers() {
-    /* User has a 2000+ queue — every saved second matters. STABLE_MS is
-       the gap we wait AFTER "Generating..." disappears (i.e. button is
-       visible AND enabled AND not in a generating state) before
-       clicking. 1.5s is enough for React to paint the final content. */
-    const STABLE_MS    = 1_500;
-    const POLL_MS      =   300;   // tight poll cadence
+    /* High-throughput tuning: by the time React has painted the
+       Save & Next / Apply Now button as visible+enabled in the
+       main page, the content is ready. The "Generating..." text
+       lives in the sidepanel (separate extension context), not
+       in the main page DOM, so we just need a tiny stability
+       window so we're not clicking a button that's about to flip
+       to disabled. */
+    const STABLE_MS    =   400;
+    const POLL_MS      =   200;
     const _clicked     = new WeakSet();
     const _firstSeenAt = new WeakMap();
 
