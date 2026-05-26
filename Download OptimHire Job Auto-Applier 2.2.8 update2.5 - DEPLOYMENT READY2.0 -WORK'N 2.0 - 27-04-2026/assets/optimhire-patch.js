@@ -2506,9 +2506,19 @@
        only AFTER the server-side resume / cover-letter generation
        completes, and the visible+enabled check below guarantees
        React has the button ready. So we click on the FIRST sight
-       with no stability window — saves ~50–100ms per button. */
-    const POLL_MS      =    50;
-    const _clicked     = new WeakSet();
+       — saves ~50–100ms per button compared to a stability window.
+
+       Caveat: when navigation between jobs is too fast, the
+       resume-fetch API for the new page can race with the
+       previous page's submit and return "couldn't fetch details
+       for this resume right now". A per-URL minimum wait of
+       PAGE_SETTLE_MS gives the fetch a chance to complete (or
+       definitively fail, which we then handle with "Use My
+       Original Resume") before we click anything. */
+    const POLL_MS        =    50;
+    const PAGE_SETTLE_MS = 2_000;
+    const _clicked       = new WeakSet();
+    const _pageEnteredAt = new Map(); // url → ts(ms) of first sight
 
     function looksGenerating(root) {
       const t = (root && root.textContent) || '';
@@ -2555,15 +2565,72 @@
       try { realClick(btn); } catch (_) { try { btn.click(); } catch (__) {} }
     }
 
-    /* T39 — Save & Next →  (only on optimhire.com resume editor) */
+    /* Detect "We couldn't fetch details for this resume right now"
+       error state — both smart-quote (U+2019) and ASCII variants. */
+    const FETCH_FAILED_RE = /couldn[’']?t\s+fetch\s+details\s+for\s+this\s+(resume|cover\s*letter)|fetch\s+details\s+for\s+this\s+(resume|cover\s*letter)\s+right\s+now/i;
+    function fetchFailed() {
+      const t = (document.body && document.body.innerText) || '';
+      return FETCH_FAILED_RE.test(t.slice(0, 8000));
+    }
+
+    /* Per-URL settle gate. The first time we see a given URL, record
+       a timestamp; auto-clickers refuse to fire until PAGE_SETTLE_MS
+       has elapsed since then. This prevents racing the resume-fetch
+       API on rapid job transitions. If the page has visibly errored
+       out (fetchFailed) we skip the gate so "Use My Original Resume"
+       fires immediately. */
+    function pageSettled() {
+      const url = location.href;
+      const now = Date.now();
+      if (!_pageEnteredAt.has(url)) {
+        _pageEnteredAt.set(url, now);
+        /* Cap the map size at 50 entries (FIFO) so it doesn't grow
+           unbounded over a long-running queue. */
+        if (_pageEnteredAt.size > 50) {
+          const firstKey = _pageEnteredAt.keys().next().value;
+          _pageEnteredAt.delete(firstKey);
+        }
+        return false;
+      }
+      return now - _pageEnteredAt.get(url) >= PAGE_SETTLE_MS;
+    }
+
+    /* T39 — Save & Next →  (only on optimhire.com resume editor)
+       If resume fetch failed and "Use My Original Resume" link is
+       present, click that instead — falls back to the user's
+       uploaded CV. Saves the application from breaking on a
+       server-side resume-generation outage. Otherwise click Save
+       & Next normally. */
     async function tickSaveNext() {
       if (!/optimhire\.com$/i.test(location.hostname) &&
           !/\.optimhire\.com$/i.test(location.hostname)) return;
+      if (!(await automationActive())) return;
+
+      /* If the page has already errored out, skip the settle wait
+         and fall back to the user's original resume immediately. */
+      if (fetchFailed()) {
+        const orig = findBtn(/^Use\s+My\s+Original\s+Resume$/i);
+        if (orig) {
+          _clicked.add(orig);
+          LOG('Resume fetch failed — clicking Use My Original Resume');
+          try { realClick(orig); } catch (_) { try { orig.click(); } catch (__) {} }
+          return;
+        }
+      }
+
+      /* Otherwise wait until the page has been around long enough
+         that the resume-fetch has had a chance to complete. */
+      if (!pageSettled()) return;
+
       await maybeClick(/^Save\s*&\s*Next(\s*[→>›])?$/i, 'Save & Next →');
     }
 
-    /* T40 — Apply Now  (any URL with the cover-letter modal) */
+    /* T40 — Apply Now  (any URL with the cover-letter modal)
+       Cover letter is optional on most ATSes, but we still wait
+       for the page to settle so the generation API isn't raced. */
     async function tickApplyNow() {
+      if (!(await automationActive())) return;
+      if (!pageSettled()) return;
       await maybeClick(/^Apply\s*Now$/i, 'Apply Now');
     }
 
