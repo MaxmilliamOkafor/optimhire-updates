@@ -648,20 +648,87 @@
 
   /* ── Field label extraction ──────────────────────────────── */
   function getLabel(el) {
-    if (el.getAttribute('aria-label')) return el.getAttribute('aria-label');
+    if (!el) return '';
+    /* 1) aria-label — explicit author-provided label */
+    const aria = el.getAttribute('aria-label');
+    if (aria && aria.trim()) return aria.trim();
+
+    /* 2) aria-labelledby — id-reference label, common on accessible forms */
+    const lbId = el.getAttribute('aria-labelledby');
+    if (lbId) {
+      const parts = lbId.split(/\s+/).map(id => {
+        const node = document.getElementById(id);
+        return node ? node.textContent.trim() : '';
+      }).filter(Boolean);
+      if (parts.length) return parts.join(' ');
+    }
+
+    /* 3) Wrapping <label> element */
+    const wrappingLabel = el.closest && el.closest('label');
+    if (wrappingLabel) {
+      const txt = wrappingLabel.cloneNode(true);
+      /* Strip the input's own text from the clone before extracting */
+      txt.querySelectorAll('input,textarea,select').forEach(n => n.remove());
+      const s = txt.textContent.trim();
+      if (s) return s;
+    }
+
+    /* 4) <label for="id"> */
     if (el.id) {
       const lbl = document.querySelector(`label[for="${CSS.escape(el.id)}"]`);
-      if (lbl) return lbl.textContent.trim();
+      if (lbl && lbl.textContent.trim()) return lbl.textContent.trim();
     }
-    if (el.placeholder) return el.placeholder;
+
+    /* 5) Surrounding fieldset legend (radio/checkbox groups) */
+    const fieldset = el.closest && el.closest('fieldset');
+    if (fieldset) {
+      const legend = fieldset.querySelector(':scope > legend');
+      if (legend && legend.textContent.trim()) return legend.textContent.trim();
+    }
+
+    /* 6) Container with explicit label child */
     const container = el.closest(
-      '.form-group,.field,.question,[class*="Field"],[class*="Question"],[class*="form-row"]'
+      '.form-group,.field,.question,[class*="Field"],[class*="Question"],' +
+      '[class*="form-row"],[class*="FormRow"],[class*="form-item"],' +
+      '[class*="FormItem"],[class*="form-field"],[class*="FormField"],' +
+      '[role="group"]'
     );
     if (container) {
       const lbl = container.querySelector('label,[class*="label"],[class*="Label"]');
-      if (lbl && lbl !== el) return lbl.textContent.trim();
+      if (lbl && lbl !== el && lbl.textContent.trim()) return lbl.textContent.trim();
     }
-    return el.name?.replace(/[_\-]/g, ' ') || '';
+
+    /* 7) Preceding-sibling label-ish element (legend-style custom forms) */
+    let sib = el.previousElementSibling;
+    for (let i = 0; i < 3 && sib; i++) {
+      if (/^(LABEL|LEGEND|H1|H2|H3|H4|H5|H6|P|SPAN|DIV)$/i.test(sib.tagName)) {
+        const t = (sib.textContent || '').trim();
+        if (t && t.length < 200) return t;
+      }
+      sib = sib.previousElementSibling;
+    }
+
+    /* 8) Parent's first text node (e.g. <div>Label <input/></div>) */
+    const parent = el.parentElement;
+    if (parent) {
+      for (const child of parent.childNodes) {
+        if (child === el) break;
+        if (child.nodeType === 3) {
+          const t = child.nodeValue.trim();
+          if (t && t.length < 200) return t;
+        } else if (child.nodeType === 1 &&
+                   /^(LABEL|SPAN|STRONG|B|H1|H2|H3|H4|H5|H6|P)$/i.test(child.tagName)) {
+          const t = child.textContent.trim();
+          if (t && t.length < 200) return t;
+        }
+      }
+    }
+
+    /* 9) Placeholder (worse than a real label — last resort) */
+    if (el.placeholder) return el.placeholder;
+
+    /* 10) name attribute, de-snake-cased */
+    return (el.name || '').replace(/[_\-]+/g, ' ').trim();
   }
 
   /* ── Smart value guesser ─────────────────────────────────── */
@@ -1574,7 +1641,7 @@
    */
   function bestSelectOption(sel, target, labelHint = '') {
     if (!target) return null;
-    const t = target.toLowerCase();
+    const t = String(target).toLowerCase();
     const opts = $$('option', sel).filter(o => o.value && o.value !== '');
     const exact   = opts.find(o => o.text.toLowerCase() === t);
     if (exact) return exact;
@@ -1582,7 +1649,60 @@
     if (starts) return starts;
     const contains = opts.find(o => o.text.toLowerCase().includes(t) || t.includes(o.text.toLowerCase()));
     if (contains) return contains;
-    // T32: Notice-period / time-duration smart-match by parsed days.
+
+    /* Numeric-range smart-match: when the target is purely numeric (e.g.
+       "7" for years of experience or "80000" for salary), find the option
+       whose range CONTAINS the number — covers "5-10 years", "5 to 10",
+       "5+ years", "Over 5 years", "Less than 10 years", etc. */
+    const num = parseFloat(t);
+    if (!isNaN(num)) {
+      let bestOpt = null;
+      let bestSpan = Infinity;
+      for (const o of opts) {
+        const txt = o.text.toLowerCase();
+        /* "X - Y" / "X to Y" / "X – Y" */
+        const range = txt.match(/(\d+(?:\.\d+)?)\s*(?:-|to|–|—)\s*(\d+(?:\.\d+)?)/);
+        if (range) {
+          const lo = parseFloat(range[1]); const hi = parseFloat(range[2]);
+          if (num >= lo && num <= hi) {
+            const span = hi - lo;
+            if (span < bestSpan) { bestOpt = o; bestSpan = span; }
+          }
+          continue;
+        }
+        /* "X+" / "Over X" / "More than X" / "At least X" */
+        const overM = txt.match(/(?:over|more\s*than|at\s*least|>=?|>\s*=?\s*)\s*(\d+(?:\.\d+)?)|(\d+(?:\.\d+)?)\s*\+/);
+        if (overM) {
+          const lo = parseFloat(overM[1] || overM[2]);
+          if (num >= lo) {
+            /* prefer the tightest "over X" — biggest X that still ≤ num */
+            const span = num - lo + 1;
+            if (span < bestSpan) { bestOpt = o; bestSpan = span; }
+          }
+          continue;
+        }
+        /* "Less than X" / "Under X" / "Up to X" / "<= X" */
+        const underM = txt.match(/(?:less\s*than|under|up\s*to|<=?|<\s*=?\s*)\s*(\d+(?:\.\d+)?)/);
+        if (underM) {
+          const hi = parseFloat(underM[1]);
+          if (num <= hi) {
+            const span = hi - num + 1;
+            if (span < bestSpan) { bestOpt = o; bestSpan = span; }
+          }
+          continue;
+        }
+        /* "Exactly X" / bare "X" (single-number option) */
+        const exactM = txt.match(/^\s*(\d+(?:\.\d+)?)\s*(?:years?|yrs?)?\s*$/);
+        if (exactM) {
+          const v = parseFloat(exactM[1]);
+          const span = Math.abs(v - num);
+          if (span < bestSpan) { bestOpt = o; bestSpan = span; }
+        }
+      }
+      if (bestOpt) return bestOpt;
+    }
+
+    /* T32: Notice-period / time-duration smart-match by parsed days. */
     if (/notice|availab|start|when.*begin/i.test(labelHint) || /notice|availab|start/i.test(t) || /week|month|day|immediate/i.test(t)) {
       const idx = pickNoticePeriodOption(sel, target);
       if (idx != null && sel.options[idx]) return sel.options[idx];
@@ -1841,10 +1961,66 @@
       else { reportFieldFilled(lbl, 'failed'); }
     }
 
-    /* Checkboxes – only required ones */
-    $$('input[type=checkbox][required], input[type=checkbox][aria-required="true"]')
-      .filter(el => isVisible(el) && !el.checked)
-      .forEach(cb => { realClick(cb); filledCount++; });
+    /* Checkboxes — required-attribute OR consent-style labels.
+       Many forms have "I agree to the privacy policy" etc as checkboxes
+       that block submit but don't carry [required]. Tick them by label. */
+    const CONSENT_RE = /\b(agree|accept|consent|acknowledge|confirm|certify|attest|declare|i\s+have\s+read|i\s+understand|terms|privacy|policy|gdpr|opt.?in|subscribe|notify\s+me|keep\s+me\s+updated|receive\s+(updates|emails|notifications))\b/i;
+    const CONSENT_NEGATIVE_RE = /\b(decline|opt.?out|do\s+not|don'?t|unsubscribe|reject)\b/i;
+    $$('input[type=checkbox]').filter(isVisible).forEach(cb => {
+      if (cb.checked) return;
+      const isReq = cb.required || cb.getAttribute('aria-required') === 'true';
+      const lbl   = getLabel(cb) || '';
+      const txt   = (cb.value || '') + ' ' + lbl;
+      if (CONSENT_NEGATIVE_RE.test(lbl)) return;
+      if (isReq || CONSENT_RE.test(txt)) {
+        realClick(cb); filledCount++;
+      }
+    });
+
+    /* ── Final-pass sweep: re-fill any still-empty required fields ──
+       Some React forms toggle required state only after first focus, or
+       reveal new inputs after a parent dropdown changes. A second pass
+       catches those. */
+    await sleep(800);
+    const stillEmpty = $$(
+      'input[required]:not([type=hidden]):not([type=file]):not([type=submit]):not([type=button]),' +
+      'input[aria-required="true"]:not([type=hidden]):not([type=file]),' +
+      'textarea[required],textarea[aria-required="true"],' +
+      'select[required],select[aria-required="true"]'
+    ).filter(el => isVisible(el) && !(el.value && el.value.trim()));
+
+    for (const el of stillEmpty) {
+      const lbl = getLabel(el);
+      if (!lbl) continue;
+      if (el.tagName === 'SELECT') {
+        const val = guessValue(lbl, p);
+        const chosen = val ? bestSelectOption(el, val, lbl) : null;
+        const fallback = chosen || bestSelectOption(el, 'yes') ||
+                         $$('option', el).find(o => o.value && o.value !== '' && !/^select/i.test(o.text));
+        if (fallback) {
+          el.value = fallback.value;
+          el.dispatchEvent(new Event('change', { bubbles: true }));
+          filledCount++;
+          reportFieldFilled(lbl, 'filled');
+        }
+      } else {
+        const inputType = (el.type || '').toLowerCase();
+        let val = guessValue(lbl, p, inputType);
+        /* Last-resort defaults for required fields we couldn't classify */
+        if (!val) {
+          if (inputType === 'email') val = p.email || '';
+          else if (inputType === 'tel') val = p.phone || '';
+          else if (inputType === 'number') val = '1';
+          else if (inputType === 'date') val = new Date().toISOString().slice(0,10);
+          else val = (p.first_name || 'N/A');
+        }
+        if (val) {
+          el.focus(); nativeSet(el, val); await sleep(40);
+          filledCount++;
+          reportFieldFilled(lbl, 'filled');
+        }
+      }
+    }
 
     // Final progress update
     try {
