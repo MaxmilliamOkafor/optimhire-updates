@@ -607,6 +607,170 @@
     };
   })();
 
+  /* ── DOM-driven "Please fill the missing details" countdown + skip ────
+   * The 2.6.0 sidepanel's own countdown text only renders when
+   * autoSkipSeconds is within a narrow range and the bundle's
+   * listener was registered before our wrap, so we can't rewrite
+   * what it sees. Instead we watch the rendered DOM directly:
+   *   1. When the warning text appears, start a local 15-second
+   *      countdown.
+   *   2. Each second, render "Auto skip in N Sec." below the Skip
+   *      button (creating the element if the sidepanel hasn't,
+   *      otherwise rewriting the number in the existing text).
+   *   3. When N hits 0, find the visible Skip button and click it.
+   *   4. Aborted if the warning disappears OR a submit was just
+   *      attempted (30-second submit-suppression window).
+   * ─────────────────────────────────────────────────────────────────── */
+  var MD_TIMEOUT_MS = 15_000;
+  var _mdStartAt = 0;
+  var _mdTimerId = null;
+  var _mdCountdownEl = null;
+
+  var MD_WARNING_PATTERNS = [
+    'please fill the missing details',
+    'fill the missing details and submit'
+  ];
+
+  function findWarningContainer() {
+    var nodes = document.querySelectorAll('h1,h2,h3,h4,p,span,div');
+    for (var i = 0; i < nodes.length; i++) {
+      var n = nodes[i];
+      if (!n) continue;
+      var t = ((n.textContent || '') + '').toLowerCase().replace(/\s+/g, ' ').trim();
+      if (!t || t.length > 300) continue;
+      for (var j = 0; j < MD_WARNING_PATTERNS.length; j++) {
+        if (t.indexOf(MD_WARNING_PATTERNS[j]) !== -1) return n;
+      }
+    }
+    return null;
+  }
+
+  function findVisibleSkipButton() {
+    var btns = document.querySelectorAll('button, [role="button"]');
+    for (var i = 0; i < btns.length; i++) {
+      var b = btns[i];
+      if (!b || b.id === 'aapBtnSkip') continue; // ignore our own panel's Skip
+      if (b.disabled) continue;
+      var r = b.getBoundingClientRect();
+      if (r.width === 0 || r.height === 0) continue;
+      var t = ((b.innerText || b.textContent || '') + '').replace(/\s+/g, ' ').trim();
+      if (t === 'Skip') return b;
+    }
+    return null;
+  }
+
+  function renderCountdown(remaining) {
+    /* Find the actual Skip button container so we can insert the
+       countdown text right below it where it belongs. */
+    var skipBtn = findVisibleSkipButton();
+    if (!skipBtn) return;
+    /* Look for an existing countdown text node ("Auto skip in N Sec.")
+       anywhere near the skip button. If found, rewrite the number. */
+    var parent = skipBtn.parentElement;
+    for (var hop = 0; hop < 3 && parent; hop++) {
+      var spans = parent.querySelectorAll('span,div,p');
+      for (var i = 0; i < spans.length; i++) {
+        var s = spans[i];
+        var txt = ((s.textContent || '') + '').trim();
+        if (/^Auto\s*skip\s+in\s+\d+\s+Sec\.?$/i.test(txt)) {
+          /* Rewrite the number in-place via text-node traversal */
+          for (var k = 0; k < s.childNodes.length; k++) {
+            var ch = s.childNodes[k];
+            if (ch.nodeType === 3 && /\d+/.test(ch.nodeValue)) {
+              ch.nodeValue = ch.nodeValue.replace(/\d+/, String(remaining));
+              return;
+            }
+            if (ch.nodeType === 1 && /^\d+$/.test((ch.textContent || '').trim())) {
+              ch.textContent = String(remaining);
+              return;
+            }
+          }
+        }
+      }
+      parent = parent.parentElement;
+    }
+    /* No native countdown text in the DOM — inject our own next to
+       the Skip button. Created once, reused across ticks. */
+    if (!_mdCountdownEl || !document.body.contains(_mdCountdownEl)) {
+      _mdCountdownEl = document.createElement('div');
+      _mdCountdownEl.id = 'oh-md-countdown';
+      _mdCountdownEl.style.cssText =
+        'text-align:center;margin-top:8px;font-size:13px;color:#a78bfa;' +
+        'font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,sans-serif;';
+      var host = skipBtn.parentElement || skipBtn;
+      host.appendChild(_mdCountdownEl);
+    }
+    _mdCountdownEl.textContent = 'Auto skip in ' + remaining + ' Sec.';
+  }
+
+  function clearMdCountdown() {
+    if (_mdTimerId) { clearInterval(_mdTimerId); _mdTimerId = null; }
+    _mdStartAt = 0;
+    if (_mdCountdownEl && _mdCountdownEl.parentElement) {
+      _mdCountdownEl.parentElement.removeChild(_mdCountdownEl);
+    }
+    _mdCountdownEl = null;
+  }
+
+  function tickMdCountdown() {
+    if (!_mdStartAt) return;
+    if (isSubmitSuppressed()) { clearMdCountdown(); return; }
+    var warning = findWarningContainer();
+    if (!warning) { clearMdCountdown(); return; }
+    var elapsed = (Date.now() - _mdStartAt) / 1000;
+    var remaining = Math.max(0, Math.round(MD_TIMEOUT_MS / 1000 - elapsed));
+    renderCountdown(remaining);
+    if (remaining <= 0) {
+      clearMdCountdown();
+      var btn = findVisibleSkipButton();
+      if (btn) {
+        try {
+          btn.dispatchEvent(new MouseEvent('mouseover', { bubbles: true }));
+          btn.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+          btn.dispatchEvent(new MouseEvent('mouseup',   { bubbles: true }));
+          btn.click();
+        } catch (_) { try { btn.click(); } catch (__) {} }
+        addLog('Missing-details: countdown reached 0, clicked Skip', '');
+      } else {
+        try { chrome.runtime.sendMessage({ action: 'skipCurrent' }).catch(function(){}); }
+        catch (_) {}
+        addLog('Missing-details: countdown reached 0, sent skipCurrent', '');
+      }
+    }
+  }
+
+  function checkMissingDetails() {
+    var visible = !!findWarningContainer();
+    if (!visible) {
+      if (_mdStartAt || _mdCountdownEl) clearMdCountdown();
+      return;
+    }
+    if (_mdStartAt) return; // already counting
+    if (isSubmitSuppressed()) return;
+    _mdStartAt = Date.now();
+    renderCountdown(Math.round(MD_TIMEOUT_MS / 1000));
+    _mdTimerId = setInterval(tickMdCountdown, 1000);
+  }
+
+  /* Drive on tight poll + MutationObserver so we react quickly when
+     the warning paints. */
+  setInterval(checkMissingDetails, 500);
+  if (document.body) {
+    try {
+      new MutationObserver(checkMissingDetails).observe(document.body, {
+        childList: true, subtree: true, characterData: true
+      });
+    } catch (_) {}
+  } else {
+    document.addEventListener('DOMContentLoaded', function () {
+      checkMissingDetails();
+      try {
+        new MutationObserver(checkMissingDetails).observe(document.body, {
+          childList: true, subtree: true, characterData: true
+        });
+      } catch (_) {}
+    });
+  }
   /* ── Stuck-job watchdog ────────────────────────────────────────────────────
    * If the same job has been "active" for more than 25 seconds without
    * completing, force-skip — UNLESS a submit was recently attempted.         */
