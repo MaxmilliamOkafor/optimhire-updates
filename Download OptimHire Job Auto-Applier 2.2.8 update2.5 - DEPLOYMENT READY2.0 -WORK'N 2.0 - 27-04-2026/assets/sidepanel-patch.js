@@ -11,7 +11,145 @@
   'use strict';
 
   /* ════════════════════════════════════════════════════════════
-     ZERO LIMITATION — targeted hide only (no storage tampering)
+     ZERO LIMITATION — DOM hide + safe storage WRITE-wrap
+     ════════════════════════════════════════════════════════════
+     We never wrap chrome.storage.local.get in the sidepanel (last
+     time that broke the React app), but we DO wrap .set so any
+     candidateDetails / planDetails that flows through it gets
+     normalised to "premium / unlimited credits" before it lands
+     in storage. We also do ONE forced rewrite of candidateDetails
+     on startup so the React state re-reads as premium. */
+
+  var SP_CREDIT_FIELDS = [
+    'free_left_credits','leftCredits','remainingCredits','credits',
+    'autofillCredits','plan_credits','totalCredits','daily_credits',
+    'remaining_credits','autoFillCredits','autofill_credits',
+    'free_credits','credit_balance','creditsLeft','creditLeft',
+    'availableCredits','available_credits'
+  ];
+  var SP_PLAN_STR_PATCHES = {
+    copilot_status: 'PREMIUM',
+    plan: 'premium',
+    planName: 'Premium',
+    plan_name: 'premium',
+    subscriptionPlan: 'premium',
+    subscription_plan: 'premium',
+    tier: 'premium',
+    accountType: 'PREMIUM',
+    account_type: 'PREMIUM'
+  };
+  var SP_BOOL_FLIP = [
+    'isCreditLeft','is_credit_left','isPremium','is_premium',
+    'is_pro','isPro','isPaid','is_paid','isSubscribed','is_subscribed',
+    'isUnlimited','is_unlimited','is_copilot_active',
+    'is_first_attempt_completed','isUpgraded'
+  ];
+  var SP_COUNTER_ZERO = [
+    'appliedCount','applied_count','dailyApplied','daily_applied',
+    'appliedToday','today_applied','isManualAppliedCount'
+  ];
+
+  function spDeepPatch(obj, seen) {
+    if (!obj || typeof obj !== 'object') return obj;
+    seen = seen || new WeakSet();
+    if (seen.has(obj)) return obj;
+    seen.add(obj);
+    SP_CREDIT_FIELDS.forEach(function (f) { if (f in obj) obj[f] = 9999; });
+    SP_BOOL_FLIP.forEach(function (f) {
+      if (!(f in obj)) return;
+      var cur = obj[f];
+      if (cur === '0' || cur === 0 || cur === false) {
+        obj[f] = (typeof cur === 'string') ? '1' : true;
+      }
+    });
+    Object.keys(SP_PLAN_STR_PATCHES).forEach(function (f) {
+      if (f in obj && typeof obj[f] === 'string') {
+        obj[f] = SP_PLAN_STR_PATCHES[f];
+      }
+    });
+    SP_COUNTER_ZERO.forEach(function (f) {
+      if (f in obj && typeof obj[f] === 'number' && obj[f] > 0) obj[f] = 0;
+    });
+    Object.keys(obj).forEach(function (k) {
+      if (obj[k] && typeof obj[k] === 'object') obj[k] = spDeepPatch(obj[k], seen);
+    });
+    return obj;
+  }
+
+  /* Wrap chrome.storage.local.set so any future writes carry
+     premium / unlimited values. SAFE: doesn't change read paths. */
+  try {
+    var _spOrigSet = chrome.storage.local.set.bind(chrome.storage.local);
+    chrome.storage.local.set = function (items, cb) {
+      try {
+        if (items && typeof items === 'object') {
+          Object.keys(items).forEach(function (k) {
+            var v = items[k];
+            if (v && typeof v === 'object') {
+              try { items[k] = spDeepPatch(JSON.parse(JSON.stringify(v))); } catch (_) {}
+            } else if (typeof v === 'string' && /^[\[{]/.test(v.trim())) {
+              try {
+                var parsed = JSON.parse(v);
+                if (parsed && typeof parsed === 'object') {
+                  items[k] = JSON.stringify(spDeepPatch(parsed));
+                }
+              } catch (_) {}
+            } else if (typeof v === 'number' && SP_COUNTER_ZERO.indexOf(k) !== -1 && v > 0) {
+              items[k] = 0;
+            }
+          });
+        }
+      } catch (_) {}
+      if (typeof cb === 'function') {
+        try { return _spOrigSet(items, cb); }
+        catch (_) { try { cb(); } catch (__) {} return; }
+      }
+      return _spOrigSet(items).catch(function () {});
+    };
+  } catch (_) {}
+
+  /* One forced rewrite of candidateDetails on startup so the
+     React state re-reads as premium / unlimited. Repeat every 30s
+     in case the sidepanel refreshes from a server response. */
+  function spForceRewrite() {
+    try {
+      var keys = ['candidateDetails','userDetails','planDetails',
+                  'subscriptionDetails','cachedSeekerInfo','seekerDetails',
+                  'appliedCount','isManualAppliedCount'];
+      chrome.storage.local.get(keys, function (data) {
+        var upd = {};
+        keys.forEach(function (k) {
+          if (data[k] == null) return;
+          try {
+            if (typeof data[k] === 'number' && SP_COUNTER_ZERO.indexOf(k) !== -1) {
+              if (data[k] > 0) upd[k] = 0;
+              return;
+            }
+            var wasStr = typeof data[k] === 'string';
+            if (wasStr && !/^[\[{]/.test(data[k].trim())) return;
+            var parsed = wasStr ? JSON.parse(data[k]) : data[k];
+            if (!parsed || typeof parsed !== 'object') return;
+            var patched = spDeepPatch(JSON.parse(JSON.stringify(parsed)));
+            /* Skip write if nothing changed — avoids unnecessary
+               storage.onChanged firings and React re-renders. */
+            var serialized = wasStr ? JSON.stringify(patched) : patched;
+            var sCmp = typeof serialized === 'string' ? serialized : JSON.stringify(serialized);
+            var origCmp = wasStr ? data[k] : JSON.stringify(data[k]);
+            if (sCmp === origCmp) return;
+            upd[k] = serialized;
+          } catch (_) {}
+        });
+        if (Object.keys(upd).length) {
+          try { chrome.storage.local.set(upd); } catch (_) {}
+        }
+      });
+    } catch (_) {}
+  }
+  spForceRewrite();
+  setInterval(spForceRewrite, 30_000);
+
+  /* ════════════════════════════════════════════════════════════
+     ZERO LIMITATION — targeted hide only (no storage READ tampering)
      The previous version intercepted chrome.storage.local.get
      and walked up unbounded DOM ancestors hiding any with
      bg-/border/rounded/card in their class — which killed the
@@ -45,21 +183,38 @@
     (document.head || document.documentElement).appendChild(style);
   } catch (_) {}
 
-  /* Hide-by-text: find elements whose OWN text (not descendants')
-     matches one of these phrases, then hide a narrow ancestor.
-     Walk-up is bounded to 4 levels AND requires the ancestor's
-     total text length stay small (< 350 chars) so we never hide
-     the whole page. */
+  /* Hide-by-text patterns. Two passes per element:
+       (a) ownText (direct text-node children only) — most precise,
+           used for short labels and CTAs.
+       (b) textContent (including descendants) — needed when the
+           bundle wraps the variable parts (20, $10, plan name) in
+           child <span>/<strong> nodes, so ownText is missing them.
+     Both passes use the same bounded-walk-up rules so we never
+     hide the React root. */
   var HIDE_TEXT_PATTERNS = [
     'Get unlimited Credits',
     'AI cover letter & more',
     'Earn While You Search',
     'Help your friends avoid applying',
-    'Get 20 Auto-fill Credits',
-    'for each referral who upgrades',
+    'Auto-fill Credits for every signup',
+    'referral who upgrades to premium',
+    'referral who upgrades',
     'One Referral 3 Benefits',
     'Refer your friend to get',
-    'commission on hire'
+    'commission on hire',
+    /* 2.6.0 limit / upgrade banners in the sidepanel */
+    'Upgrade to get Unlimited Credits',
+    'Upgrade to get unlimited credits',
+    'free Credits daily',
+    'Auto-fill Credits left today',
+    'matching jobs by manually filling',
+    'Start Applying Manually',
+    'You can still apply to',
+    'Upgrade and save countless hours',
+    /* Resume-fetch error message — smart-quote variant in bundle */
+    "couldn’t fetch details for this resume",
+    "couldn't fetch details for this resume",
+    'fetch details for this resume right now'
   ];
 
   function ownText(el) {
@@ -117,14 +272,37 @@
 
   function hideMatching() {
     try {
-      var nodes = document.querySelectorAll('h1,h2,h3,h4,p,span,div,a,button');
+      var nodes = document.querySelectorAll('h1,h2,h3,h4,p,li,span,div,a,button');
       for (var i = 0; i < nodes.length; i++) {
         var el = nodes[i];
         if (!el || (el.dataset && el.dataset.ohHidden === '1')) continue;
+        var matched = false;
+        /* Pass 1: ownText (direct text-node children) — fastest, most
+           precise, catches plain labels. */
         var t = ownText(el).trim();
-        if (!t || t.length > 200) continue;
-        for (var j = 0; j < HIDE_TEXT_PATTERNS.length; j++) {
-          if (t.indexOf(HIDE_TEXT_PATTERNS[j]) !== -1) {
+        if (t && t.length <= 200) {
+          for (var j = 0; j < HIDE_TEXT_PATTERNS.length; j++) {
+            if (t.indexOf(HIDE_TEXT_PATTERNS[j]) !== -1) {
+              safeHide(pickAncestorToHide(el));
+              matched = true;
+              break;
+            }
+          }
+        }
+        if (matched) continue;
+        /* Pass 2: textContent (includes child spans) — needed when
+           bundle wraps variable text like "Get [20] Auto-fill
+           Credits" with the number in a child span. Bounded length
+           so we never match a huge container. */
+        var tc = (el.textContent || '').replace(/\s+/g, ' ').trim();
+        if (!tc || tc.length > 300) continue;
+        /* Only check on elements that look like leaf-ish containers
+           (≤ 3 child elements or a list item) to avoid matching a
+           whole sidebar that happens to contain a pattern. */
+        var childElems = el.children ? el.children.length : 0;
+        if (childElems > 3 && el.tagName !== 'LI' && el.tagName !== 'P') continue;
+        for (var k = 0; k < HIDE_TEXT_PATTERNS.length; k++) {
+          if (tc.indexOf(HIDE_TEXT_PATTERNS[k]) !== -1) {
             safeHide(pickAncestorToHide(el));
             break;
           }
@@ -458,6 +636,115 @@
       chrome.runtime.sendMessage({ action: 'skipCurrent' }).catch(function () {});
       _watchdogJobKey = '';
     }, 25_000);
+  }
+
+  /* ── "Please fill the missing details" DOM-driven skip ───────────────────
+   * The sidepanel-bundle's own onMessage listener was registered BEFORE
+   * our wrap, so the autoSkipSeconds interception doesn't always fire
+   * scheduleForceSkip(). Watch the sidepanel DOM directly for the warning
+   * card, then click its Skip button after MISSING_DETAILS_TIMEOUT_MS so
+   * the queue advances reliably regardless of message-interception. */
+  var MISSING_DETAILS_TIMEOUT_MS = 7_000;
+  var _missingTimer = null;
+  var _missingShownAt = 0;
+
+  function findSkipButton() {
+    /* Look for a visible <button> (or role=button) whose own text is
+       exactly "Skip" — the sidepanel renders it as a plain Skip button.
+       Avoid our own #aapBtnSkip (that one belongs to the Auto-Apply
+       Status Panel and may be hidden). */
+    var btns = document.querySelectorAll('button, [role="button"]');
+    for (var i = 0; i < btns.length; i++) {
+      var b = btns[i];
+      if (!b || b.id === 'aapBtnSkip') continue;
+      if (b.disabled) continue;
+      var r = b.getBoundingClientRect();
+      if (r.width === 0 || r.height === 0) continue;
+      var t = ((b.innerText || b.textContent || '') + '').replace(/\s+/g, ' ').trim();
+      if (t === 'Skip') return b;
+    }
+    return null;
+  }
+
+  function ownTextLower(el) {
+    if (!el) return '';
+    var s = '';
+    for (var i = 0; i < el.childNodes.length; i++) {
+      var n = el.childNodes[i];
+      if (n.nodeType === 3) s += n.nodeValue;
+    }
+    return s.toLowerCase();
+  }
+
+  var MISSING_PATTERNS = [
+    'please fill the missing details',
+    'fill the missing details and submit',
+    'job auto-applier needs your preferences'
+  ];
+
+  function isMissingDetailsVisible() {
+    var nodes = document.querySelectorAll('h1,h2,h3,h4,p,span,div');
+    for (var i = 0; i < nodes.length; i++) {
+      var n = nodes[i];
+      if (!n) continue;
+      var t = ownTextLower(n);
+      if (!t || t.length > 300) continue;
+      for (var j = 0; j < MISSING_PATTERNS.length; j++) {
+        if (t.indexOf(MISSING_PATTERNS[j]) !== -1) return true;
+      }
+    }
+    return false;
+  }
+
+  function checkMissingDetails() {
+    var visible = isMissingDetailsVisible();
+    if (!visible) {
+      /* Warning gone — clear the pending timer */
+      if (_missingTimer) { clearTimeout(_missingTimer); _missingTimer = null; }
+      _missingShownAt = 0;
+      return;
+    }
+    if (_missingTimer || _missingShownAt) return; // already armed
+    if (isSubmitSuppressed()) return;
+    _missingShownAt = Date.now();
+    _missingTimer = setTimeout(function () {
+      _missingTimer = null;
+      if (isSubmitSuppressed()) { _missingShownAt = 0; return; }
+      if (!isMissingDetailsVisible()) { _missingShownAt = 0; return; }
+      var btn = findSkipButton();
+      if (btn) {
+        try {
+          btn.dispatchEvent(new MouseEvent('mouseover', { bubbles: true }));
+          btn.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+          btn.dispatchEvent(new MouseEvent('mouseup',   { bubbles: true }));
+          btn.click();
+        } catch (_) { try { btn.click(); } catch (__) {} }
+        addLog('Missing-details: clicked Skip', '');
+      } else {
+        try { chrome.runtime.sendMessage({ action: 'skipCurrent' }).catch(function () {}); }
+        catch (_) {}
+        addLog('Missing-details: sent skipCurrent (no Skip button)', '');
+      }
+      _missingShownAt = 0;
+    }, MISSING_DETAILS_TIMEOUT_MS);
+  }
+
+  /* Run on a tight poll + on every DOM mutation */
+  setInterval(checkMissingDetails, 600);
+  if (document.body) {
+    try {
+      new MutationObserver(checkMissingDetails).observe(document.body, {
+        childList: true, subtree: true, characterData: true
+      });
+    } catch (_) {}
+  } else {
+    document.addEventListener('DOMContentLoaded', function () {
+      try {
+        new MutationObserver(checkMissingDetails).observe(document.body, {
+          childList: true, subtree: true, characterData: true
+        });
+      } catch (_) {}
+    });
   }
 
   chrome.runtime.onMessage.addListener(function (msg) {
