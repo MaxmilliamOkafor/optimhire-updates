@@ -2447,6 +2447,212 @@
     else document.addEventListener('DOMContentLoaded', startObserver);
   })();
 
+  /* ── T41 / T42 / T43: End-to-end flow controller ─────────────────────────
+   * T41 — Multi-step Next/Continue/Review advance. After the autofill has
+   *       just finished on the current page (i.e. _fillActive flipped to
+   *       false and stayed false for the settle window), click the
+   *       intermediate-step advance button. Tracked per URL fingerprint
+   *       so we don't double-advance the same step.
+   * T42 — Already-applied / unsupported overlay quick-dismiss. If the
+   *       OptimHire overlay (or the ATS page) reports the job is already
+   *       applied / has no application / is unavailable, click the
+   *       close/dismiss/got-it button to free the queue immediately.
+   * T43 — Generic terminal-submit fallback. ATS-specific handlers do this
+   *       on their domains; on unsupported ATSes, click the page's only
+   *       sensible "Submit Application" button after fill is stable.
+   *
+   * All three gate on:
+   *   - Active automation (csvActiveJobId / isAutoProcessStartJob /
+   *     autoApplyStateUpdate.isRunning) — won't fire during idle browsing.
+   *   - _fillActive false — never click while a fill pass is running.
+   *   - Not within the 30s submit-suppression window — avoid double-submit.
+   * ─────────────────────────────────────────────────────────────────────── */
+  (function installFlowController() {
+    const SETTLE_MS = 1_000;   // wait this long after fill stops before clicking
+    const POLL_MS   =   400;
+    const _clicked  = new WeakSet();
+    const _dismissedFingerprints = new Set();
+
+    /* Track when _fillActive transitions true → false without touching
+       the existing transition points (those live in several functions). */
+    let _wasFilling = false;
+    let _lastFillCompletedTs = Date.now();
+    setInterval(() => {
+      if (_wasFilling && !_fillActive) _lastFillCompletedTs = Date.now();
+      _wasFilling = _fillActive;
+    }, 200);
+
+    function automationActive() {
+      return ST.get(['csvActiveJobId','isAutoProcessStartJob','autoApplyStateUpdate'])
+        .then(d => !!(d.csvActiveJobId || d.isAutoProcessStartJob ||
+                      (d.autoApplyStateUpdate && d.autoApplyStateUpdate.isRunning)));
+    }
+
+    function fillStable() {
+      if (_fillActive) return false;
+      if (Date.now() - _lastFillCompletedTs < SETTLE_MS) return false;
+      return true;
+    }
+
+    function submitSuppressed() {
+      return _submitAttempted && (Date.now() - _submitAttemptTs) < 30_000;
+    }
+
+    function pageFingerprint(extra) {
+      /* URL + count of visible form controls — changes between steps */
+      const ctrlCount = document.querySelectorAll(
+        'input:not([type=hidden]),textarea,select'
+      ).length;
+      return location.href + '|' + ctrlCount + '|' + (extra || '');
+    }
+
+    function findBtnByText(re, scopeEl) {
+      const root = scopeEl || document;
+      const cands = root.querySelectorAll(
+        'button, [role="button"], input[type="submit"], input[type="button"], a'
+      );
+      for (const el of cands) {
+        if (!el || _clicked.has(el)) continue;
+        if (el.disabled) continue;
+        if (el.getAttribute && el.getAttribute('aria-disabled') === 'true') continue;
+        if (!isVisible(el)) continue;
+        const txt = ((el.innerText || el.value || el.textContent || '') + '')
+                      .replace(/\s+/g, ' ').trim();
+        if (!txt || txt.length > 60) continue;
+        if (re.test(txt)) return el;
+      }
+      return null;
+    }
+
+    /* ── T41: Multi-step intermediate advance ── */
+    const ADVANCE_RE = /^(next|continue|next\s+step|proceed|review|go\s+to\s+review|save\s+and\s+continue|save\s+&\s+continue|save\s+and\s+next|save\s+&\s+next|to\s+the\s+next\s+step)$/i;
+    /* These are TERMINAL — don't click them in the intermediate pass
+       (T43 / T27 handle them). Listed so ADVANCE_RE doesn't pick them up
+       via partial overlap. */
+    const TERMINAL_RE = /^(submit(\s+application)?|send\s+application|complete\s+application|finish(\s+application)?|apply\s+now|confirm\s+and\s+submit|submit\s+my\s+application)$/i;
+
+    async function tickAdvance() {
+      if (!await automationActive()) return;
+      if (!fillStable() || submitSuppressed()) return;
+
+      /* Don't advance if the page is still showing validation errors */
+      const hasErrors = !!document.querySelector(
+        '[aria-invalid="true"],.error,.is-invalid,[class*="field-error"],[class*="fieldError"],[role="alert"][class*="error" i]'
+      );
+      if (hasErrors) return;
+
+      const btn = findBtnByText(ADVANCE_RE);
+      if (!btn) return;
+      const txt = ((btn.innerText || btn.textContent || '') + '').trim();
+      if (TERMINAL_RE.test(txt)) return; // safety: never advance via a submit-looking word
+
+      /* Per-fingerprint guard so we don't ping-pong on the same step */
+      const fp = pageFingerprint('advance');
+      if (_dismissedFingerprints.has(fp)) return;
+      _dismissedFingerprints.add(fp);
+      _clicked.add(btn);
+      LOG(`Flow: clicking advance "${txt}"`);
+      try { realClick(btn); } catch (_) { try { btn.click(); } catch (__) {} }
+    }
+
+    /* ── T42: Already-applied / unsupported quick-dismiss ── */
+    const ALREADY_TEXT_RE = /(already\s+applied|application\s+already\s+submitted|you\s+have\s+already\s+applied|no\s+application\s+(form|available)|job\s+is\s+no\s+longer\s+available|this\s+position\s+is\s+closed|posting\s+is\s+closed|application\s+window\s+has\s+closed)/i;
+    const DISMISS_RE = /^(ok|okay|got\s*it|close|dismiss|cancel|skip|next\s+job|continue)$/i;
+
+    async function tickAlreadyApplied() {
+      if (!await automationActive()) return;
+      const bodyText = (document.body && document.body.innerText || '').slice(0, 4000);
+      if (!ALREADY_TEXT_RE.test(bodyText)) return;
+
+      /* Look for a close/dismiss button anywhere on the page first; if
+         none, send a skipCurrent so the queue moves on. */
+      const fp = pageFingerprint('alreadyApplied');
+      if (_dismissedFingerprints.has(fp)) return;
+
+      const btn = findBtnByText(DISMISS_RE);
+      if (btn) {
+        _dismissedFingerprints.add(fp);
+        _clicked.add(btn);
+        LOG('Flow: dismissing already-applied / unavailable card');
+        try { realClick(btn); } catch (_) { try { btn.click(); } catch (__) {} }
+        /* Also tell the queue to advance — even if the dismiss closes the
+           modal, the underlying page might not navigate. */
+        setTimeout(() => {
+          try { chrome.runtime.sendMessage({ action: 'skipCurrent' }).catch(() => {}); }
+          catch (_) {}
+        }, 600);
+        return;
+      }
+      /* No dismiss button found — just skip */
+      _dismissedFingerprints.add(fp);
+      LOG('Flow: already-applied detected, no dismiss button — skipping');
+      try { chrome.runtime.sendMessage({ action: 'skipCurrent' }).catch(() => {}); }
+      catch (_) {}
+    }
+
+    /* ── T43: Generic terminal-submit fallback ──
+       Only runs when:
+         - Fill has been stable for SETTLE_MS
+         - No submit has been attempted in the last 30s
+         - No validation errors are visible on the page
+         - The page contains a button whose text matches a terminal pattern
+       Marks _submitAttempted so the stuck watchdog doesn't fire. */
+    const T43_TERMINAL_RE = /^(submit\s+application|send\s+application|submit\s+my\s+application|complete\s+application|submit)$/i;
+
+    async function tickGenericSubmit() {
+      if (!await automationActive()) return;
+      if (!fillStable() || submitSuppressed()) return;
+
+      /* Don't run on the optimhire.com domain — the overlay/cover-letter
+         flow already drives submit there via T39/T40. */
+      if (/optimhire\.com$/i.test(location.hostname) ||
+          /\.optimhire\.com$/i.test(location.hostname)) return;
+
+      const hasErrors = !!document.querySelector(
+        '[aria-invalid="true"],.error,.is-invalid,[class*="field-error"],[class*="fieldError"]'
+      );
+      if (hasErrors) return;
+
+      const btn = findBtnByText(T43_TERMINAL_RE);
+      if (!btn) return;
+      /* Don't double-submit on the same step */
+      const fp = pageFingerprint('submit');
+      if (_dismissedFingerprints.has(fp)) return;
+      _dismissedFingerprints.add(fp);
+      _clicked.add(btn);
+      LOG(`Flow: clicking terminal submit "${((btn.innerText||'')+'').trim()}"`);
+      markSubmitAttempted();
+      try { realClick(btn); } catch (_) { try { btn.click(); } catch (__) {} }
+    }
+
+    /* URL-change resets the fingerprint cache so the next step is
+       eligible for advance/dismiss/submit again. */
+    let _lastUrl = location.href;
+    setInterval(() => {
+      if (location.href !== _lastUrl) {
+        _lastUrl = location.href;
+        _dismissedFingerprints.clear();
+      }
+    }, 500);
+
+    setInterval(() => {
+      tickAdvance().catch(() => {});
+      tickAlreadyApplied().catch(() => {});
+      tickGenericSubmit().catch(() => {});
+    }, POLL_MS);
+
+    function startObs() {
+      try {
+        const obs = new MutationObserver(() => {
+          tickAlreadyApplied().catch(() => {});
+        });
+        obs.observe(document.body, { childList: true, subtree: true });
+      } catch (_) {}
+    }
+    if (document.body) startObs();
+    else document.addEventListener('DOMContentLoaded', startObs);
+  })();
+
   /* ── T12: Auto-solve captchas ────────────────────────────── */
   async function solveCaptcha() {
     /* reCAPTCHA checkbox inside iframe */
