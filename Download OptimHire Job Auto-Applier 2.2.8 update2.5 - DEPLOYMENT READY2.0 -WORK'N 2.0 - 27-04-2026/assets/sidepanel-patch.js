@@ -396,18 +396,42 @@
     }, (AUTO_SKIP_MAX + 1) * 1000);
   }
 
+  /* Per-job countdown rescale. Background ticks autoSkipSeconds from
+     ~180 down to 0; flat-clamping every tick to AUTO_SKIP_MAX would
+     show "15" frozen for 165s before it actually started decrementing.
+     Instead we track the moment we first saw a >MAX value for each
+     job and serve a real local countdown from AUTO_SKIP_MAX → 0. */
+  var _countdownByJob = Object.create(null); // jobKey → start ts (ms)
+
+  function rescaleAutoSkip(msg) {
+    var jobKey = String(msg.url || msg.jobUrl || msg.jobId || msg.id || 'cur');
+    var now = Date.now();
+    var startTs = _countdownByJob[jobKey];
+    if (!startTs) { _countdownByJob[jobKey] = now; startTs = now; }
+    var elapsed = (now - startTs) / 1000;
+    var remaining = Math.max(0, Math.round(AUTO_SKIP_MAX - elapsed));
+    return remaining;
+  }
+
   (function patchOnMessage() {
     const _origAddListener = chrome.runtime.onMessage.addListener.bind(chrome.runtime.onMessage);
     chrome.runtime.onMessage.addListener = function (listener) {
       return _origAddListener(function (msg, sender, sendResponse) {
         if (msg && msg.type === 'AUTO_APPLY_STATE_UPDATE' &&
-            typeof msg.autoSkipSeconds === 'number' &&
-            msg.autoSkipSeconds > AUTO_SKIP_MAX) {
-          if (!isSubmitSuppressed()) {
-            var jobKey = (msg.url || msg.jobUrl || '') + '_' + msg.autoSkipSeconds;
-            scheduleForceSkip(jobKey);
+            typeof msg.autoSkipSeconds === 'number') {
+          if (msg.autoSkipSeconds > AUTO_SKIP_MAX) {
+            if (!isSubmitSuppressed()) {
+              var jobKey = String(msg.url || msg.jobUrl || msg.jobId || msg.id || 'cur');
+              scheduleForceSkip(jobKey);
+            }
+            var rescaled = rescaleAutoSkip(msg);
+            msg = Object.assign({}, msg, { autoSkipSeconds: rescaled });
+          } else {
+            /* Value already within cap — clear our local countdown
+               tracking so a re-trigger restarts from MAX. */
+            var jk = String(msg.url || msg.jobUrl || msg.jobId || msg.id || 'cur');
+            delete _countdownByJob[jk];
           }
-          msg = Object.assign({}, msg, { autoSkipSeconds: AUTO_SKIP_MAX });
         }
         return listener(msg, sender, sendResponse);
       });

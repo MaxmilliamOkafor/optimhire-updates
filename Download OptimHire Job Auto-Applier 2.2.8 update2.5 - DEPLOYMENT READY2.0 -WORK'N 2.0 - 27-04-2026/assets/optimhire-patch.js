@@ -363,14 +363,34 @@
     setTimeout(() => { _submitAttempted = false; }, 30_000);
   }
 
+  /* Per-job countdown rescale (content side). Background ticks
+     autoSkipSeconds from a large initial value (~180) down to 0;
+     flat-clamping every tick to AUTO_SKIP_MAX_SECONDS would show the
+     same cap value frozen across many ticks before counting down.
+     Instead we serve a real local countdown from AUTO_SKIP_MAX_SECONDS
+     → 0 based on elapsed wall time since the first capped value for
+     this job. */
+  const _countdownByJobSend = Object.create(null);
+  function rescaleAutoSkipSeconds(msg) {
+    const jobKey = String(msg.url || msg.jobUrl || msg.jobId || msg.id || 'cur');
+    const now = Date.now();
+    if (!_countdownByJobSend[jobKey]) _countdownByJobSend[jobKey] = now;
+    const elapsed = (now - _countdownByJobSend[jobKey]) / 1000;
+    return Math.max(0, Math.round(AUTO_SKIP_MAX_SECONDS - elapsed));
+  }
+
   (function capAutoSkipOnSend() {
     const _orig = chrome.runtime.sendMessage.bind(chrome.runtime);
     chrome.runtime.sendMessage = function (msg, ...args) {
       try {
         if (msg && msg.type === 'AUTO_APPLY_STATE_UPDATE' &&
-            typeof msg.autoSkipSeconds === 'number' &&
-            msg.autoSkipSeconds > AUTO_SKIP_MAX_SECONDS) {
-          msg = { ...msg, autoSkipSeconds: AUTO_SKIP_MAX_SECONDS };
+            typeof msg.autoSkipSeconds === 'number') {
+          if (msg.autoSkipSeconds > AUTO_SKIP_MAX_SECONDS) {
+            msg = { ...msg, autoSkipSeconds: rescaleAutoSkipSeconds(msg) };
+          } else {
+            const jk = String(msg.url || msg.jobUrl || msg.jobId || msg.id || 'cur');
+            delete _countdownByJobSend[jk];
+          }
         }
       } catch (_) {}
       return _orig(msg, ...args);
