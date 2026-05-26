@@ -1,0 +1,86 @@
+{
+    "manifest_version": 3,
+    "name": "OptimHire Job Auto-Applier",
+    "version": "2.2.8",
+    "description": "Autofill job applications in 1 click, track every job, and apply faster with your OptimHire Job Auto-Applier.",
+    "icons": {
+        "16": "icon16.plasmo.6c567d50.png",
+        "32": "icon32.plasmo.76b92899.png",
+        "48": "icon48.plasmo.aced7582.png",
+        "64": "icon64.plasmo.8bb5e6e0.png",
+        "128": "icon128.plasmo.3c1ed2d2.png"
+    },
+    "action": {
+        "default_icon": {
+            "16": "icon16.plasmo.6c567d50.png",
+            "32": "icon32.plasmo.76b92899.png",
+            "48": "icon48.plasmo.aced7582.png",
+            "64": "icon64.plasmo.8bb5e6e0.png",
+            "128": "icon128.plasmo.3c1ed2d2.png"
+        }
+    },
+    "background": {
+        "service_worker": "static/background/index.js"
+    },
+    "side_panel": {
+        "default_path": "sidepanel.html"
+    },
+    "options_ui": {
+        "page": "options.html",
+        "open_in_tab": true
+    },
+    "permissions": [
+        "sidePanel",
+        "tabs",
+        "storage",
+        "activeTab",
+        "cookies",
+        "notifications",
+        "contextMenus",
+        "scripting",
+        "alarms",
+        "unlimitedStorage"
+    ],
+    "host_permissions": [
+        "<all_urls>"
+    ],
+    "content_scripts": [
+        {
+            "matches": ["<all_urls>"],
+            "js": ["clickNotification.7c43bc3d.js"],
+            "css": []
+        },
+        {
+            "matches": ["<all_urls>"],
+            "js": ["autofill.73df3a6d.js"],
+            "all_frames": false,
+            "run_at": "document_end",
+            "css": []
+        },
+        {
+            "matches": ["<all_urls>"],
+            "js": ["openSidePanelToast.b0286adb.js"],
+            "css": []
+        },
+        {
+            "matches": ["https://*.optimhire.com/*"],
+            "js": ["optimhire-auth.0a577e02.js"],
+            "all_frames": false,
+            "run_at": "document_end",
+            "css": []
+        },
+        {
+            "matches": ["<all_urls>"],
+            "js": ["assets/optimhire-patch.js"],
+            "all_frames": false,
+            "run_at": "document_idle",
+            "css": []
+        }
+    ],
+    "web_accessible_resources": [
+        {
+            "resources": ["assets/*", "tabs/*"],
+            "matches": ["<all_urls>"]
+        }
+    ]
+}
