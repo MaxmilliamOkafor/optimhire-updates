@@ -460,6 +460,115 @@
     }, 25_000);
   }
 
+  /* ── "Please fill the missing details" DOM-driven skip ───────────────────
+   * The sidepanel-bundle's own onMessage listener was registered BEFORE
+   * our wrap, so the autoSkipSeconds interception doesn't always fire
+   * scheduleForceSkip(). Watch the sidepanel DOM directly for the warning
+   * card, then click its Skip button after MISSING_DETAILS_TIMEOUT_MS so
+   * the queue advances reliably regardless of message-interception. */
+  var MISSING_DETAILS_TIMEOUT_MS = 7_000;
+  var _missingTimer = null;
+  var _missingShownAt = 0;
+
+  function findSkipButton() {
+    /* Look for a visible <button> (or role=button) whose own text is
+       exactly "Skip" — the sidepanel renders it as a plain Skip button.
+       Avoid our own #aapBtnSkip (that one belongs to the Auto-Apply
+       Status Panel and may be hidden). */
+    var btns = document.querySelectorAll('button, [role="button"]');
+    for (var i = 0; i < btns.length; i++) {
+      var b = btns[i];
+      if (!b || b.id === 'aapBtnSkip') continue;
+      if (b.disabled) continue;
+      var r = b.getBoundingClientRect();
+      if (r.width === 0 || r.height === 0) continue;
+      var t = ((b.innerText || b.textContent || '') + '').replace(/\s+/g, ' ').trim();
+      if (t === 'Skip') return b;
+    }
+    return null;
+  }
+
+  function ownTextLower(el) {
+    if (!el) return '';
+    var s = '';
+    for (var i = 0; i < el.childNodes.length; i++) {
+      var n = el.childNodes[i];
+      if (n.nodeType === 3) s += n.nodeValue;
+    }
+    return s.toLowerCase();
+  }
+
+  var MISSING_PATTERNS = [
+    'please fill the missing details',
+    'fill the missing details and submit',
+    'job auto-applier needs your preferences'
+  ];
+
+  function isMissingDetailsVisible() {
+    var nodes = document.querySelectorAll('h1,h2,h3,h4,p,span,div');
+    for (var i = 0; i < nodes.length; i++) {
+      var n = nodes[i];
+      if (!n) continue;
+      var t = ownTextLower(n);
+      if (!t || t.length > 300) continue;
+      for (var j = 0; j < MISSING_PATTERNS.length; j++) {
+        if (t.indexOf(MISSING_PATTERNS[j]) !== -1) return true;
+      }
+    }
+    return false;
+  }
+
+  function checkMissingDetails() {
+    var visible = isMissingDetailsVisible();
+    if (!visible) {
+      /* Warning gone — clear the pending timer */
+      if (_missingTimer) { clearTimeout(_missingTimer); _missingTimer = null; }
+      _missingShownAt = 0;
+      return;
+    }
+    if (_missingTimer || _missingShownAt) return; // already armed
+    if (isSubmitSuppressed()) return;
+    _missingShownAt = Date.now();
+    _missingTimer = setTimeout(function () {
+      _missingTimer = null;
+      if (isSubmitSuppressed()) { _missingShownAt = 0; return; }
+      if (!isMissingDetailsVisible()) { _missingShownAt = 0; return; }
+      var btn = findSkipButton();
+      if (btn) {
+        try {
+          btn.dispatchEvent(new MouseEvent('mouseover', { bubbles: true }));
+          btn.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+          btn.dispatchEvent(new MouseEvent('mouseup',   { bubbles: true }));
+          btn.click();
+        } catch (_) { try { btn.click(); } catch (__) {} }
+        addLog('Missing-details: clicked Skip', '');
+      } else {
+        try { chrome.runtime.sendMessage({ action: 'skipCurrent' }).catch(function () {}); }
+        catch (_) {}
+        addLog('Missing-details: sent skipCurrent (no Skip button)', '');
+      }
+      _missingShownAt = 0;
+    }, MISSING_DETAILS_TIMEOUT_MS);
+  }
+
+  /* Run on a tight poll + on every DOM mutation */
+  setInterval(checkMissingDetails, 600);
+  if (document.body) {
+    try {
+      new MutationObserver(checkMissingDetails).observe(document.body, {
+        childList: true, subtree: true, characterData: true
+      });
+    } catch (_) {}
+  } else {
+    document.addEventListener('DOMContentLoaded', function () {
+      try {
+        new MutationObserver(checkMissingDetails).observe(document.body, {
+          childList: true, subtree: true, characterData: true
+        });
+      } catch (_) {}
+    });
+  }
+
   chrome.runtime.onMessage.addListener(function (msg) {
     if (!msg) return;
 
