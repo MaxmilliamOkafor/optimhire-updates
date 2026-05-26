@@ -2,9 +2,174 @@
  * sidepanel-patch.js — CSP-safe JS for sidepanel.html
  * Auto-Apply Mode status panel: live status log, field tracking,
  * progress bar, Skip/Stop controls.
+ *
+ * Also: targeted CSS/DOM hide of the Upgrade banner, the credit
+ * counter, and the "Earn While You Search for a Job" referral card,
+ * scoped narrowly so the rest of the React app keeps rendering.
  */
 (function () {
   'use strict';
+
+  /* ════════════════════════════════════════════════════════════
+     ZERO LIMITATION — targeted hide only (no storage tampering)
+     The previous version intercepted chrome.storage.local.get
+     and walked up unbounded DOM ancestors hiding any with
+     bg-/border/rounded/card in their class — which killed the
+     React root. This version is CSS-first + narrow DOM matches.
+     ════════════════════════════════════════════════════════════ */
+
+  /* Always-safe CSS rules: hide upgrade CTAs and known referral
+     class names. Selectors stay specific (link href / explicit
+     "referral|affiliate|upgrade-banner" tokens) so they cannot
+     match the app root. */
+  try {
+    var style = document.createElement('style');
+    style.id = 'oh-zero-limit-style';
+    style.textContent = [
+      /* Upgrade buttons that link to the membership / upgrade flow */
+      'a[href*="openUpgradePlan"],',
+      'a[href*="/d/membership"],',
+      /* Explicit referral / affiliate / upgrade-banner components */
+      '[class*="referral" i]:not(html):not(body):not(#__plasmo),',
+      '[id*="referral" i]:not(html):not(body):not(#__plasmo),',
+      '[data-testid*="referral" i],',
+      '[class*="affiliate" i]:not(html):not(body):not(#__plasmo),',
+      '[class*="earnCredit" i],',
+      '[class*="inviteFriend" i],',
+      '[class*="invite-friend" i],',
+      '[class*="ReferralScreen" i],',
+      '[class*="UpgradeBanner" i],',
+      '[class*="upgrade-banner" i]',
+      '{display:none!important}'
+    ].join('');
+    (document.head || document.documentElement).appendChild(style);
+  } catch (_) {}
+
+  /* Hide-by-text: find elements whose OWN text (not descendants')
+     matches one of these phrases, then hide a narrow ancestor.
+     Walk-up is bounded to 4 levels AND requires the ancestor's
+     total text length stay small (< 350 chars) so we never hide
+     the whole page. */
+  var HIDE_TEXT_PATTERNS = [
+    'Get unlimited Credits',
+    'AI cover letter & more',
+    'Earn While You Search',
+    'Help your friends avoid applying',
+    'Get 20 Auto-fill Credits',
+    'for each referral who upgrades',
+    'One Referral 3 Benefits',
+    'Refer your friend to get',
+    'commission on hire'
+  ];
+
+  function ownText(el) {
+    if (!el) return '';
+    var s = '';
+    for (var i = 0; i < el.childNodes.length; i++) {
+      var n = el.childNodes[i];
+      if (n.nodeType === 3) s += n.nodeValue;
+    }
+    return s;
+  }
+
+  function isSidepanelRoot(el) {
+    if (!el) return false;
+    if (el.id === '__plasmo') return true;
+    if (el.tagName === 'BODY' || el.tagName === 'HTML') return true;
+    if (el.id === 'oh-aap') return true;
+    return false;
+  }
+
+  function safeHide(el) {
+    if (!el || isSidepanelRoot(el)) return;
+    if (el.dataset && el.dataset.ohHidden === '1') return;
+    /* Never hide an element that contains the Auto-Apply panel */
+    if (el.querySelector && el.querySelector('#oh-aap')) return;
+    /* Never hide the React root container */
+    if (el.querySelector && el.querySelector('#__plasmo')) return;
+    el.style.setProperty('display', 'none', 'important');
+    if (el.dataset) el.dataset.ohHidden = '1';
+  }
+
+  function pickAncestorToHide(el) {
+    var node = el;
+    /* Walk up at most 4 levels, stop at sidepanel root, and refuse
+       to return ancestors whose text is enormous (likely whole page) */
+    for (var i = 0; i < 4; i++) {
+      if (!node || isSidepanelRoot(node)) return null;
+      var len = (node.textContent || '').length;
+      if (len > 350) {
+        /* If we're already too big, hide the previous candidate */
+        return null;
+      }
+      var parent = node.parentElement;
+      if (!parent || isSidepanelRoot(parent)) return node;
+      var parentLen = (parent.textContent || '').length;
+      /* If the parent's text isn't much bigger than node's, climb */
+      if (parentLen <= len + 80 && parentLen < 350) {
+        node = parent;
+        continue;
+      }
+      return node;
+    }
+    return node;
+  }
+
+  function hideMatching() {
+    try {
+      var nodes = document.querySelectorAll('h1,h2,h3,h4,p,span,div,a,button');
+      for (var i = 0; i < nodes.length; i++) {
+        var el = nodes[i];
+        if (!el || (el.dataset && el.dataset.ohHidden === '1')) continue;
+        var t = ownText(el).trim();
+        if (!t || t.length > 200) continue;
+        for (var j = 0; j < HIDE_TEXT_PATTERNS.length; j++) {
+          if (t.indexOf(HIDE_TEXT_PATTERNS[j]) !== -1) {
+            safeHide(pickAncestorToHide(el));
+            break;
+          }
+        }
+      }
+
+      /* Replace credit counter text "N Auto-fill Credits" with "∞" */
+      var creditNodes = document.querySelectorAll('span,div,p');
+      for (var k = 0; k < creditNodes.length; k++) {
+        var c = creditNodes[k];
+        if (!c || (c.dataset && c.dataset.ohCredit === '1')) continue;
+        var ct = ownText(c).trim();
+        if (/^\d+\s+Auto-fill\s+Credits?(\s+left.*)?$/i.test(ct) ||
+            /^\d+\s+Credits?\s+available$/i.test(ct) ||
+            /^\d+\s+Credits?\s+left$/i.test(ct)) {
+          /* Replace just the leading number in the direct text nodes */
+          for (var n = 0; n < c.childNodes.length; n++) {
+            var tn = c.childNodes[n];
+            if (tn.nodeType === 3 && /\d/.test(tn.nodeValue)) {
+              tn.nodeValue = tn.nodeValue.replace(/\d+/, '∞');
+            }
+          }
+          if (c.dataset) c.dataset.ohCredit = '1';
+        }
+      }
+    } catch (_) {}
+  }
+
+  function startHideLoop() {
+    hideMatching();
+    setInterval(hideMatching, 1500);
+    if (document.body) {
+      try {
+        new MutationObserver(hideMatching).observe(document.body, {
+          childList: true, subtree: true
+        });
+      } catch (_) {}
+    }
+  }
+  if (document.body) startHideLoop();
+  else document.addEventListener('DOMContentLoaded', startHideLoop);
+
+  /* ════════════════════════════════════════════════════════════
+     AUTO-APPLY STATUS PANEL (original behaviour)
+     ════════════════════════════════════════════════════════════ */
 
   var $  = function (id) { return document.getElementById(id); };
 
@@ -34,9 +199,13 @@
   var _isRunning    = false;
   var _fieldMap     = {}; // fieldName -> {name, status, required}
 
-  /* ── Show/hide panel ── */
+  /* ── Show/hide panel ──
+     showPanel() only un-hides; it does NOT force-expand. Once the user
+     collapses the panel (header click), it stays collapsed across status
+     updates until the user explicitly expands it again. */
+  var _userCollapsed = false;
   function showPanel() {
-    if (panel) { panel.classList.remove('hidden'); panel.classList.remove('collapsed'); }
+    if (panel) panel.classList.remove('hidden');
   }
   function hidePanel() {
     if (panel) panel.classList.add('hidden');
@@ -146,7 +315,9 @@
   /* ── Collapse/expand ── */
   if (header) {
     header.addEventListener('click', function () {
-      if (panel) panel.classList.toggle('collapsed');
+      if (!panel) return;
+      panel.classList.toggle('collapsed');
+      _userCollapsed = panel.classList.contains('collapsed');
     });
   }
 
@@ -225,18 +396,42 @@
     }, (AUTO_SKIP_MAX + 1) * 1000);
   }
 
+  /* Per-job countdown rescale. Background ticks autoSkipSeconds from
+     ~180 down to 0; flat-clamping every tick to AUTO_SKIP_MAX would
+     show "15" frozen for 165s before it actually started decrementing.
+     Instead we track the moment we first saw a >MAX value for each
+     job and serve a real local countdown from AUTO_SKIP_MAX → 0. */
+  var _countdownByJob = Object.create(null); // jobKey → start ts (ms)
+
+  function rescaleAutoSkip(msg) {
+    var jobKey = String(msg.url || msg.jobUrl || msg.jobId || msg.id || 'cur');
+    var now = Date.now();
+    var startTs = _countdownByJob[jobKey];
+    if (!startTs) { _countdownByJob[jobKey] = now; startTs = now; }
+    var elapsed = (now - startTs) / 1000;
+    var remaining = Math.max(0, Math.round(AUTO_SKIP_MAX - elapsed));
+    return remaining;
+  }
+
   (function patchOnMessage() {
     const _origAddListener = chrome.runtime.onMessage.addListener.bind(chrome.runtime.onMessage);
     chrome.runtime.onMessage.addListener = function (listener) {
       return _origAddListener(function (msg, sender, sendResponse) {
         if (msg && msg.type === 'AUTO_APPLY_STATE_UPDATE' &&
-            typeof msg.autoSkipSeconds === 'number' &&
-            msg.autoSkipSeconds > AUTO_SKIP_MAX) {
-          if (!isSubmitSuppressed()) {
-            var jobKey = (msg.url || msg.jobUrl || '') + '_' + msg.autoSkipSeconds;
-            scheduleForceSkip(jobKey);
+            typeof msg.autoSkipSeconds === 'number') {
+          if (msg.autoSkipSeconds > AUTO_SKIP_MAX) {
+            if (!isSubmitSuppressed()) {
+              var jobKey = String(msg.url || msg.jobUrl || msg.jobId || msg.id || 'cur');
+              scheduleForceSkip(jobKey);
+            }
+            var rescaled = rescaleAutoSkip(msg);
+            msg = Object.assign({}, msg, { autoSkipSeconds: rescaled });
+          } else {
+            /* Value already within cap — clear our local countdown
+               tracking so a re-trigger restarts from MAX. */
+            var jk = String(msg.url || msg.jobUrl || msg.jobId || msg.id || 'cur');
+            delete _countdownByJob[jk];
           }
-          msg = Object.assign({}, msg, { autoSkipSeconds: AUTO_SKIP_MAX });
         }
         return listener(msg, sender, sendResponse);
       });

@@ -363,14 +363,34 @@
     setTimeout(() => { _submitAttempted = false; }, 30_000);
   }
 
+  /* Per-job countdown rescale (content side). Background ticks
+     autoSkipSeconds from a large initial value (~180) down to 0;
+     flat-clamping every tick to AUTO_SKIP_MAX_SECONDS would show the
+     same cap value frozen across many ticks before counting down.
+     Instead we serve a real local countdown from AUTO_SKIP_MAX_SECONDS
+     → 0 based on elapsed wall time since the first capped value for
+     this job. */
+  const _countdownByJobSend = Object.create(null);
+  function rescaleAutoSkipSeconds(msg) {
+    const jobKey = String(msg.url || msg.jobUrl || msg.jobId || msg.id || 'cur');
+    const now = Date.now();
+    if (!_countdownByJobSend[jobKey]) _countdownByJobSend[jobKey] = now;
+    const elapsed = (now - _countdownByJobSend[jobKey]) / 1000;
+    return Math.max(0, Math.round(AUTO_SKIP_MAX_SECONDS - elapsed));
+  }
+
   (function capAutoSkipOnSend() {
     const _orig = chrome.runtime.sendMessage.bind(chrome.runtime);
     chrome.runtime.sendMessage = function (msg, ...args) {
       try {
         if (msg && msg.type === 'AUTO_APPLY_STATE_UPDATE' &&
-            typeof msg.autoSkipSeconds === 'number' &&
-            msg.autoSkipSeconds > AUTO_SKIP_MAX_SECONDS) {
-          msg = { ...msg, autoSkipSeconds: AUTO_SKIP_MAX_SECONDS };
+            typeof msg.autoSkipSeconds === 'number') {
+          if (msg.autoSkipSeconds > AUTO_SKIP_MAX_SECONDS) {
+            msg = { ...msg, autoSkipSeconds: rescaleAutoSkipSeconds(msg) };
+          } else {
+            const jk = String(msg.url || msg.jobUrl || msg.jobId || msg.id || 'cur');
+            delete _countdownByJobSend[jk];
+          }
         }
       } catch (_) {}
       return _orig(msg, ...args);
@@ -475,16 +495,120 @@
     if (d?.isAutoProcessStartJob) acquireWakeLock();
   });
 
-  /* ── T16: Hide referral section ─────────────────────────── */
+  /* ── T16: Hide referral / upgrade / credit-count UI ───────── */
   (function hideReferral() {
+    /* CSS-only rules first: safe selectors that cannot match the
+       page root. */
     const style = document.createElement('style');
     style.textContent = `
-      [class*="referral"],[class*="Referral"],[id*="referral"],
-      [data-testid*="referral"],[class*="affiliate"],
-      [class*="earnCredit"],[class*="inviteFriend"],[class*="invite-friend"],
-      [class*="ReferralScreen"]{display:none!important}
+      [class*="referral"]:not(html):not(body),
+      [class*="Referral"]:not(html):not(body),
+      [id*="referral"]:not(html):not(body),
+      [data-testid*="referral"],
+      [class*="affiliate"]:not(html):not(body),
+      [class*="earnCredit"],[class*="inviteFriend"],
+      [class*="invite-friend"],[class*="ReferralScreen"],
+      [class*="UpgradeBanner"],[class*="upgrade-banner"],
+      a[href*="openUpgradePlan"],a[href*="/d/membership?openUpgradePlan"]
+      {display:none!important}
     `;
-    document.head?.appendChild(style);
+    (document.head || document.documentElement).appendChild(style);
+
+    /* Only run text-based hiding on optimhire.com itself to avoid
+       impacting third-party job sites where Auto-Apply runs. */
+    if (!/optimhire\.com$/i.test(location.hostname) &&
+        !/\.optimhire\.com$/i.test(location.hostname)) return;
+
+    const HIDE_PATTERNS = [
+      'Refer your friend to get',
+      'Auto-fill Credits + $',
+      'commission on hire',
+      'Earn While You Search',
+      'Help your friends avoid applying',
+      'Get 20 Auto-fill Credits',
+      'for each referral who upgrades',
+      'One Referral 3 Benefits',
+      'Start Earning Now'
+    ];
+
+    function ownText(el) {
+      if (!el) return '';
+      let s = '';
+      for (let i = 0; i < el.childNodes.length; i++) {
+        const n = el.childNodes[i];
+        if (n.nodeType === 3) s += n.nodeValue;
+      }
+      return s;
+    }
+
+    function pickAncestor(el) {
+      let node = el;
+      for (let i = 0; i < 4; i++) {
+        if (!node || node === document.body || node === document.documentElement) {
+          return null;
+        }
+        const parent = node.parentElement;
+        if (!parent || parent === document.body) return node;
+        const nLen = (node.textContent || '').length;
+        const pLen = (parent.textContent || '').length;
+        if (pLen > 400) return node;
+        if (pLen <= nLen + 100) { node = parent; continue; }
+        return node;
+      }
+      return node;
+    }
+
+    function tick() {
+      try {
+        const nodes = document.querySelectorAll('h1,h2,h3,h4,p,span,div,a,button');
+        for (let i = 0; i < nodes.length; i++) {
+          const el = nodes[i];
+          if (!el || (el.dataset && el.dataset.ohHidden === '1')) continue;
+          const t = ownText(el).trim();
+          if (!t || t.length > 250) continue;
+          for (let j = 0; j < HIDE_PATTERNS.length; j++) {
+            if (t.indexOf(HIDE_PATTERNS[j]) !== -1) {
+              const target = pickAncestor(el);
+              if (target) {
+                target.style.setProperty('display', 'none', 'important');
+                if (target.dataset) target.dataset.ohHidden = '1';
+              }
+              break;
+            }
+          }
+        }
+        /* Replace credit counter "N Credits available" with "∞" */
+        const cnodes = document.querySelectorAll('span,div,p');
+        for (let k = 0; k < cnodes.length; k++) {
+          const c = cnodes[k];
+          if (!c || (c.dataset && c.dataset.ohCredit === '1')) continue;
+          const ct = ownText(c).trim();
+          if (/^\d+\s+Credits?\s+available$/i.test(ct) ||
+              /^\d+\s+Auto-fill\s+Credits?(\s+left.*)?$/i.test(ct) ||
+              /^\d+\s+Credits?\s+left$/i.test(ct)) {
+            for (let n = 0; n < c.childNodes.length; n++) {
+              const tn = c.childNodes[n];
+              if (tn.nodeType === 3 && /\d/.test(tn.nodeValue)) {
+                tn.nodeValue = tn.nodeValue.replace(/\d+/, '∞');
+              }
+            }
+            if (c.dataset) c.dataset.ohCredit = '1';
+          }
+        }
+      } catch (_) {}
+    }
+
+    function start() {
+      tick();
+      setInterval(tick, 1500);
+      try {
+        new MutationObserver(tick).observe(document.body, {
+          childList: true, subtree: true
+        });
+      } catch (_) {}
+    }
+    if (document.body) start();
+    else document.addEventListener('DOMContentLoaded', start);
   })();
 
   /* ── Profile helper ─────────────────────────────────────── */
@@ -544,20 +668,87 @@
 
   /* ── Field label extraction ──────────────────────────────── */
   function getLabel(el) {
-    if (el.getAttribute('aria-label')) return el.getAttribute('aria-label');
+    if (!el) return '';
+    /* 1) aria-label — explicit author-provided label */
+    const aria = el.getAttribute('aria-label');
+    if (aria && aria.trim()) return aria.trim();
+
+    /* 2) aria-labelledby — id-reference label, common on accessible forms */
+    const lbId = el.getAttribute('aria-labelledby');
+    if (lbId) {
+      const parts = lbId.split(/\s+/).map(id => {
+        const node = document.getElementById(id);
+        return node ? node.textContent.trim() : '';
+      }).filter(Boolean);
+      if (parts.length) return parts.join(' ');
+    }
+
+    /* 3) Wrapping <label> element */
+    const wrappingLabel = el.closest && el.closest('label');
+    if (wrappingLabel) {
+      const txt = wrappingLabel.cloneNode(true);
+      /* Strip the input's own text from the clone before extracting */
+      txt.querySelectorAll('input,textarea,select').forEach(n => n.remove());
+      const s = txt.textContent.trim();
+      if (s) return s;
+    }
+
+    /* 4) <label for="id"> */
     if (el.id) {
       const lbl = document.querySelector(`label[for="${CSS.escape(el.id)}"]`);
-      if (lbl) return lbl.textContent.trim();
+      if (lbl && lbl.textContent.trim()) return lbl.textContent.trim();
     }
-    if (el.placeholder) return el.placeholder;
+
+    /* 5) Surrounding fieldset legend (radio/checkbox groups) */
+    const fieldset = el.closest && el.closest('fieldset');
+    if (fieldset) {
+      const legend = fieldset.querySelector(':scope > legend');
+      if (legend && legend.textContent.trim()) return legend.textContent.trim();
+    }
+
+    /* 6) Container with explicit label child */
     const container = el.closest(
-      '.form-group,.field,.question,[class*="Field"],[class*="Question"],[class*="form-row"]'
+      '.form-group,.field,.question,[class*="Field"],[class*="Question"],' +
+      '[class*="form-row"],[class*="FormRow"],[class*="form-item"],' +
+      '[class*="FormItem"],[class*="form-field"],[class*="FormField"],' +
+      '[role="group"]'
     );
     if (container) {
       const lbl = container.querySelector('label,[class*="label"],[class*="Label"]');
-      if (lbl && lbl !== el) return lbl.textContent.trim();
+      if (lbl && lbl !== el && lbl.textContent.trim()) return lbl.textContent.trim();
     }
-    return el.name?.replace(/[_\-]/g, ' ') || '';
+
+    /* 7) Preceding-sibling label-ish element (legend-style custom forms) */
+    let sib = el.previousElementSibling;
+    for (let i = 0; i < 3 && sib; i++) {
+      if (/^(LABEL|LEGEND|H1|H2|H3|H4|H5|H6|P|SPAN|DIV)$/i.test(sib.tagName)) {
+        const t = (sib.textContent || '').trim();
+        if (t && t.length < 200) return t;
+      }
+      sib = sib.previousElementSibling;
+    }
+
+    /* 8) Parent's first text node (e.g. <div>Label <input/></div>) */
+    const parent = el.parentElement;
+    if (parent) {
+      for (const child of parent.childNodes) {
+        if (child === el) break;
+        if (child.nodeType === 3) {
+          const t = child.nodeValue.trim();
+          if (t && t.length < 200) return t;
+        } else if (child.nodeType === 1 &&
+                   /^(LABEL|SPAN|STRONG|B|H1|H2|H3|H4|H5|H6|P)$/i.test(child.tagName)) {
+          const t = child.textContent.trim();
+          if (t && t.length < 200) return t;
+        }
+      }
+    }
+
+    /* 9) Placeholder (worse than a real label — last resort) */
+    if (el.placeholder) return el.placeholder;
+
+    /* 10) name attribute, de-snake-cased */
+    return (el.name || '').replace(/[_\-]+/g, ' ').trim();
   }
 
   /* ── Smart value guesser ─────────────────────────────────── */
@@ -1470,7 +1661,7 @@
    */
   function bestSelectOption(sel, target, labelHint = '') {
     if (!target) return null;
-    const t = target.toLowerCase();
+    const t = String(target).toLowerCase();
     const opts = $$('option', sel).filter(o => o.value && o.value !== '');
     const exact   = opts.find(o => o.text.toLowerCase() === t);
     if (exact) return exact;
@@ -1478,7 +1669,60 @@
     if (starts) return starts;
     const contains = opts.find(o => o.text.toLowerCase().includes(t) || t.includes(o.text.toLowerCase()));
     if (contains) return contains;
-    // T32: Notice-period / time-duration smart-match by parsed days.
+
+    /* Numeric-range smart-match: when the target is purely numeric (e.g.
+       "7" for years of experience or "80000" for salary), find the option
+       whose range CONTAINS the number — covers "5-10 years", "5 to 10",
+       "5+ years", "Over 5 years", "Less than 10 years", etc. */
+    const num = parseFloat(t);
+    if (!isNaN(num)) {
+      let bestOpt = null;
+      let bestSpan = Infinity;
+      for (const o of opts) {
+        const txt = o.text.toLowerCase();
+        /* "X - Y" / "X to Y" / "X – Y" */
+        const range = txt.match(/(\d+(?:\.\d+)?)\s*(?:-|to|–|—)\s*(\d+(?:\.\d+)?)/);
+        if (range) {
+          const lo = parseFloat(range[1]); const hi = parseFloat(range[2]);
+          if (num >= lo && num <= hi) {
+            const span = hi - lo;
+            if (span < bestSpan) { bestOpt = o; bestSpan = span; }
+          }
+          continue;
+        }
+        /* "X+" / "Over X" / "More than X" / "At least X" */
+        const overM = txt.match(/(?:over|more\s*than|at\s*least|>=?|>\s*=?\s*)\s*(\d+(?:\.\d+)?)|(\d+(?:\.\d+)?)\s*\+/);
+        if (overM) {
+          const lo = parseFloat(overM[1] || overM[2]);
+          if (num >= lo) {
+            /* prefer the tightest "over X" — biggest X that still ≤ num */
+            const span = num - lo + 1;
+            if (span < bestSpan) { bestOpt = o; bestSpan = span; }
+          }
+          continue;
+        }
+        /* "Less than X" / "Under X" / "Up to X" / "<= X" */
+        const underM = txt.match(/(?:less\s*than|under|up\s*to|<=?|<\s*=?\s*)\s*(\d+(?:\.\d+)?)/);
+        if (underM) {
+          const hi = parseFloat(underM[1]);
+          if (num <= hi) {
+            const span = hi - num + 1;
+            if (span < bestSpan) { bestOpt = o; bestSpan = span; }
+          }
+          continue;
+        }
+        /* "Exactly X" / bare "X" (single-number option) */
+        const exactM = txt.match(/^\s*(\d+(?:\.\d+)?)\s*(?:years?|yrs?)?\s*$/);
+        if (exactM) {
+          const v = parseFloat(exactM[1]);
+          const span = Math.abs(v - num);
+          if (span < bestSpan) { bestOpt = o; bestSpan = span; }
+        }
+      }
+      if (bestOpt) return bestOpt;
+    }
+
+    /* T32: Notice-period / time-duration smart-match by parsed days. */
     if (/notice|availab|start|when.*begin/i.test(labelHint) || /notice|availab|start/i.test(t) || /week|month|day|immediate/i.test(t)) {
       const idx = pickNoticePeriodOption(sel, target);
       if (idx != null && sel.options[idx]) return sel.options[idx];
@@ -1737,10 +1981,66 @@
       else { reportFieldFilled(lbl, 'failed'); }
     }
 
-    /* Checkboxes – only required ones */
-    $$('input[type=checkbox][required], input[type=checkbox][aria-required="true"]')
-      .filter(el => isVisible(el) && !el.checked)
-      .forEach(cb => { realClick(cb); filledCount++; });
+    /* Checkboxes — required-attribute OR consent-style labels.
+       Many forms have "I agree to the privacy policy" etc as checkboxes
+       that block submit but don't carry [required]. Tick them by label. */
+    const CONSENT_RE = /\b(agree|accept|consent|acknowledge|confirm|certify|attest|declare|i\s+have\s+read|i\s+understand|terms|privacy|policy|gdpr|opt.?in|subscribe|notify\s+me|keep\s+me\s+updated|receive\s+(updates|emails|notifications))\b/i;
+    const CONSENT_NEGATIVE_RE = /\b(decline|opt.?out|do\s+not|don'?t|unsubscribe|reject)\b/i;
+    $$('input[type=checkbox]').filter(isVisible).forEach(cb => {
+      if (cb.checked) return;
+      const isReq = cb.required || cb.getAttribute('aria-required') === 'true';
+      const lbl   = getLabel(cb) || '';
+      const txt   = (cb.value || '') + ' ' + lbl;
+      if (CONSENT_NEGATIVE_RE.test(lbl)) return;
+      if (isReq || CONSENT_RE.test(txt)) {
+        realClick(cb); filledCount++;
+      }
+    });
+
+    /* ── Final-pass sweep: re-fill any still-empty required fields ──
+       Some React forms toggle required state only after first focus, or
+       reveal new inputs after a parent dropdown changes. A second pass
+       catches those. */
+    await sleep(800);
+    const stillEmpty = $$(
+      'input[required]:not([type=hidden]):not([type=file]):not([type=submit]):not([type=button]),' +
+      'input[aria-required="true"]:not([type=hidden]):not([type=file]),' +
+      'textarea[required],textarea[aria-required="true"],' +
+      'select[required],select[aria-required="true"]'
+    ).filter(el => isVisible(el) && !(el.value && el.value.trim()));
+
+    for (const el of stillEmpty) {
+      const lbl = getLabel(el);
+      if (!lbl) continue;
+      if (el.tagName === 'SELECT') {
+        const val = guessValue(lbl, p);
+        const chosen = val ? bestSelectOption(el, val, lbl) : null;
+        const fallback = chosen || bestSelectOption(el, 'yes') ||
+                         $$('option', el).find(o => o.value && o.value !== '' && !/^select/i.test(o.text));
+        if (fallback) {
+          el.value = fallback.value;
+          el.dispatchEvent(new Event('change', { bubbles: true }));
+          filledCount++;
+          reportFieldFilled(lbl, 'filled');
+        }
+      } else {
+        const inputType = (el.type || '').toLowerCase();
+        let val = guessValue(lbl, p, inputType);
+        /* Last-resort defaults for required fields we couldn't classify */
+        if (!val) {
+          if (inputType === 'email') val = p.email || '';
+          else if (inputType === 'tel') val = p.phone || '';
+          else if (inputType === 'number') val = '1';
+          else if (inputType === 'date') val = new Date().toISOString().slice(0,10);
+          else val = (p.first_name || 'N/A');
+        }
+        if (val) {
+          el.focus(); nativeSet(el, val); await sleep(40);
+          filledCount++;
+          reportFieldFilled(lbl, 'filled');
+        }
+      }
+    }
 
     // Final progress update
     try {
@@ -1997,7 +2297,11 @@
   (function installStuckWatchdog() {
     let _watchdogUrl = '';
     let _watchdogTimer = null;
-    const STUCK_TIMEOUT_MS = 25_000; // 25 seconds
+    /* 7s — user preference for high-throughput 2000+ queues. _fillActive
+       and _submitAttempted guards still suppress the skip during real
+       form filling / submit attempts, so we only skip when the page is
+       truly idle on the same URL for 7s straight. */
+    const STUCK_TIMEOUT_MS = 7_000;
 
     async function checkStuck() {
       const { csvActiveJobId, isAutoProcessStartJob } = await ST.get([
@@ -2031,8 +2335,322 @@
     }
 
     // Poll every 15 seconds for URL / active status changes
-    setInterval(checkStuck, 15_000);
+    setInterval(checkStuck, 3_000); // poll every 3s so 7s stalls are caught promptly
     checkStuck();
+  })();
+
+  /* ── T39 / T40: Zero-manual-effort auto-clickers ─────────────────────────
+   * The 2.6.0 release added two interstitial screens that block the queue
+   * unless the user clicks through:
+   *   T39 — Custom Resume editor (optimhire.com): "Save & Next →" button
+   *   T40 — Custom Cover Letter modal: "Apply Now" button
+   * Both only fire while active automation is running (csvActiveJobId,
+   * isAutoProcessStartJob, or autoApplyStateUpdate.isRunning) AND only
+   * after the "Generating..." state has settled. We wait up to STABLE_MS
+   * for the button to stay visible (so we don't click before the
+   * generation finishes), then click via realClick().
+   * ─────────────────────────────────────────────────────────────────────── */
+  (function installAutoActionClickers() {
+    /* High-throughput tuning: by the time React has painted the
+       Save & Next / Apply Now button as visible+enabled in the
+       main page, the content is ready. The "Generating..." text
+       lives in the sidepanel (separate extension context), not
+       in the main page DOM, so we just need a tiny stability
+       window so we're not clicking a button that's about to flip
+       to disabled. */
+    const STABLE_MS    =   150;
+    const POLL_MS      =   100;
+    const _clicked     = new WeakSet();
+    const _firstSeenAt = new WeakMap();
+
+    function looksGenerating(root) {
+      const t = (root && root.textContent) || '';
+      return /Generating\s+(Custom\s+)?(Resume|Cover\s*Letter)/i.test(t);
+    }
+
+    /* Find a visible button whose own text matches `re` */
+    function findBtn(re) {
+      const cands = document.querySelectorAll('button, [role="button"], a');
+      for (const el of cands) {
+        if (!el || _clicked.has(el)) continue;
+        const txt = ((el.innerText || el.textContent || '') + '').trim();
+        if (!txt || txt.length > 40) continue;
+        if (!re.test(txt)) continue;
+        if (!isVisible(el)) continue;
+        if (el.disabled) continue;
+        const ariaDis = el.getAttribute && el.getAttribute('aria-disabled');
+        if (ariaDis === 'true') continue;
+        return el;
+      }
+      return null;
+    }
+
+    async function automationActive() {
+      try {
+        const { csvActiveJobId, isAutoProcessStartJob, autoApplyStateUpdate } =
+          await ST.get(['csvActiveJobId', 'isAutoProcessStartJob', 'autoApplyStateUpdate']);
+        return !!csvActiveJobId || !!isAutoProcessStartJob ||
+               !!(autoApplyStateUpdate && autoApplyStateUpdate.isRunning);
+      } catch (_) { return false; }
+    }
+
+    async function maybeClick(re, label) {
+      if (!(await automationActive())) return;
+      const btn = findBtn(re);
+      if (!btn) return;
+      /* Bail out while "Generating..." is still on screen — clicking the
+         button before generation finishes either no-ops or saves an empty
+         doc.  Look for the indicator within the modal/page subtree. */
+      const root = btn.closest('section, [role="dialog"], [class*="modal" i], ' +
+                                '[class*="Modal" i], [class*="drawer" i], ' +
+                                '[class*="Drawer" i], main, body') || document.body;
+      if (looksGenerating(root)) {
+        /* reset the stability timer while still generating */
+        _firstSeenAt.delete(btn);
+        return;
+      }
+      const now = Date.now();
+      if (!_firstSeenAt.has(btn)) { _firstSeenAt.set(btn, now); return; }
+      if (now - _firstSeenAt.get(btn) < STABLE_MS) return;
+
+      _clicked.add(btn);
+      LOG(`Auto-click: ${label}`);
+      try { realClick(btn); } catch (_) { try { btn.click(); } catch (__) {} }
+    }
+
+    /* T39 — Save & Next →  (only on optimhire.com resume editor) */
+    async function tickSaveNext() {
+      if (!/optimhire\.com$/i.test(location.hostname) &&
+          !/\.optimhire\.com$/i.test(location.hostname)) return;
+      await maybeClick(/^Save\s*&\s*Next(\s*[→>›])?$/i, 'Save & Next →');
+    }
+
+    /* T40 — Apply Now  (any URL with the cover-letter modal) */
+    async function tickApplyNow() {
+      await maybeClick(/^Apply\s*Now$/i, 'Apply Now');
+    }
+
+    setInterval(tickSaveNext, POLL_MS);
+    setInterval(tickApplyNow, POLL_MS);
+
+    /* Also drive on DOM mutation so we react fast when the modal opens */
+    function startObserver() {
+      try {
+        const obs = new MutationObserver(() => {
+          tickSaveNext().catch(() => {});
+          tickApplyNow().catch(() => {});
+        });
+        obs.observe(document.body, { childList: true, subtree: true });
+      } catch (_) {}
+    }
+    if (document.body) startObserver();
+    else document.addEventListener('DOMContentLoaded', startObserver);
+  })();
+
+  /* ── T41 / T42 / T43: End-to-end flow controller ─────────────────────────
+   * T41 — Multi-step Next/Continue/Review advance. After the autofill has
+   *       just finished on the current page (i.e. _fillActive flipped to
+   *       false and stayed false for the settle window), click the
+   *       intermediate-step advance button. Tracked per URL fingerprint
+   *       so we don't double-advance the same step.
+   * T42 — Already-applied / unsupported overlay quick-dismiss. If the
+   *       OptimHire overlay (or the ATS page) reports the job is already
+   *       applied / has no application / is unavailable, click the
+   *       close/dismiss/got-it button to free the queue immediately.
+   * T43 — Generic terminal-submit fallback. ATS-specific handlers do this
+   *       on their domains; on unsupported ATSes, click the page's only
+   *       sensible "Submit Application" button after fill is stable.
+   *
+   * All three gate on:
+   *   - Active automation (csvActiveJobId / isAutoProcessStartJob /
+   *     autoApplyStateUpdate.isRunning) — won't fire during idle browsing.
+   *   - _fillActive false — never click while a fill pass is running.
+   *   - Not within the 30s submit-suppression window — avoid double-submit.
+   * ─────────────────────────────────────────────────────────────────────── */
+  (function installFlowController() {
+    const SETTLE_MS = 1_000;   // wait this long after fill stops before clicking
+    const POLL_MS   =   400;
+    const _clicked  = new WeakSet();
+    const _dismissedFingerprints = new Set();
+
+    /* Track when _fillActive transitions true → false without touching
+       the existing transition points (those live in several functions). */
+    let _wasFilling = false;
+    let _lastFillCompletedTs = Date.now();
+    setInterval(() => {
+      if (_wasFilling && !_fillActive) _lastFillCompletedTs = Date.now();
+      _wasFilling = _fillActive;
+    }, 200);
+
+    function automationActive() {
+      return ST.get(['csvActiveJobId','isAutoProcessStartJob','autoApplyStateUpdate'])
+        .then(d => !!(d.csvActiveJobId || d.isAutoProcessStartJob ||
+                      (d.autoApplyStateUpdate && d.autoApplyStateUpdate.isRunning)));
+    }
+
+    function fillStable() {
+      if (_fillActive) return false;
+      if (Date.now() - _lastFillCompletedTs < SETTLE_MS) return false;
+      return true;
+    }
+
+    function submitSuppressed() {
+      return _submitAttempted && (Date.now() - _submitAttemptTs) < 30_000;
+    }
+
+    function pageFingerprint(extra) {
+      /* URL + count of visible form controls — changes between steps */
+      const ctrlCount = document.querySelectorAll(
+        'input:not([type=hidden]),textarea,select'
+      ).length;
+      return location.href + '|' + ctrlCount + '|' + (extra || '');
+    }
+
+    function findBtnByText(re, scopeEl) {
+      const root = scopeEl || document;
+      const cands = root.querySelectorAll(
+        'button, [role="button"], input[type="submit"], input[type="button"], a'
+      );
+      for (const el of cands) {
+        if (!el || _clicked.has(el)) continue;
+        if (el.disabled) continue;
+        if (el.getAttribute && el.getAttribute('aria-disabled') === 'true') continue;
+        if (!isVisible(el)) continue;
+        const txt = ((el.innerText || el.value || el.textContent || '') + '')
+                      .replace(/\s+/g, ' ').trim();
+        if (!txt || txt.length > 60) continue;
+        if (re.test(txt)) return el;
+      }
+      return null;
+    }
+
+    /* ── T41: Multi-step intermediate advance ── */
+    const ADVANCE_RE = /^(next|continue|next\s+step|proceed|review|go\s+to\s+review|save\s+and\s+continue|save\s+&\s+continue|save\s+and\s+next|save\s+&\s+next|to\s+the\s+next\s+step)$/i;
+    /* These are TERMINAL — don't click them in the intermediate pass
+       (T43 / T27 handle them). Listed so ADVANCE_RE doesn't pick them up
+       via partial overlap. */
+    const TERMINAL_RE = /^(submit(\s+application)?|send\s+application|complete\s+application|finish(\s+application)?|apply\s+now|confirm\s+and\s+submit|submit\s+my\s+application)$/i;
+
+    async function tickAdvance() {
+      if (!await automationActive()) return;
+      if (!fillStable() || submitSuppressed()) return;
+
+      /* Don't advance if the page is still showing validation errors */
+      const hasErrors = !!document.querySelector(
+        '[aria-invalid="true"],.error,.is-invalid,[class*="field-error"],[class*="fieldError"],[role="alert"][class*="error" i]'
+      );
+      if (hasErrors) return;
+
+      const btn = findBtnByText(ADVANCE_RE);
+      if (!btn) return;
+      const txt = ((btn.innerText || btn.textContent || '') + '').trim();
+      if (TERMINAL_RE.test(txt)) return; // safety: never advance via a submit-looking word
+
+      /* Per-fingerprint guard so we don't ping-pong on the same step */
+      const fp = pageFingerprint('advance');
+      if (_dismissedFingerprints.has(fp)) return;
+      _dismissedFingerprints.add(fp);
+      _clicked.add(btn);
+      LOG(`Flow: clicking advance "${txt}"`);
+      try { realClick(btn); } catch (_) { try { btn.click(); } catch (__) {} }
+    }
+
+    /* ── T42: Already-applied / unsupported quick-dismiss ── */
+    const ALREADY_TEXT_RE = /(already\s+applied|application\s+already\s+submitted|you\s+have\s+already\s+applied|no\s+application\s+(form|available)|job\s+is\s+no\s+longer\s+available|this\s+position\s+is\s+closed|posting\s+is\s+closed|application\s+window\s+has\s+closed)/i;
+    const DISMISS_RE = /^(ok|okay|got\s*it|close|dismiss|cancel|skip|next\s+job|continue)$/i;
+
+    async function tickAlreadyApplied() {
+      if (!await automationActive()) return;
+      const bodyText = (document.body && document.body.innerText || '').slice(0, 4000);
+      if (!ALREADY_TEXT_RE.test(bodyText)) return;
+
+      /* Look for a close/dismiss button anywhere on the page first; if
+         none, send a skipCurrent so the queue moves on. */
+      const fp = pageFingerprint('alreadyApplied');
+      if (_dismissedFingerprints.has(fp)) return;
+
+      const btn = findBtnByText(DISMISS_RE);
+      if (btn) {
+        _dismissedFingerprints.add(fp);
+        _clicked.add(btn);
+        LOG('Flow: dismissing already-applied / unavailable card');
+        try { realClick(btn); } catch (_) { try { btn.click(); } catch (__) {} }
+        /* Also tell the queue to advance — even if the dismiss closes the
+           modal, the underlying page might not navigate. */
+        setTimeout(() => {
+          try { chrome.runtime.sendMessage({ action: 'skipCurrent' }).catch(() => {}); }
+          catch (_) {}
+        }, 600);
+        return;
+      }
+      /* No dismiss button found — just skip */
+      _dismissedFingerprints.add(fp);
+      LOG('Flow: already-applied detected, no dismiss button — skipping');
+      try { chrome.runtime.sendMessage({ action: 'skipCurrent' }).catch(() => {}); }
+      catch (_) {}
+    }
+
+    /* ── T43: Generic terminal-submit fallback ──
+       Only runs when:
+         - Fill has been stable for SETTLE_MS
+         - No submit has been attempted in the last 30s
+         - No validation errors are visible on the page
+         - The page contains a button whose text matches a terminal pattern
+       Marks _submitAttempted so the stuck watchdog doesn't fire. */
+    const T43_TERMINAL_RE = /^(submit\s+application|send\s+application|submit\s+my\s+application|complete\s+application|submit)$/i;
+
+    async function tickGenericSubmit() {
+      if (!await automationActive()) return;
+      if (!fillStable() || submitSuppressed()) return;
+
+      /* Don't run on the optimhire.com domain — the overlay/cover-letter
+         flow already drives submit there via T39/T40. */
+      if (/optimhire\.com$/i.test(location.hostname) ||
+          /\.optimhire\.com$/i.test(location.hostname)) return;
+
+      const hasErrors = !!document.querySelector(
+        '[aria-invalid="true"],.error,.is-invalid,[class*="field-error"],[class*="fieldError"]'
+      );
+      if (hasErrors) return;
+
+      const btn = findBtnByText(T43_TERMINAL_RE);
+      if (!btn) return;
+      /* Don't double-submit on the same step */
+      const fp = pageFingerprint('submit');
+      if (_dismissedFingerprints.has(fp)) return;
+      _dismissedFingerprints.add(fp);
+      _clicked.add(btn);
+      LOG(`Flow: clicking terminal submit "${((btn.innerText||'')+'').trim()}"`);
+      markSubmitAttempted();
+      try { realClick(btn); } catch (_) { try { btn.click(); } catch (__) {} }
+    }
+
+    /* URL-change resets the fingerprint cache so the next step is
+       eligible for advance/dismiss/submit again. */
+    let _lastUrl = location.href;
+    setInterval(() => {
+      if (location.href !== _lastUrl) {
+        _lastUrl = location.href;
+        _dismissedFingerprints.clear();
+      }
+    }, 500);
+
+    setInterval(() => {
+      tickAdvance().catch(() => {});
+      tickAlreadyApplied().catch(() => {});
+      tickGenericSubmit().catch(() => {});
+    }, POLL_MS);
+
+    function startObs() {
+      try {
+        const obs = new MutationObserver(() => {
+          tickAlreadyApplied().catch(() => {});
+        });
+        obs.observe(document.body, { childList: true, subtree: true });
+      } catch (_) {}
+    }
+    if (document.body) startObs();
+    else document.addEventListener('DOMContentLoaded', startObs);
   })();
 
   /* ── T12: Auto-solve captchas ────────────────────────────── */
