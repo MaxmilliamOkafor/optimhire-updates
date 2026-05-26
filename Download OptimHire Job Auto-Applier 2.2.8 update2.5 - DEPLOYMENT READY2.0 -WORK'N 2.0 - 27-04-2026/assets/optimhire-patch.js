@@ -2502,24 +2502,20 @@
    * generation finishes), then click via realClick().
    * ─────────────────────────────────────────────────────────────────────── */
   (function installAutoActionClickers() {
-    /* High-throughput tuning: by the time React has painted the
-       Save & Next / Apply Now button as visible+enabled in the
-       main page, the content is ready. The "Generating..." text
-       lives in the sidepanel (separate extension context), not
-       in the main page DOM, so we just need a tiny stability
-       window so we're not clicking a button that's about to flip
-       to disabled. */
-    const STABLE_MS    =    50;
+    /* High-throughput tuning for 2000+ queues. The button paints
+       only AFTER the server-side resume / cover-letter generation
+       completes, and the visible+enabled check below guarantees
+       React has the button ready. So we click on the FIRST sight
+       with no stability window — saves ~50–100ms per button. */
     const POLL_MS      =    50;
     const _clicked     = new WeakSet();
-    const _firstSeenAt = new WeakMap();
 
     function looksGenerating(root) {
       const t = (root && root.textContent) || '';
       return /Generating\s+(Custom\s+)?(Resume|Cover\s*Letter)/i.test(t);
     }
 
-    /* Find a visible button whose own text matches `re` */
+    /* Find a visible+enabled button whose own text matches `re` */
     function findBtn(re) {
       const cands = document.querySelectorAll('button, [role="button"], a');
       for (const el of cands) {
@@ -2536,14 +2532,9 @@
       return null;
     }
 
-    async function automationActive() {
-      try {
-        const { csvActiveJobId, isAutoProcessStartJob, autoApplyStateUpdate } =
-          await ST.get(['csvActiveJobId', 'isAutoProcessStartJob', 'autoApplyStateUpdate']);
-        return !!csvActiveJobId || !!isAutoProcessStartJob ||
-               !!(autoApplyStateUpdate && autoApplyStateUpdate.isRunning);
-      } catch (_) { return false; }
-    }
+    /* Use the shared cached helper (1.5s TTL) instead of doing our
+       own storage read on every tick. */
+    const automationActive = () => isAutomationActive();
 
     async function maybeClick(re, label) {
       if (!(await automationActive())) return;
@@ -2551,19 +2542,14 @@
       if (!btn) return;
       /* Bail out while "Generating..." is still on screen — clicking the
          button before generation finishes either no-ops or saves an empty
-         doc.  Look for the indicator within the modal/page subtree. */
+         doc. Look for the indicator within the modal/page subtree. */
       const root = btn.closest('section, [role="dialog"], [class*="modal" i], ' +
                                 '[class*="Modal" i], [class*="drawer" i], ' +
                                 '[class*="Drawer" i], main, body') || document.body;
-      if (looksGenerating(root)) {
-        /* reset the stability timer while still generating */
-        _firstSeenAt.delete(btn);
-        return;
-      }
-      const now = Date.now();
-      if (!_firstSeenAt.has(btn)) { _firstSeenAt.set(btn, now); return; }
-      if (now - _firstSeenAt.get(btn) < STABLE_MS) return;
+      if (looksGenerating(root)) return;
 
+      /* First-sight click — visible+enabled check above is enough to
+         know the button is ready. */
       _clicked.add(btn);
       LOG(`Auto-click: ${label}`);
       try { realClick(btn); } catch (_) { try { btn.click(); } catch (__) {} }
