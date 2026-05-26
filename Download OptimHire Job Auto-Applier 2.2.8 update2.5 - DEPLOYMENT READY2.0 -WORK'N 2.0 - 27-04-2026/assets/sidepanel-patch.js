@@ -2,9 +2,201 @@
  * sidepanel-patch.js — CSP-safe JS for sidepanel.html
  * Auto-Apply Mode status panel: live status log, field tracking,
  * progress bar, Skip/Stop controls.
+ *
+ * Sidepanel context limit-busting (matches optimhire-patch.js T2/T16
+ * but inside the extension's own sidepanel page):
+ *   - chrome.storage.local.get → returns 9999 for all credit fields
+ *   - Periodic write of 9999 into known credit storage keys
+ *   - Aggressive DOM hide of Upgrade banner, "Auto-fill Credits"
+ *     counter, and the "Earn While You Search for a Job" referral card
  */
 (function () {
   'use strict';
+
+  /* ════════════════════════════════════════════════════════════
+     ZERO LIMITATION ENFORCEMENT (sidepanel context)
+     ════════════════════════════════════════════════════════════ */
+
+  /* ── Credit interception: chrome.storage.local.get → 9999 ── */
+  var CREDIT_FIELDS = [
+    'free_left_credits','leftCredits','remainingCredits','credits',
+    'autofillCredits','plan_credits','totalCredits','daily_credits',
+    'remaining_credits','autoFillCredits','autofill_credits',
+    'free_credits','credit_balance','creditsLeft','creditLeft'
+  ];
+  var CREDIT_BOOL_FIELDS = [
+    'isCreditLeft','is_credit_left','hasCredits','has_credits',
+    'isPremium','is_premium','is_pro','isPro','isPaid','is_paid',
+    'isSubscribed','is_subscribed','isUnlimited','is_unlimited'
+  ];
+  var PLAN_FIELDS = ['plan','planName','plan_name','subscriptionPlan','tier'];
+
+  function deepPatch(obj, seen) {
+    if (!obj || typeof obj !== 'object') return obj;
+    seen = seen || new WeakSet();
+    if (seen.has(obj)) return obj;
+    seen.add(obj);
+    CREDIT_FIELDS.forEach(function (f) { if (f in obj) obj[f] = 9999; });
+    CREDIT_BOOL_FIELDS.forEach(function (f) { if (f in obj) obj[f] = true; });
+    PLAN_FIELDS.forEach(function (f) {
+      if (f in obj && typeof obj[f] === 'string' && /free/i.test(obj[f])) {
+        obj[f] = 'premium';
+      }
+    });
+    Object.keys(obj).forEach(function (k) {
+      if (obj[k] && typeof obj[k] === 'object') obj[k] = deepPatch(obj[k], seen);
+    });
+    return obj;
+  }
+
+  try {
+    var _origGet = chrome.storage.local.get.bind(chrome.storage.local);
+    chrome.storage.local.get = function (keys, cb) {
+      var patchResult = function (result) {
+        Object.keys(result).forEach(function (k) {
+          var v = result[k];
+          if (v && typeof v === 'object') {
+            try { result[k] = deepPatch(JSON.parse(JSON.stringify(v))); } catch (_) {}
+          } else if (typeof v === 'string') {
+            try {
+              var parsed = JSON.parse(v);
+              if (parsed && typeof parsed === 'object') {
+                result[k] = JSON.stringify(deepPatch(parsed));
+              }
+            } catch (_) {}
+          }
+        });
+        return result;
+      };
+      if (typeof cb === 'function') {
+        try { return _origGet(keys, function (r) { cb(patchResult(r)); }); }
+        catch (_) { try { cb({}); } catch (__) {} return; }
+      }
+      return _origGet(keys).then(patchResult).catch(function () { return {}; });
+    };
+  } catch (_) {}
+
+  /* Periodically write 9999 into known credit-bearing storage keys */
+  function enforceCredits() {
+    try {
+      var keys = ['candidateDetails','userDetails','planDetails',
+                  'subscriptionDetails','cachedSeekerInfo','seekerDetails'];
+      chrome.storage.local.get(keys, function (data) {
+        var upd = {};
+        keys.forEach(function (k) {
+          if (!data[k]) return;
+          try {
+            var wasStr = typeof data[k] === 'string';
+            var parsed = wasStr ? JSON.parse(data[k]) : data[k];
+            var patched = deepPatch(JSON.parse(JSON.stringify(parsed)));
+            upd[k] = wasStr ? JSON.stringify(patched) : patched;
+          } catch (_) {}
+        });
+        if (Object.keys(upd).length) {
+          try { chrome.storage.local.set(upd); } catch (_) {}
+        }
+      });
+    } catch (_) {}
+  }
+  enforceCredits();
+  setInterval(enforceCredits, 15000);
+
+  /* ── DOM hide: Upgrade banner, credit counter, referral card ── */
+  var HIDE_TEXT_PATTERNS = [
+    'Get unlimited Credits',
+    'AI cover letter & more',
+    'Auto-fill Credits',
+    'Auto-fill Credits left today',
+    'Earn While You Search',
+    'Help your friends avoid applying',
+    'Get 20 Auto-fill Credits',
+    'for each referral who upgrades',
+    'One Referral 3 Benefits',
+    'to get Unlimited Credits',
+    'to get unlimited credits',
+    'will get 3 free Credits daily',
+    'have Auto-Fill credits'
+  ];
+
+  function findCardAncestor(el) {
+    var node = el;
+    for (var i = 0; i < 10 && node && node.parentElement; i++) {
+      node = node.parentElement;
+      var cls = (node.className && typeof node.className === 'string') ? node.className : '';
+      if (cls.indexOf('bg-') !== -1 || cls.indexOf('border') !== -1 ||
+          cls.indexOf('rounded') !== -1 || cls.indexOf('card') !== -1 ||
+          cls.indexOf('Card') !== -1) {
+        return node;
+      }
+    }
+    return el;
+  }
+
+  function hideMatching() {
+    try {
+      /* Hide elements matching text patterns */
+      var nodes = document.querySelectorAll('h1,h2,h3,h4,p,span,div,a,button');
+      for (var i = 0; i < nodes.length; i++) {
+        var el = nodes[i];
+        if (!el || el.dataset && el.dataset.ohHidden === '1') continue;
+        var t = el.textContent || '';
+        if (t.length > 500) continue;
+        for (var j = 0; j < HIDE_TEXT_PATTERNS.length; j++) {
+          if (t.indexOf(HIDE_TEXT_PATTERNS[j]) !== -1) {
+            var target = findCardAncestor(el);
+            target.style.cssText = 'display:none!important';
+            if (target.dataset) target.dataset.ohHidden = '1';
+            break;
+          }
+        }
+      }
+      /* Hide upgrade links/buttons by href / aria-label */
+      var upgradeLinks = document.querySelectorAll(
+        'a[href*="openUpgradePlan"],a[href*="/d/membership"],' +
+        'button[aria-label*="Upgrade" i],a[aria-label*="Upgrade" i]'
+      );
+      for (var k = 0; k < upgradeLinks.length; k++) {
+        var l = upgradeLinks[k];
+        if (l.dataset && l.dataset.ohHidden === '1') continue;
+        var cardL = findCardAncestor(l);
+        cardL.style.cssText = 'display:none!important';
+        if (cardL.dataset) cardL.dataset.ohHidden = '1';
+      }
+    } catch (_) {}
+  }
+
+  /* Inject a CSS hammer for known referral/affiliate selectors */
+  try {
+    var style = document.createElement('style');
+    style.textContent =
+      '[class*="referral" i],[class*="Referral" i],[id*="referral" i],' +
+      '[data-testid*="referral" i],[class*="affiliate" i],' +
+      '[class*="earnCredit" i],[class*="inviteFriend" i],' +
+      '[class*="invite-friend" i],[class*="ReferralScreen" i],' +
+      '[class*="upgrade" i][class*="banner" i],' +
+      '[class*="UpgradeBanner" i],[class*="upgrade-banner" i],' +
+      'a[href*="openUpgradePlan"]{display:none!important}';
+    (document.head || document.documentElement).appendChild(style);
+  } catch (_) {}
+
+  hideMatching();
+  setInterval(hideMatching, 1500);
+  if (document.body) {
+    new MutationObserver(hideMatching).observe(document.body, {
+      childList: true, subtree: true
+    });
+  } else {
+    document.addEventListener('DOMContentLoaded', function () {
+      hideMatching();
+      new MutationObserver(hideMatching).observe(document.body, {
+        childList: true, subtree: true
+      });
+    });
+  }
+
+  /* ════════════════════════════════════════════════════════════
+     AUTO-APPLY STATUS PANEL (original behaviour)
+     ════════════════════════════════════════════════════════════ */
 
   var $  = function (id) { return document.getElementById(id); };
 
@@ -34,9 +226,13 @@
   var _isRunning    = false;
   var _fieldMap     = {}; // fieldName -> {name, status, required}
 
-  /* ── Show/hide panel ── */
+  /* ── Show/hide panel ──
+     showPanel() only un-hides; it does NOT force-expand. Once the user
+     collapses the panel (header click), it stays collapsed across status
+     updates until the user explicitly expands it again. */
+  var _userCollapsed = false;
   function showPanel() {
-    if (panel) { panel.classList.remove('hidden'); panel.classList.remove('collapsed'); }
+    if (panel) panel.classList.remove('hidden');
   }
   function hidePanel() {
     if (panel) panel.classList.add('hidden');
@@ -146,7 +342,9 @@
   /* ── Collapse/expand ── */
   if (header) {
     header.addEventListener('click', function () {
-      if (panel) panel.classList.toggle('collapsed');
+      if (!panel) return;
+      panel.classList.toggle('collapsed');
+      _userCollapsed = panel.classList.contains('collapsed');
     });
   }
 
