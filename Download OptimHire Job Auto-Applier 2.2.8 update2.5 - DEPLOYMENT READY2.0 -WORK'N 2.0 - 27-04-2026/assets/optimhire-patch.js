@@ -2101,11 +2101,11 @@
   (function installStuckWatchdog() {
     let _watchdogUrl = '';
     let _watchdogTimer = null;
-    /* 30s — leave room for slow ATS (Workday, Greenhouse, iCIMS often
-       take 15–20s to render forms). T39/T40 clickers already handle the
-       known interstitials, so the watchdog is a safety net, not the
-       primary throughput driver. Too aggressive = false skips. */
-    const STUCK_TIMEOUT_MS = 30_000;
+    /* 7s — user preference for high-throughput 2000+ queues. _fillActive
+       and _submitAttempted guards still suppress the skip during real
+       form filling / submit attempts, so we only skip when the page is
+       truly idle on the same URL for 7s straight. */
+    const STUCK_TIMEOUT_MS = 7_000;
 
     async function checkStuck() {
       const { csvActiveJobId, isAutoProcessStartJob } = await ST.get([
@@ -2139,7 +2139,7 @@
     }
 
     // Poll every 15 seconds for URL / active status changes
-    setInterval(checkStuck, 10_000); // poll every 10s
+    setInterval(checkStuck, 3_000); // poll every 3s so 7s stalls are caught promptly
     checkStuck();
   })();
 
