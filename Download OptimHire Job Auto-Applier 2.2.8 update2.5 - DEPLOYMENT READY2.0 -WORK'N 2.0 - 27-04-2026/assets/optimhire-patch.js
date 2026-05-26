@@ -2162,8 +2162,8 @@
        in the main page DOM, so we just need a tiny stability
        window so we're not clicking a button that's about to flip
        to disabled. */
-    const STABLE_MS    =   400;
-    const POLL_MS      =   200;
+    const STABLE_MS    =   150;
+    const POLL_MS      =   100;
     const _clicked     = new WeakSet();
     const _firstSeenAt = new WeakMap();
 
