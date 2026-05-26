@@ -432,8 +432,11 @@
     'appliedToday','today_applied','isManualAppliedCount',
   ];
 
-  function deepPatchCredits(obj) {
+  function deepPatchCredits(obj, seen) {
     if (!obj || typeof obj !== 'object') return obj;
+    seen = seen || new WeakSet();
+    if (seen.has(obj)) return obj; // cycle guard
+    seen.add(obj);
     CREDIT_FIELDS.forEach(f => { if (f in obj) obj[f] = 9999; });
     CREDIT_BOOL_FIELDS.forEach(f => {
       if (f in obj) {
@@ -459,7 +462,7 @@
       if (f in obj && typeof obj[f] === 'number' && obj[f] > 0) obj[f] = 0;
     });
     Object.keys(obj).forEach(k => {
-      if (obj[k] && typeof obj[k] === 'object') obj[k] = deepPatchCredits(obj[k]);
+      if (obj[k] && typeof obj[k] === 'object') obj[k] = deepPatchCredits(obj[k], seen);
     });
     return obj;
   }
@@ -2518,14 +2521,9 @@
       return null;
     }
 
-    async function automationActive() {
-      try {
-        const { csvActiveJobId, isAutoProcessStartJob, autoApplyStateUpdate } =
-          await ST.get(['csvActiveJobId', 'isAutoProcessStartJob', 'autoApplyStateUpdate']);
-        return !!csvActiveJobId || !!isAutoProcessStartJob ||
-               !!(autoApplyStateUpdate && autoApplyStateUpdate.isRunning);
-      } catch (_) { return false; }
-    }
+    /* Use the shared cached helper (declared at top of file) instead
+       of doing our own storage read on every tick. */
+    const automationActive = () => isAutomationActive();
 
     async function maybeClick(re, label) {
       if (!(await automationActive())) return;
@@ -2621,11 +2619,10 @@
       _wasFilling = _fillActive;
     }, 200);
 
-    function automationActive() {
-      return ST.get(['csvActiveJobId','isAutoProcessStartJob','autoApplyStateUpdate'])
-        .then(d => !!(d.csvActiveJobId || d.isAutoProcessStartJob ||
-                      (d.autoApplyStateUpdate && d.autoApplyStateUpdate.isRunning)));
-    }
+    /* Use the shared cached helper (declared at top of file) — its
+       1.5s cache covers our 400ms tick cadence without any storage
+       reads on most ticks. */
+    const automationActive = () => isAutomationActive();
 
     function fillStable() {
       if (_fillActive) return false;

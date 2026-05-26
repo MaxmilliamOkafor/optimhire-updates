@@ -63,9 +63,7 @@
       }
     });
     Object.keys(SP_PLAN_STR_PATCHES).forEach(function (f) {
-      if (f in obj && typeof obj[f] === 'string' && /^free$/i.test(obj[f])) {
-        obj[f] = SP_PLAN_STR_PATCHES[f];
-      } else if (f in obj && typeof obj[f] === 'string') {
+      if (f in obj && typeof obj[f] === 'string') {
         obj[f] = SP_PLAN_STR_PATCHES[f];
       }
     });
@@ -132,7 +130,13 @@
             var parsed = wasStr ? JSON.parse(data[k]) : data[k];
             if (!parsed || typeof parsed !== 'object') return;
             var patched = spDeepPatch(JSON.parse(JSON.stringify(parsed)));
-            upd[k] = wasStr ? JSON.stringify(patched) : patched;
+            /* Skip write if nothing changed — avoids unnecessary
+               storage.onChanged firings and React re-renders. */
+            var serialized = wasStr ? JSON.stringify(patched) : patched;
+            var sCmp = typeof serialized === 'string' ? serialized : JSON.stringify(serialized);
+            var origCmp = wasStr ? data[k] : JSON.stringify(data[k]);
+            if (sCmp === origCmp) return;
+            upd[k] = serialized;
           } catch (_) {}
         });
         if (Object.keys(upd).length) {
