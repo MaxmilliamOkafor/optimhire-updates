@@ -11,7 +11,144 @@
   'use strict';
 
   /* ════════════════════════════════════════════════════════════
-     ZERO LIMITATION — targeted hide only (no storage tampering)
+     ZERO LIMITATION — DOM hide + safe storage WRITE-wrap
+     ════════════════════════════════════════════════════════════
+     We never wrap chrome.storage.local.get in the sidepanel (last
+     time that broke the React app), but we DO wrap .set so any
+     candidateDetails / planDetails that flows through it gets
+     normalised to "premium / unlimited credits" before it lands
+     in storage. We also do ONE forced rewrite of candidateDetails
+     on startup so the React state re-reads as premium. */
+
+  var SP_CREDIT_FIELDS = [
+    'free_left_credits','leftCredits','remainingCredits','credits',
+    'autofillCredits','plan_credits','totalCredits','daily_credits',
+    'remaining_credits','autoFillCredits','autofill_credits',
+    'free_credits','credit_balance','creditsLeft','creditLeft',
+    'availableCredits','available_credits'
+  ];
+  var SP_PLAN_STR_PATCHES = {
+    copilot_status: 'PREMIUM',
+    plan: 'premium',
+    planName: 'Premium',
+    plan_name: 'premium',
+    subscriptionPlan: 'premium',
+    subscription_plan: 'premium',
+    tier: 'premium',
+    accountType: 'PREMIUM',
+    account_type: 'PREMIUM'
+  };
+  var SP_BOOL_FLIP = [
+    'isCreditLeft','is_credit_left','isPremium','is_premium',
+    'is_pro','isPro','isPaid','is_paid','isSubscribed','is_subscribed',
+    'isUnlimited','is_unlimited','is_copilot_active',
+    'is_first_attempt_completed','isUpgraded'
+  ];
+  var SP_COUNTER_ZERO = [
+    'appliedCount','applied_count','dailyApplied','daily_applied',
+    'appliedToday','today_applied','isManualAppliedCount'
+  ];
+
+  function spDeepPatch(obj, seen) {
+    if (!obj || typeof obj !== 'object') return obj;
+    seen = seen || new WeakSet();
+    if (seen.has(obj)) return obj;
+    seen.add(obj);
+    SP_CREDIT_FIELDS.forEach(function (f) { if (f in obj) obj[f] = 9999; });
+    SP_BOOL_FLIP.forEach(function (f) {
+      if (!(f in obj)) return;
+      var cur = obj[f];
+      if (cur === '0' || cur === 0 || cur === false) {
+        obj[f] = (typeof cur === 'string') ? '1' : true;
+      }
+    });
+    Object.keys(SP_PLAN_STR_PATCHES).forEach(function (f) {
+      if (f in obj && typeof obj[f] === 'string') {
+        obj[f] = SP_PLAN_STR_PATCHES[f];
+      }
+    });
+    SP_COUNTER_ZERO.forEach(function (f) {
+      if (f in obj && typeof obj[f] === 'number' && obj[f] > 0) obj[f] = 0;
+    });
+    Object.keys(obj).forEach(function (k) {
+      if (obj[k] && typeof obj[k] === 'object') obj[k] = spDeepPatch(obj[k], seen);
+    });
+    return obj;
+  }
+
+  /* Wrap chrome.storage.local.set so any future writes carry
+     premium / unlimited values. SAFE: doesn't change read paths. */
+  try {
+    var _spOrigSet = chrome.storage.local.set.bind(chrome.storage.local);
+    chrome.storage.local.set = function (items, cb) {
+      try {
+        if (items && typeof items === 'object') {
+          Object.keys(items).forEach(function (k) {
+            var v = items[k];
+            if (v && typeof v === 'object') {
+              try { items[k] = spDeepPatch(JSON.parse(JSON.stringify(v))); } catch (_) {}
+            } else if (typeof v === 'string' && /^[\[{]/.test(v.trim())) {
+              try {
+                var parsed = JSON.parse(v);
+                if (parsed && typeof parsed === 'object') {
+                  items[k] = JSON.stringify(spDeepPatch(parsed));
+                }
+              } catch (_) {}
+            } else if (typeof v === 'number' && SP_COUNTER_ZERO.indexOf(k) !== -1 && v > 0) {
+              items[k] = 0;
+            }
+          });
+        }
+      } catch (_) {}
+      if (typeof cb === 'function') {
+        try { return _spOrigSet(items, cb); }
+        catch (_) { try { cb(); } catch (__) {} return; }
+      }
+      return _spOrigSet(items).catch(function () {});
+    };
+  } catch (_) {}
+
+  /* One forced rewrite of candidateDetails on startup so the React
+     state re-reads as premium / unlimited. Repeat every 30s in case
+     the sidepanel refreshes from a server response. Diffs and
+     skips writes when nothing changed (no pointless re-renders). */
+  function spForceRewrite() {
+    try {
+      var keys = ['candidateDetails','userDetails','planDetails',
+                  'subscriptionDetails','cachedSeekerInfo','seekerDetails',
+                  'appliedCount','isManualAppliedCount'];
+      chrome.storage.local.get(keys, function (data) {
+        var upd = {};
+        keys.forEach(function (k) {
+          if (data[k] == null) return;
+          try {
+            if (typeof data[k] === 'number' && SP_COUNTER_ZERO.indexOf(k) !== -1) {
+              if (data[k] > 0) upd[k] = 0;
+              return;
+            }
+            var wasStr = typeof data[k] === 'string';
+            if (wasStr && !/^[\[{]/.test(data[k].trim())) return;
+            var parsed = wasStr ? JSON.parse(data[k]) : data[k];
+            if (!parsed || typeof parsed !== 'object') return;
+            var patched = spDeepPatch(JSON.parse(JSON.stringify(parsed)));
+            var serialized = wasStr ? JSON.stringify(patched) : patched;
+            var sCmp = typeof serialized === 'string' ? serialized : JSON.stringify(serialized);
+            var origCmp = wasStr ? data[k] : JSON.stringify(data[k]);
+            if (sCmp === origCmp) return;
+            upd[k] = serialized;
+          } catch (_) {}
+        });
+        if (Object.keys(upd).length) {
+          try { chrome.storage.local.set(upd); } catch (_) {}
+        }
+      });
+    } catch (_) {}
+  }
+  spForceRewrite();
+  setInterval(spForceRewrite, 30_000);
+
+  /* ════════════════════════════════════════════════════════════
+     ZERO LIMITATION — targeted DOM hide (no storage READ tampering)
      The previous version intercepted chrome.storage.local.get
      and walked up unbounded DOM ancestors hiding any with
      bg-/border/rounded/card in their class — which killed the
@@ -45,21 +182,37 @@
     (document.head || document.documentElement).appendChild(style);
   } catch (_) {}
 
-  /* Hide-by-text: find elements whose OWN text (not descendants')
-     matches one of these phrases, then hide a narrow ancestor.
-     Walk-up is bounded to 4 levels AND requires the ancestor's
-     total text length stay small (< 350 chars) so we never hide
-     the whole page. */
+  /* Hide-by-text patterns. Two passes per element:
+       (a) ownText (direct text-node children) — most precise, for
+           short labels and CTAs.
+       (b) textContent (descendants included) — needed when the
+           bundle wraps variable parts (20, $10, plan name) in
+           child spans so ownText is missing them. Constrained to
+           leaf-ish containers so we never hide the React root. */
   var HIDE_TEXT_PATTERNS = [
     'Get unlimited Credits',
     'AI cover letter & more',
     'Earn While You Search',
     'Help your friends avoid applying',
-    'Get 20 Auto-fill Credits',
-    'for each referral who upgrades',
+    'Auto-fill Credits for every signup',
+    'referral who upgrades to premium',
+    'referral who upgrades',
     'One Referral 3 Benefits',
     'Refer your friend to get',
-    'commission on hire'
+    'commission on hire',
+    /* 2.6.0 limit / upgrade banners in the sidepanel */
+    'Upgrade to get Unlimited Credits',
+    'Upgrade to get unlimited credits',
+    'free Credits daily',
+    'Auto-fill Credits left today',
+    'matching jobs by manually filling',
+    'Start Applying Manually',
+    'You can still apply to',
+    'Upgrade and save countless hours',
+    /* Resume-fetch error message — smart-quote variant in bundle */
+    "couldn’t fetch details for this resume",
+    "couldn't fetch details for this resume",
+    'fetch details for this resume right now'
   ];
 
   function ownText(el) {
@@ -117,14 +270,32 @@
 
   function hideMatching() {
     try {
-      var nodes = document.querySelectorAll('h1,h2,h3,h4,p,span,div,a,button');
+      var nodes = document.querySelectorAll('h1,h2,h3,h4,p,li,span,div,a,button');
       for (var i = 0; i < nodes.length; i++) {
         var el = nodes[i];
         if (!el || (el.dataset && el.dataset.ohHidden === '1')) continue;
+        var matched = false;
+        /* Pass 1: ownText — fast, precise for plain labels */
         var t = ownText(el).trim();
-        if (!t || t.length > 200) continue;
-        for (var j = 0; j < HIDE_TEXT_PATTERNS.length; j++) {
-          if (t.indexOf(HIDE_TEXT_PATTERNS[j]) !== -1) {
+        if (t && t.length <= 200) {
+          for (var j = 0; j < HIDE_TEXT_PATTERNS.length; j++) {
+            if (t.indexOf(HIDE_TEXT_PATTERNS[j]) !== -1) {
+              safeHide(pickAncestorToHide(el));
+              matched = true;
+              break;
+            }
+          }
+        }
+        if (matched) continue;
+        /* Pass 2: textContent — catches "Get [20] Auto-fill Credits"
+           where variable parts are wrapped in child spans. Bounded
+           length + bounded children so we never match a huge container. */
+        var tc = (el.textContent || '').replace(/\s+/g, ' ').trim();
+        if (!tc || tc.length > 300) continue;
+        var childElems = el.children ? el.children.length : 0;
+        if (childElems > 3 && el.tagName !== 'LI' && el.tagName !== 'P') continue;
+        for (var p = 0; p < HIDE_TEXT_PATTERNS.length; p++) {
+          if (tc.indexOf(HIDE_TEXT_PATTERNS[p]) !== -1) {
             safeHide(pickAncestorToHide(el));
             break;
           }

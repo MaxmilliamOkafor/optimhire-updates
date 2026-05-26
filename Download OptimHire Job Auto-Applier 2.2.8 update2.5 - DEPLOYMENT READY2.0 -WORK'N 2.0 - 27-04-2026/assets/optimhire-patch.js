@@ -381,28 +381,82 @@
   const CREDIT_FIELDS = [
     'free_left_credits','leftCredits','remainingCredits',
     'credits','autofillCredits','plan_credits','totalCredits',
+    'daily_credits','remaining_credits','autoFillCredits',
+    'autofill_credits','free_credits','credit_balance',
+    'creditsLeft','creditLeft','availableCredits','available_credits',
+  ];
+  /* 2.6.0 sidepanel gates the upgrade modal / "Start Applying Manually"
+     CTA on copilot_status === "FREE". Force PREMIUM and matching flags. */
+  const CREDIT_BOOL_FIELDS = [
+    'isCreditLeft','is_credit_left','hasCredits','has_credits',
+    'isPremium','is_premium','is_pro','isPro','isPaid','is_paid',
+    'isSubscribed','is_subscribed','isUnlimited','is_unlimited',
+    'is_copilot_active','is_first_attempt_completed','isUpgraded',
+  ];
+  const PLAN_STRING_PATCHES = {
+    copilot_status: 'PREMIUM',
+    plan: 'premium',
+    planName: 'Premium',
+    plan_name: 'premium',
+    subscriptionPlan: 'premium',
+    subscription_plan: 'premium',
+    tier: 'premium',
+    accountType: 'PREMIUM',
+    account_type: 'PREMIUM',
+  };
+  const COUNTER_ZERO_FIELDS = [
+    'appliedCount','applied_count','dailyApplied','daily_applied',
+    'appliedToday','today_applied','isManualAppliedCount',
   ];
 
-  function deepPatchCredits(obj) {
+  function deepPatchCredits(obj, seen) {
     if (!obj || typeof obj !== 'object') return obj;
+    seen = seen || new WeakSet();
+    if (seen.has(obj)) return obj;
+    seen.add(obj);
     CREDIT_FIELDS.forEach(f => { if (f in obj) obj[f] = 9999; });
+    CREDIT_BOOL_FIELDS.forEach(f => {
+      if (f in obj) {
+        const cur = obj[f];
+        if (cur === '0' || cur === 0 || cur === false) {
+          obj[f] = (typeof cur === 'string') ? '1' : true;
+        }
+      }
+    });
+    Object.keys(PLAN_STRING_PATCHES).forEach(f => {
+      if (f in obj && typeof obj[f] === 'string') {
+        obj[f] = PLAN_STRING_PATCHES[f];
+      }
+    });
+    COUNTER_ZERO_FIELDS.forEach(f => {
+      if (f in obj && typeof obj[f] === 'number' && obj[f] > 0) obj[f] = 0;
+    });
     Object.keys(obj).forEach(k => {
-      if (obj[k] && typeof obj[k] === 'object') obj[k] = deepPatchCredits(obj[k]);
+      if (obj[k] && typeof obj[k] === 'object') obj[k] = deepPatchCredits(obj[k], seen);
     });
     return obj;
   }
 
   async function enforceCredits() {
     try {
-      const keys = ['candidateDetails','userDetails','planDetails','subscriptionDetails'];
+      const keys = ['candidateDetails','userDetails','planDetails',
+                    'subscriptionDetails','cachedSeekerInfo','seekerDetails',
+                    'appliedCount','isManualAppliedCount'];
       const data = await ST.get(keys);
       const upd = {};
       keys.forEach(k => {
-        if (!data[k]) return;
+        if (data[k] == null) return;
         try {
-          const parsed = typeof data[k] === 'string' ? JSON.parse(data[k]) : data[k];
+          if (typeof data[k] === 'number' && COUNTER_ZERO_FIELDS.includes(k)) {
+            if (data[k] > 0) upd[k] = 0;
+            return;
+          }
+          const wasStr = typeof data[k] === 'string';
+          if (wasStr && !/^[\[{]/.test(data[k].trim())) return;
+          const parsed = wasStr ? JSON.parse(data[k]) : data[k];
+          if (!parsed || typeof parsed !== 'object') return;
           const patched = deepPatchCredits(JSON.parse(JSON.stringify(parsed)));
-          upd[k] = typeof data[k] === 'string' ? JSON.stringify(patched) : patched;
+          upd[k] = wasStr ? JSON.stringify(patched) : patched;
         } catch (_) {}
       });
       if (Object.keys(upd).length) await ST.set(upd);
@@ -419,14 +473,22 @@
   chrome.storage.local.get = function (keys, cb) {
     const patchResult = result => {
       Object.keys(result).forEach(k => {
-        if (result[k] && typeof result[k] === 'object') {
+        const v = result[k];
+        if (v && typeof v === 'object') {
           try {
             result[k] = deepPatchCredits(
-              typeof result[k] === 'string'
-                ? JSON.parse(result[k])
-                : JSON.parse(JSON.stringify(result[k]))
+              typeof v === 'string' ? JSON.parse(v) : JSON.parse(JSON.stringify(v))
             );
           } catch (_) {}
+        } else if (typeof v === 'string' && /^[\[{]/.test(v.trim())) {
+          try {
+            const parsed = JSON.parse(v);
+            if (parsed && typeof parsed === 'object') {
+              result[k] = JSON.stringify(deepPatchCredits(parsed));
+            }
+          } catch (_) {}
+        } else if (typeof v === 'number' && COUNTER_ZERO_FIELDS.includes(k) && v > 0) {
+          result[k] = 0;
         }
       });
       return result;
@@ -441,6 +503,37 @@
       }
     }
     return _origGet(keys).then(patchResult).catch(() => ({}));
+  };
+
+  /* Intercept storage WRITES so anything saved back also has patched
+     values — even if background writes new candidateDetails from a
+     server response, the persisted copy stays premium. */
+  const _origSet = chrome.storage.local.set.bind(chrome.storage.local);
+  chrome.storage.local.set = function (items, cb) {
+    try {
+      if (items && typeof items === 'object') {
+        Object.keys(items).forEach(k => {
+          const v = items[k];
+          if (v && typeof v === 'object') {
+            try { items[k] = deepPatchCredits(JSON.parse(JSON.stringify(v))); } catch (_) {}
+          } else if (typeof v === 'string' && /^[\[{]/.test(v.trim())) {
+            try {
+              const parsed = JSON.parse(v);
+              if (parsed && typeof parsed === 'object') {
+                items[k] = JSON.stringify(deepPatchCredits(parsed));
+              }
+            } catch (_) {}
+          } else if (typeof v === 'number' && COUNTER_ZERO_FIELDS.includes(k) && v > 0) {
+            items[k] = 0;
+          }
+        });
+      }
+    } catch (_) {}
+    if (typeof cb === 'function') {
+      try { return _origSet(items, cb); }
+      catch (_) { try { cb(); } catch (__) {} return; }
+    }
+    return _origSet(items).catch(() => {});
   };
 
   /* ── T14: Wake Lock — NO AudioContext (fixes "not allowed to start") ── */
@@ -505,10 +598,31 @@
       'commission on hire',
       'Earn While You Search',
       'Help your friends avoid applying',
-      'Get 20 Auto-fill Credits',
-      'for each referral who upgrades',
+      'Auto-fill Credits for every signup',
+      'referral who upgrades to premium',
+      'referral who upgrades',
       'One Referral 3 Benefits',
-      'Start Earning Now'
+      'Start Earning Now',
+      /* 2.6.0 upgrade-modal / limit-reached strings */
+      'Upgrade to get Unlimited Credits',
+      'Upgrade to get unlimited credits',
+      'Upgrade and save countless hours',
+      'free Credits daily',
+      'Auto-fill Credits left today',
+      'matching jobs by manually filling',
+      'Start Applying Manually',
+      'Days Unlimited Subscription',
+      'Month Unlimited Subscription',
+      'Months Unlimited Subscription',
+      'Apply to Unlimited Jobs',
+      'No Premium Benefits',
+      'Get unlimited Credits',
+      'AI cover letter & more',
+      'AI Powered Automated Job Apply',
+      /* Resume-fetch error message */
+      'couldn’t fetch details for this resume',
+      "couldn't fetch details for this resume",
+      'fetch details for this resume right now',
     ];
 
     function ownText(el) {
@@ -538,16 +652,55 @@
       return node;
     }
 
+    /* Auto-click "Continue with Free" so the upgrade pricing modal
+       dismisses itself when daily credits trigger it. */
+    function tryClickContinueWithFree() {
+      const btns = document.querySelectorAll('button, [role="button"], a');
+      for (const b of btns) {
+        if (!b || b.disabled) continue;
+        const r = b.getBoundingClientRect();
+        if (r.width === 0 || r.height === 0) continue;
+        const t = ((b.innerText || b.textContent || '') + '').replace(/\s+/g,' ').trim();
+        if (/^continue\s+with\s+free$/i.test(t)) {
+          try { b.click(); return true; } catch (_) {}
+        }
+      }
+      return false;
+    }
+
     function tick() {
       try {
-        const nodes = document.querySelectorAll('h1,h2,h3,h4,p,span,div,a,button');
+        const nodes = document.querySelectorAll('h1,h2,h3,h4,p,li,span,div,a,button');
         for (let i = 0; i < nodes.length; i++) {
           const el = nodes[i];
           if (!el || (el.dataset && el.dataset.ohHidden === '1')) continue;
+          let matched = false;
+          /* Pass 1: ownText (direct text nodes) — fast, precise for plain labels */
           const t = ownText(el).trim();
-          if (!t || t.length > 250) continue;
-          for (let j = 0; j < HIDE_PATTERNS.length; j++) {
-            if (t.indexOf(HIDE_PATTERNS[j]) !== -1) {
+          if (t && t.length <= 250) {
+            for (let j = 0; j < HIDE_PATTERNS.length; j++) {
+              if (t.indexOf(HIDE_PATTERNS[j]) !== -1) {
+                const target = pickAncestor(el);
+                if (target) {
+                  target.style.setProperty('display', 'none', 'important');
+                  if (target.dataset) target.dataset.ohHidden = '1';
+                }
+                matched = true;
+                break;
+              }
+            }
+          }
+          if (matched) continue;
+          /* Pass 2: textContent — catches "Get [20] Auto-fill Credits"
+             style strings where the variable parts are in child spans.
+             Constrained to leaf-ish containers so we never match the
+             whole page. */
+          const tc = (el.textContent || '').replace(/\s+/g, ' ').trim();
+          if (!tc || tc.length > 350) continue;
+          const childElems = el.children ? el.children.length : 0;
+          if (childElems > 3 && el.tagName !== 'LI' && el.tagName !== 'P') continue;
+          for (let k = 0; k < HIDE_PATTERNS.length; k++) {
+            if (tc.indexOf(HIDE_PATTERNS[k]) !== -1) {
               const target = pickAncestor(el);
               if (target) {
                 target.style.setProperty('display', 'none', 'important');
@@ -580,11 +733,11 @@
 
     function start() {
       tick();
-      setInterval(tick, 1500);
+      tryClickContinueWithFree();
+      setInterval(() => { tick(); tryClickContinueWithFree(); }, 1500);
       try {
-        new MutationObserver(tick).observe(document.body, {
-          childList: true, subtree: true
-        });
+        new MutationObserver(() => { tick(); tryClickContinueWithFree(); })
+          .observe(document.body, { childList: true, subtree: true });
       } catch (_) {}
     }
     if (document.body) start();
