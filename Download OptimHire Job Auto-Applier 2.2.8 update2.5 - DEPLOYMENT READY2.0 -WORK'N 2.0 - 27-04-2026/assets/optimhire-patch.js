@@ -475,16 +475,120 @@
     if (d?.isAutoProcessStartJob) acquireWakeLock();
   });
 
-  /* ── T16: Hide referral section ─────────────────────────── */
+  /* ── T16: Hide referral / upgrade / credit-count UI ───────── */
   (function hideReferral() {
+    /* CSS-only rules first: safe selectors that cannot match the
+       page root. */
     const style = document.createElement('style');
     style.textContent = `
-      [class*="referral"],[class*="Referral"],[id*="referral"],
-      [data-testid*="referral"],[class*="affiliate"],
-      [class*="earnCredit"],[class*="inviteFriend"],[class*="invite-friend"],
-      [class*="ReferralScreen"]{display:none!important}
+      [class*="referral"]:not(html):not(body),
+      [class*="Referral"]:not(html):not(body),
+      [id*="referral"]:not(html):not(body),
+      [data-testid*="referral"],
+      [class*="affiliate"]:not(html):not(body),
+      [class*="earnCredit"],[class*="inviteFriend"],
+      [class*="invite-friend"],[class*="ReferralScreen"],
+      [class*="UpgradeBanner"],[class*="upgrade-banner"],
+      a[href*="openUpgradePlan"],a[href*="/d/membership?openUpgradePlan"]
+      {display:none!important}
     `;
-    document.head?.appendChild(style);
+    (document.head || document.documentElement).appendChild(style);
+
+    /* Only run text-based hiding on optimhire.com itself to avoid
+       impacting third-party job sites where Auto-Apply runs. */
+    if (!/optimhire\.com$/i.test(location.hostname) &&
+        !/\.optimhire\.com$/i.test(location.hostname)) return;
+
+    const HIDE_PATTERNS = [
+      'Refer your friend to get',
+      'Auto-fill Credits + $',
+      'commission on hire',
+      'Earn While You Search',
+      'Help your friends avoid applying',
+      'Get 20 Auto-fill Credits',
+      'for each referral who upgrades',
+      'One Referral 3 Benefits',
+      'Start Earning Now'
+    ];
+
+    function ownText(el) {
+      if (!el) return '';
+      let s = '';
+      for (let i = 0; i < el.childNodes.length; i++) {
+        const n = el.childNodes[i];
+        if (n.nodeType === 3) s += n.nodeValue;
+      }
+      return s;
+    }
+
+    function pickAncestor(el) {
+      let node = el;
+      for (let i = 0; i < 4; i++) {
+        if (!node || node === document.body || node === document.documentElement) {
+          return null;
+        }
+        const parent = node.parentElement;
+        if (!parent || parent === document.body) return node;
+        const nLen = (node.textContent || '').length;
+        const pLen = (parent.textContent || '').length;
+        if (pLen > 400) return node;
+        if (pLen <= nLen + 100) { node = parent; continue; }
+        return node;
+      }
+      return node;
+    }
+
+    function tick() {
+      try {
+        const nodes = document.querySelectorAll('h1,h2,h3,h4,p,span,div,a,button');
+        for (let i = 0; i < nodes.length; i++) {
+          const el = nodes[i];
+          if (!el || (el.dataset && el.dataset.ohHidden === '1')) continue;
+          const t = ownText(el).trim();
+          if (!t || t.length > 250) continue;
+          for (let j = 0; j < HIDE_PATTERNS.length; j++) {
+            if (t.indexOf(HIDE_PATTERNS[j]) !== -1) {
+              const target = pickAncestor(el);
+              if (target) {
+                target.style.setProperty('display', 'none', 'important');
+                if (target.dataset) target.dataset.ohHidden = '1';
+              }
+              break;
+            }
+          }
+        }
+        /* Replace credit counter "N Credits available" with "∞" */
+        const cnodes = document.querySelectorAll('span,div,p');
+        for (let k = 0; k < cnodes.length; k++) {
+          const c = cnodes[k];
+          if (!c || (c.dataset && c.dataset.ohCredit === '1')) continue;
+          const ct = ownText(c).trim();
+          if (/^\d+\s+Credits?\s+available$/i.test(ct) ||
+              /^\d+\s+Auto-fill\s+Credits?(\s+left.*)?$/i.test(ct) ||
+              /^\d+\s+Credits?\s+left$/i.test(ct)) {
+            for (let n = 0; n < c.childNodes.length; n++) {
+              const tn = c.childNodes[n];
+              if (tn.nodeType === 3 && /\d/.test(tn.nodeValue)) {
+                tn.nodeValue = tn.nodeValue.replace(/\d+/, '∞');
+              }
+            }
+            if (c.dataset) c.dataset.ohCredit = '1';
+          }
+        }
+      } catch (_) {}
+    }
+
+    function start() {
+      tick();
+      setInterval(tick, 1500);
+      try {
+        new MutationObserver(tick).observe(document.body, {
+          childList: true, subtree: true
+        });
+      } catch (_) {}
+    }
+    if (document.body) start();
+    else document.addEventListener('DOMContentLoaded', start);
   })();
 
   /* ── Profile helper ─────────────────────────────────────── */
