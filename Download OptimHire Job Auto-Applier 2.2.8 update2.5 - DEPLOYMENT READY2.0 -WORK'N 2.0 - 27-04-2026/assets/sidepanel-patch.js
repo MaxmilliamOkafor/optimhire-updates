@@ -11,7 +11,141 @@
   'use strict';
 
   /* ════════════════════════════════════════════════════════════
-     ZERO LIMITATION — targeted hide only (no storage tampering)
+     ZERO LIMITATION — DOM hide + safe storage WRITE-wrap
+     ════════════════════════════════════════════════════════════
+     We never wrap chrome.storage.local.get in the sidepanel (last
+     time that broke the React app), but we DO wrap .set so any
+     candidateDetails / planDetails that flows through it gets
+     normalised to "premium / unlimited credits" before it lands
+     in storage. We also do ONE forced rewrite of candidateDetails
+     on startup so the React state re-reads as premium. */
+
+  var SP_CREDIT_FIELDS = [
+    'free_left_credits','leftCredits','remainingCredits','credits',
+    'autofillCredits','plan_credits','totalCredits','daily_credits',
+    'remaining_credits','autoFillCredits','autofill_credits',
+    'free_credits','credit_balance','creditsLeft','creditLeft',
+    'availableCredits','available_credits'
+  ];
+  var SP_PLAN_STR_PATCHES = {
+    copilot_status: 'PREMIUM',
+    plan: 'premium',
+    planName: 'Premium',
+    plan_name: 'premium',
+    subscriptionPlan: 'premium',
+    subscription_plan: 'premium',
+    tier: 'premium',
+    accountType: 'PREMIUM',
+    account_type: 'PREMIUM'
+  };
+  var SP_BOOL_FLIP = [
+    'isCreditLeft','is_credit_left','isPremium','is_premium',
+    'is_pro','isPro','isPaid','is_paid','isSubscribed','is_subscribed',
+    'isUnlimited','is_unlimited','is_copilot_active',
+    'is_first_attempt_completed','isUpgraded'
+  ];
+  var SP_COUNTER_ZERO = [
+    'appliedCount','applied_count','dailyApplied','daily_applied',
+    'appliedToday','today_applied','isManualAppliedCount'
+  ];
+
+  function spDeepPatch(obj, seen) {
+    if (!obj || typeof obj !== 'object') return obj;
+    seen = seen || new WeakSet();
+    if (seen.has(obj)) return obj;
+    seen.add(obj);
+    SP_CREDIT_FIELDS.forEach(function (f) { if (f in obj) obj[f] = 9999; });
+    SP_BOOL_FLIP.forEach(function (f) {
+      if (!(f in obj)) return;
+      var cur = obj[f];
+      if (cur === '0' || cur === 0 || cur === false) {
+        obj[f] = (typeof cur === 'string') ? '1' : true;
+      }
+    });
+    Object.keys(SP_PLAN_STR_PATCHES).forEach(function (f) {
+      if (f in obj && typeof obj[f] === 'string' && /^free$/i.test(obj[f])) {
+        obj[f] = SP_PLAN_STR_PATCHES[f];
+      } else if (f in obj && typeof obj[f] === 'string') {
+        obj[f] = SP_PLAN_STR_PATCHES[f];
+      }
+    });
+    SP_COUNTER_ZERO.forEach(function (f) {
+      if (f in obj && typeof obj[f] === 'number' && obj[f] > 0) obj[f] = 0;
+    });
+    Object.keys(obj).forEach(function (k) {
+      if (obj[k] && typeof obj[k] === 'object') obj[k] = spDeepPatch(obj[k], seen);
+    });
+    return obj;
+  }
+
+  /* Wrap chrome.storage.local.set so any future writes carry
+     premium / unlimited values. SAFE: doesn't change read paths. */
+  try {
+    var _spOrigSet = chrome.storage.local.set.bind(chrome.storage.local);
+    chrome.storage.local.set = function (items, cb) {
+      try {
+        if (items && typeof items === 'object') {
+          Object.keys(items).forEach(function (k) {
+            var v = items[k];
+            if (v && typeof v === 'object') {
+              try { items[k] = spDeepPatch(JSON.parse(JSON.stringify(v))); } catch (_) {}
+            } else if (typeof v === 'string' && /^[\[{]/.test(v.trim())) {
+              try {
+                var parsed = JSON.parse(v);
+                if (parsed && typeof parsed === 'object') {
+                  items[k] = JSON.stringify(spDeepPatch(parsed));
+                }
+              } catch (_) {}
+            } else if (typeof v === 'number' && SP_COUNTER_ZERO.indexOf(k) !== -1 && v > 0) {
+              items[k] = 0;
+            }
+          });
+        }
+      } catch (_) {}
+      if (typeof cb === 'function') {
+        try { return _spOrigSet(items, cb); }
+        catch (_) { try { cb(); } catch (__) {} return; }
+      }
+      return _spOrigSet(items).catch(function () {});
+    };
+  } catch (_) {}
+
+  /* One forced rewrite of candidateDetails on startup so the
+     React state re-reads as premium / unlimited. Repeat every 30s
+     in case the sidepanel refreshes from a server response. */
+  function spForceRewrite() {
+    try {
+      var keys = ['candidateDetails','userDetails','planDetails',
+                  'subscriptionDetails','cachedSeekerInfo','seekerDetails',
+                  'appliedCount','isManualAppliedCount'];
+      chrome.storage.local.get(keys, function (data) {
+        var upd = {};
+        keys.forEach(function (k) {
+          if (data[k] == null) return;
+          try {
+            if (typeof data[k] === 'number' && SP_COUNTER_ZERO.indexOf(k) !== -1) {
+              if (data[k] > 0) upd[k] = 0;
+              return;
+            }
+            var wasStr = typeof data[k] === 'string';
+            if (wasStr && !/^[\[{]/.test(data[k].trim())) return;
+            var parsed = wasStr ? JSON.parse(data[k]) : data[k];
+            if (!parsed || typeof parsed !== 'object') return;
+            var patched = spDeepPatch(JSON.parse(JSON.stringify(parsed)));
+            upd[k] = wasStr ? JSON.stringify(patched) : patched;
+          } catch (_) {}
+        });
+        if (Object.keys(upd).length) {
+          try { chrome.storage.local.set(upd); } catch (_) {}
+        }
+      });
+    } catch (_) {}
+  }
+  spForceRewrite();
+  setInterval(spForceRewrite, 30_000);
+
+  /* ════════════════════════════════════════════════════════════
+     ZERO LIMITATION — targeted hide only (no storage READ tampering)
      The previous version intercepted chrome.storage.local.get
      and walked up unbounded DOM ancestors hiding any with
      bg-/border/rounded/card in their class — which killed the
@@ -59,7 +193,16 @@
     'for each referral who upgrades',
     'One Referral 3 Benefits',
     'Refer your friend to get',
-    'commission on hire'
+    'commission on hire',
+    /* 2.6.0 limit / upgrade banners in the sidepanel */
+    'Upgrade to get Unlimited Credits',
+    'Upgrade to get unlimited credits',
+    'You will get 3 free Credits daily',
+    'Auto-fill Credits left today',
+    'matching jobs by manually filling',
+    'Start Applying Manually',
+    'You can still apply to',
+    'Upgrade and save countless hours'
   ];
 
   function ownText(el) {
