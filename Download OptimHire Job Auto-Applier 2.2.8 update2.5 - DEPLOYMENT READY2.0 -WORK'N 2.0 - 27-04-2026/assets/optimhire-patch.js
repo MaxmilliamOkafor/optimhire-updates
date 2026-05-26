@@ -2101,7 +2101,7 @@
   (function installStuckWatchdog() {
     let _watchdogUrl = '';
     let _watchdogTimer = null;
-    const STUCK_TIMEOUT_MS = 25_000; // 25 seconds
+    const STUCK_TIMEOUT_MS = 15_000; // 15s — 2000+ queue, can't afford long stalls
 
     async function checkStuck() {
       const { csvActiveJobId, isAutoProcessStartJob } = await ST.get([
@@ -2135,8 +2135,113 @@
     }
 
     // Poll every 15 seconds for URL / active status changes
-    setInterval(checkStuck, 15_000);
+    setInterval(checkStuck, 7_500); // poll every 7.5s so stuck jobs are caught fast
     checkStuck();
+  })();
+
+  /* ── T39 / T40: Zero-manual-effort auto-clickers ─────────────────────────
+   * The 2.6.0 release added two interstitial screens that block the queue
+   * unless the user clicks through:
+   *   T39 — Custom Resume editor (optimhire.com): "Save & Next →" button
+   *   T40 — Custom Cover Letter modal: "Apply Now" button
+   * Both only fire while active automation is running (csvActiveJobId,
+   * isAutoProcessStartJob, or autoApplyStateUpdate.isRunning) AND only
+   * after the "Generating..." state has settled. We wait up to STABLE_MS
+   * for the button to stay visible (so we don't click before the
+   * generation finishes), then click via realClick().
+   * ─────────────────────────────────────────────────────────────────────── */
+  (function installAutoActionClickers() {
+    /* User has a 2000+ queue — every saved second matters. STABLE_MS is
+       the gap we wait AFTER "Generating..." disappears (i.e. button is
+       visible AND enabled AND not in a generating state) before
+       clicking. 1.5s is enough for React to paint the final content. */
+    const STABLE_MS    = 1_500;
+    const POLL_MS      =   300;   // tight poll cadence
+    const _clicked     = new WeakSet();
+    const _firstSeenAt = new WeakMap();
+
+    function looksGenerating(root) {
+      const t = (root && root.textContent) || '';
+      return /Generating\s+(Custom\s+)?(Resume|Cover\s*Letter)/i.test(t);
+    }
+
+    /* Find a visible button whose own text matches `re` */
+    function findBtn(re) {
+      const cands = document.querySelectorAll('button, [role="button"], a');
+      for (const el of cands) {
+        if (!el || _clicked.has(el)) continue;
+        const txt = ((el.innerText || el.textContent || '') + '').trim();
+        if (!txt || txt.length > 40) continue;
+        if (!re.test(txt)) continue;
+        if (!isVisible(el)) continue;
+        if (el.disabled) continue;
+        const ariaDis = el.getAttribute && el.getAttribute('aria-disabled');
+        if (ariaDis === 'true') continue;
+        return el;
+      }
+      return null;
+    }
+
+    async function automationActive() {
+      try {
+        const { csvActiveJobId, isAutoProcessStartJob, autoApplyStateUpdate } =
+          await ST.get(['csvActiveJobId', 'isAutoProcessStartJob', 'autoApplyStateUpdate']);
+        return !!csvActiveJobId || !!isAutoProcessStartJob ||
+               !!(autoApplyStateUpdate && autoApplyStateUpdate.isRunning);
+      } catch (_) { return false; }
+    }
+
+    async function maybeClick(re, label) {
+      if (!(await automationActive())) return;
+      const btn = findBtn(re);
+      if (!btn) return;
+      /* Bail out while "Generating..." is still on screen — clicking the
+         button before generation finishes either no-ops or saves an empty
+         doc.  Look for the indicator within the modal/page subtree. */
+      const root = btn.closest('section, [role="dialog"], [class*="modal" i], ' +
+                                '[class*="Modal" i], [class*="drawer" i], ' +
+                                '[class*="Drawer" i], main, body') || document.body;
+      if (looksGenerating(root)) {
+        /* reset the stability timer while still generating */
+        _firstSeenAt.delete(btn);
+        return;
+      }
+      const now = Date.now();
+      if (!_firstSeenAt.has(btn)) { _firstSeenAt.set(btn, now); return; }
+      if (now - _firstSeenAt.get(btn) < STABLE_MS) return;
+
+      _clicked.add(btn);
+      LOG(`Auto-click: ${label}`);
+      try { realClick(btn); } catch (_) { try { btn.click(); } catch (__) {} }
+    }
+
+    /* T39 — Save & Next →  (only on optimhire.com resume editor) */
+    async function tickSaveNext() {
+      if (!/optimhire\.com$/i.test(location.hostname) &&
+          !/\.optimhire\.com$/i.test(location.hostname)) return;
+      await maybeClick(/^Save\s*&\s*Next(\s*[→>›])?$/i, 'Save & Next →');
+    }
+
+    /* T40 — Apply Now  (any URL with the cover-letter modal) */
+    async function tickApplyNow() {
+      await maybeClick(/^Apply\s*Now$/i, 'Apply Now');
+    }
+
+    setInterval(tickSaveNext, POLL_MS);
+    setInterval(tickApplyNow, POLL_MS);
+
+    /* Also drive on DOM mutation so we react fast when the modal opens */
+    function startObserver() {
+      try {
+        const obs = new MutationObserver(() => {
+          tickSaveNext().catch(() => {});
+          tickApplyNow().catch(() => {});
+        });
+        obs.observe(document.body, { childList: true, subtree: true });
+      } catch (_) {}
+    }
+    if (document.body) startObserver();
+    else document.addEventListener('DOMContentLoaded', startObserver);
   })();
 
   /* ── T12: Auto-solve captchas ────────────────────────────── */
