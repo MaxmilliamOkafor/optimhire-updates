@@ -621,7 +621,7 @@
    *   4. Aborted if the warning disappears OR a submit was just
    *      attempted (30-second submit-suppression window).
    * ─────────────────────────────────────────────────────────────────── */
-  var MD_TIMEOUT_MS = 15_000;
+  var MD_TIMEOUT_MS = 10_000;
   var _mdStartAt = 0;
   var _mdTimerId = null;
   var _mdCountdownEl = null;
