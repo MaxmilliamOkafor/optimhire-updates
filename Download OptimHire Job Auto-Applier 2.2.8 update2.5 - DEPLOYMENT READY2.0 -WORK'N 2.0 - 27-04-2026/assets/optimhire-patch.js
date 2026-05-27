@@ -2571,7 +2571,7 @@
        definitively fail, which we then handle with "Use My
        Original Resume") before we click anything. */
     const POLL_MS        =    50;
-    const PAGE_SETTLE_MS = 1_500;
+    const PAGE_SETTLE_MS = 2_000;
     const _clicked       = new WeakSet();
     const _pageEnteredAt = new Map(); // url → ts(ms) of first sight
 
