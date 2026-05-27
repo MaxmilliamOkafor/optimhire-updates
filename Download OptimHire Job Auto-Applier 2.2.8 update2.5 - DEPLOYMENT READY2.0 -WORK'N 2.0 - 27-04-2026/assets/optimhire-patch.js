@@ -432,10 +432,6 @@
     accountType: 'PREMIUM',
     account_type: 'PREMIUM',
   };
-    status: null, // only patched if currently 'FREE'
-    accountType: 'PREMIUM',
-    account_type: 'PREMIUM',
-  };
   /* Counters that may be used to enforce per-day limits */
   const COUNTER_ZERO_FIELDS = [
     'appliedCount','applied_count','dailyApplied','daily_applied',
@@ -445,7 +441,6 @@
   function deepPatchCredits(obj, seen) {
     if (!obj || typeof obj !== 'object') return obj;
     seen = seen || new WeakSet();
-    if (seen.has(obj)) return obj;
     if (seen.has(obj)) return obj; // cycle guard
     seen.add(obj);
     CREDIT_FIELDS.forEach(f => { if (f in obj) obj[f] = 9999; });
@@ -460,22 +455,6 @@
     Object.keys(PLAN_STRING_PATCHES).forEach(f => {
       if (f in obj && typeof obj[f] === 'string') {
         obj[f] = PLAN_STRING_PATCHES[f];
-        /* "1"/"0" strings (common in this codebase) → "1" */
-        const cur = obj[f];
-        if (cur === '0' || cur === 0 || cur === false) obj[f] = (typeof cur === 'string') ? '1' : true;
-        else if (typeof cur === 'number' && cur === 0) obj[f] = 1;
-      }
-    });
-    Object.keys(PLAN_STRING_PATCHES).forEach(f => {
-      if (!(f in obj)) return;
-      const target = PLAN_STRING_PATCHES[f];
-      const cur = obj[f];
-      if (target === null) {
-        /* Only patch 'FREE'/'free' to PREMIUM (used for fields like
-           'status' that we shouldn't overwrite unconditionally) */
-        if (typeof cur === 'string' && /^free$/i.test(cur)) obj[f] = 'PREMIUM';
-      } else if (typeof cur === 'string') {
-        obj[f] = target;
       }
     });
     COUNTER_ZERO_FIELDS.forEach(f => {
@@ -502,7 +481,6 @@
             return;
           }
           const wasStr = typeof data[k] === 'string';
-          if (wasStr && !/^[\[{]/.test(data[k].trim())) return;
           if (wasStr && !/^[\[{]/.test(data[k].trim())) return; // not JSON
           const parsed = wasStr ? JSON.parse(data[k]) : data[k];
           if (!parsed || typeof parsed !== 'object') return;
