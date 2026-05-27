@@ -363,6 +363,11 @@
     setTimeout(() => { _submitAttempted = false; }, 30_000);
   }
 
+  /* Per-job countdown rescale on the SEND side (content script).
+     Same reasoning as the sidepanel-patch.js intercept: a flat
+     clamp freezes the displayed countdown at AUTO_SKIP_MAX_SECONDS
+     for most of its life. Serve a real local countdown based on
+     elapsed time since the first capped value for this job. */
   /* Per-job countdown rescale (content side). Background ticks
      autoSkipSeconds from a large initial value (~180) down to 0;
      flat-clamping every tick to AUTO_SKIP_MAX_SECONDS would show the
@@ -405,6 +410,8 @@
     'autofill_credits','free_credits','credit_balance',
     'creditsLeft','creditLeft','availableCredits','available_credits',
   ];
+  /* 2.6.0 sidepanel gates the upgrade modal / "Start Applying Manually"
+     CTA on copilot_status === "FREE". Force PREMIUM and matching flags. */
   const CREDIT_BOOL_FIELDS = [
     'isCreditLeft','is_credit_left','hasCredits','has_credits',
     'isPremium','is_premium','is_pro','isPro','isPaid','is_paid',
@@ -422,6 +429,9 @@
     subscriptionPlan: 'premium',
     subscription_plan: 'premium',
     tier: 'premium',
+    accountType: 'PREMIUM',
+    account_type: 'PREMIUM',
+  };
     status: null, // only patched if currently 'FREE'
     accountType: 'PREMIUM',
     account_type: 'PREMIUM',
@@ -435,11 +445,21 @@
   function deepPatchCredits(obj, seen) {
     if (!obj || typeof obj !== 'object') return obj;
     seen = seen || new WeakSet();
+    if (seen.has(obj)) return obj;
     if (seen.has(obj)) return obj; // cycle guard
     seen.add(obj);
     CREDIT_FIELDS.forEach(f => { if (f in obj) obj[f] = 9999; });
     CREDIT_BOOL_FIELDS.forEach(f => {
       if (f in obj) {
+        const cur = obj[f];
+        if (cur === '0' || cur === 0 || cur === false) {
+          obj[f] = (typeof cur === 'string') ? '1' : true;
+        }
+      }
+    });
+    Object.keys(PLAN_STRING_PATCHES).forEach(f => {
+      if (f in obj && typeof obj[f] === 'string') {
+        obj[f] = PLAN_STRING_PATCHES[f];
         /* "1"/"0" strings (common in this codebase) → "1" */
         const cur = obj[f];
         if (cur === '0' || cur === 0 || cur === false) obj[f] = (typeof cur === 'string') ? '1' : true;
@@ -482,6 +502,7 @@
             return;
           }
           const wasStr = typeof data[k] === 'string';
+          if (wasStr && !/^[\[{]/.test(data[k].trim())) return;
           if (wasStr && !/^[\[{]/.test(data[k].trim())) return; // not JSON
           const parsed = wasStr ? JSON.parse(data[k]) : data[k];
           if (!parsed || typeof parsed !== 'object') return;
@@ -699,6 +720,22 @@
       return node;
     }
 
+    /* Auto-click "Continue with Free" so the upgrade pricing modal
+       dismisses itself when daily credits trigger it. */
+    function tryClickContinueWithFree() {
+      const btns = document.querySelectorAll('button, [role="button"], a');
+      for (const b of btns) {
+        if (!b || b.disabled) continue;
+        const r = b.getBoundingClientRect();
+        if (r.width === 0 || r.height === 0) continue;
+        const t = ((b.innerText || b.textContent || '') + '').replace(/\s+/g,' ').trim();
+        if (/^continue\s+with\s+free$/i.test(t)) {
+          try { b.click(); return true; } catch (_) {}
+        }
+      }
+      return false;
+    }
+
     function tick() {
       try {
         const nodes = document.querySelectorAll('h1,h2,h3,h4,p,li,span,div,a,button');
@@ -706,6 +743,7 @@
           const el = nodes[i];
           if (!el || (el.dataset && el.dataset.ohHidden === '1')) continue;
           let matched = false;
+          /* Pass 1: ownText (direct text nodes) — fast, precise for plain labels */
           /* Pass 1: ownText — fastest, catches plain labels */
           const t = ownText(el).trim();
           if (t && t.length <= 250) {
@@ -722,6 +760,10 @@
             }
           }
           if (matched) continue;
+          /* Pass 2: textContent — catches "Get [20] Auto-fill Credits"
+             style strings where the variable parts are in child spans.
+             Constrained to leaf-ish containers so we never match the
+             whole page. */
           /* Pass 2: textContent for elements that wrap variable
              text (numbers, plan name) in child spans. Constrained
              to small leaf-ish containers so we never match a huge
@@ -2515,24 +2557,30 @@
    * generation finishes), then click via realClick().
    * ─────────────────────────────────────────────────────────────────────── */
   (function installAutoActionClickers() {
-    /* High-throughput tuning: by the time React has painted the
-       Save & Next / Apply Now button as visible+enabled in the
-       main page, the content is ready. The "Generating..." text
-       lives in the sidepanel (separate extension context), not
-       in the main page DOM, so we just need a tiny stability
-       window so we're not clicking a button that's about to flip
-       to disabled. */
-    const STABLE_MS    =   150;
-    const POLL_MS      =   100;
-    const _clicked     = new WeakSet();
-    const _firstSeenAt = new WeakMap();
+    /* High-throughput tuning for 2000+ queues. The button paints
+       only AFTER the server-side resume / cover-letter generation
+       completes, and the visible+enabled check below guarantees
+       React has the button ready. So we click on the FIRST sight
+       — saves ~50–100ms per button compared to a stability window.
+
+       Caveat: when navigation between jobs is too fast, the
+       resume-fetch API for the new page can race with the
+       previous page's submit and return "couldn't fetch details
+       for this resume right now". A per-URL minimum wait of
+       PAGE_SETTLE_MS gives the fetch a chance to complete (or
+       definitively fail, which we then handle with "Use My
+       Original Resume") before we click anything. */
+    const POLL_MS        =    50;
+    const PAGE_SETTLE_MS = 1_500;
+    const _clicked       = new WeakSet();
+    const _pageEnteredAt = new Map(); // url → ts(ms) of first sight
 
     function looksGenerating(root) {
       const t = (root && root.textContent) || '';
       return /Generating\s+(Custom\s+)?(Resume|Cover\s*Letter)/i.test(t);
     }
 
-    /* Find a visible button whose own text matches `re` */
+    /* Find a visible+enabled button whose own text matches `re` */
     function findBtn(re) {
       const cands = document.querySelectorAll('button, [role="button"], a');
       for (const el of cands) {
@@ -2549,6 +2597,8 @@
       return null;
     }
 
+    /* Use the shared cached helper (1.5s TTL) instead of doing our
+       own storage read on every tick. */
     /* Use the shared cached helper (declared at top of file) instead
        of doing our own storage read on every tick. */
     const automationActive = () => isAutomationActive();
@@ -2559,33 +2609,85 @@
       if (!btn) return;
       /* Bail out while "Generating..." is still on screen — clicking the
          button before generation finishes either no-ops or saves an empty
-         doc.  Look for the indicator within the modal/page subtree. */
+         doc. Look for the indicator within the modal/page subtree. */
       const root = btn.closest('section, [role="dialog"], [class*="modal" i], ' +
                                 '[class*="Modal" i], [class*="drawer" i], ' +
                                 '[class*="Drawer" i], main, body') || document.body;
-      if (looksGenerating(root)) {
-        /* reset the stability timer while still generating */
-        _firstSeenAt.delete(btn);
-        return;
-      }
-      const now = Date.now();
-      if (!_firstSeenAt.has(btn)) { _firstSeenAt.set(btn, now); return; }
-      if (now - _firstSeenAt.get(btn) < STABLE_MS) return;
+      if (looksGenerating(root)) return;
 
+      /* First-sight click — visible+enabled check above is enough to
+         know the button is ready. */
       _clicked.add(btn);
       LOG(`Auto-click: ${label}`);
       try { realClick(btn); } catch (_) { try { btn.click(); } catch (__) {} }
     }
 
-    /* T39 — Save & Next →  (only on optimhire.com resume editor) */
+    /* Detect "We couldn't fetch details for this resume right now"
+       error state — both smart-quote (U+2019) and ASCII variants. */
+    const FETCH_FAILED_RE = /couldn[’']?t\s+fetch\s+details\s+for\s+this\s+(resume|cover\s*letter)|fetch\s+details\s+for\s+this\s+(resume|cover\s*letter)\s+right\s+now/i;
+    function fetchFailed() {
+      const t = (document.body && document.body.innerText) || '';
+      return FETCH_FAILED_RE.test(t.slice(0, 8000));
+    }
+
+    /* Per-URL settle gate. The first time we see a given URL, record
+       a timestamp; auto-clickers refuse to fire until PAGE_SETTLE_MS
+       has elapsed since then. This prevents racing the resume-fetch
+       API on rapid job transitions. If the page has visibly errored
+       out (fetchFailed) we skip the gate so "Use My Original Resume"
+       fires immediately. */
+    function pageSettled() {
+      const url = location.href;
+      const now = Date.now();
+      if (!_pageEnteredAt.has(url)) {
+        _pageEnteredAt.set(url, now);
+        /* Cap the map size at 50 entries (FIFO) so it doesn't grow
+           unbounded over a long-running queue. */
+        if (_pageEnteredAt.size > 50) {
+          const firstKey = _pageEnteredAt.keys().next().value;
+          _pageEnteredAt.delete(firstKey);
+        }
+        return false;
+      }
+      return now - _pageEnteredAt.get(url) >= PAGE_SETTLE_MS;
+    }
+
+    /* T39 — Save & Next →  (only on optimhire.com resume editor)
+       If resume fetch failed and "Use My Original Resume" link is
+       present, click that instead — falls back to the user's
+       uploaded CV. Saves the application from breaking on a
+       server-side resume-generation outage. Otherwise click Save
+       & Next normally. */
     async function tickSaveNext() {
       if (!/optimhire\.com$/i.test(location.hostname) &&
           !/\.optimhire\.com$/i.test(location.hostname)) return;
+      if (!(await automationActive())) return;
+
+      /* If the page has already errored out, skip the settle wait
+         and fall back to the user's original resume immediately. */
+      if (fetchFailed()) {
+        const orig = findBtn(/^Use\s+My\s+Original\s+Resume$/i);
+        if (orig) {
+          _clicked.add(orig);
+          LOG('Resume fetch failed — clicking Use My Original Resume');
+          try { realClick(orig); } catch (_) { try { orig.click(); } catch (__) {} }
+          return;
+        }
+      }
+
+      /* Otherwise wait until the page has been around long enough
+         that the resume-fetch has had a chance to complete. */
+      if (!pageSettled()) return;
+
       await maybeClick(/^Save\s*&\s*Next(\s*[→>›])?$/i, 'Save & Next →');
     }
 
-    /* T40 — Apply Now  (any URL with the cover-letter modal) */
+    /* T40 — Apply Now  (any URL with the cover-letter modal)
+       Cover letter is optional on most ATSes, but we still wait
+       for the page to settle so the generation API isn't raced. */
     async function tickApplyNow() {
+      if (!(await automationActive())) return;
+      if (!pageSettled()) return;
       await maybeClick(/^Apply\s*Now$/i, 'Apply Now');
     }
 
