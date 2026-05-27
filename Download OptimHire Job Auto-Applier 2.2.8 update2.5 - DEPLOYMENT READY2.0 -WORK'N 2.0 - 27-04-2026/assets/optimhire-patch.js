@@ -368,6 +368,13 @@
      clamp freezes the displayed countdown at AUTO_SKIP_MAX_SECONDS
      for most of its life. Serve a real local countdown based on
      elapsed time since the first capped value for this job. */
+  /* Per-job countdown rescale (content side). Background ticks
+     autoSkipSeconds from a large initial value (~180) down to 0;
+     flat-clamping every tick to AUTO_SKIP_MAX_SECONDS would show the
+     same cap value frozen across many ticks before counting down.
+     Instead we serve a real local countdown from AUTO_SKIP_MAX_SECONDS
+     → 0 based on elapsed wall time since the first capped value for
+     this job. */
   const _countdownByJobSend = Object.create(null);
   function rescaleAutoSkipSeconds(msg) {
     const jobKey = String(msg.url || msg.jobUrl || msg.jobId || msg.id || 'cur');
@@ -411,6 +418,9 @@
     'isSubscribed','is_subscribed','isUnlimited','is_unlimited',
     'is_copilot_active','is_first_attempt_completed','isUpgraded',
   ];
+  /* 2.6.0: copilot_status === "FREE" triggers the upgrade modal /
+     "Start Applying Manually" CTA / daily-credit-cap screen. Force
+     it to PREMIUM and the FREE-tier code paths never fire. */
   const PLAN_STRING_PATCHES = {
     copilot_status: 'PREMIUM',
     plan: 'premium',
@@ -422,6 +432,11 @@
     accountType: 'PREMIUM',
     account_type: 'PREMIUM',
   };
+    status: null, // only patched if currently 'FREE'
+    accountType: 'PREMIUM',
+    account_type: 'PREMIUM',
+  };
+  /* Counters that may be used to enforce per-day limits */
   const COUNTER_ZERO_FIELDS = [
     'appliedCount','applied_count','dailyApplied','daily_applied',
     'appliedToday','today_applied','isManualAppliedCount',
@@ -431,6 +446,7 @@
     if (!obj || typeof obj !== 'object') return obj;
     seen = seen || new WeakSet();
     if (seen.has(obj)) return obj;
+    if (seen.has(obj)) return obj; // cycle guard
     seen.add(obj);
     CREDIT_FIELDS.forEach(f => { if (f in obj) obj[f] = 9999; });
     CREDIT_BOOL_FIELDS.forEach(f => {
@@ -444,6 +460,22 @@
     Object.keys(PLAN_STRING_PATCHES).forEach(f => {
       if (f in obj && typeof obj[f] === 'string') {
         obj[f] = PLAN_STRING_PATCHES[f];
+        /* "1"/"0" strings (common in this codebase) → "1" */
+        const cur = obj[f];
+        if (cur === '0' || cur === 0 || cur === false) obj[f] = (typeof cur === 'string') ? '1' : true;
+        else if (typeof cur === 'number' && cur === 0) obj[f] = 1;
+      }
+    });
+    Object.keys(PLAN_STRING_PATCHES).forEach(f => {
+      if (!(f in obj)) return;
+      const target = PLAN_STRING_PATCHES[f];
+      const cur = obj[f];
+      if (target === null) {
+        /* Only patch 'FREE'/'free' to PREMIUM (used for fields like
+           'status' that we shouldn't overwrite unconditionally) */
+        if (typeof cur === 'string' && /^free$/i.test(cur)) obj[f] = 'PREMIUM';
+      } else if (typeof cur === 'string') {
+        obj[f] = target;
       }
     });
     COUNTER_ZERO_FIELDS.forEach(f => {
@@ -471,6 +503,7 @@
           }
           const wasStr = typeof data[k] === 'string';
           if (wasStr && !/^[\[{]/.test(data[k].trim())) return;
+          if (wasStr && !/^[\[{]/.test(data[k].trim())) return; // not JSON
           const parsed = wasStr ? JSON.parse(data[k]) : data[k];
           if (!parsed || typeof parsed !== 'object') return;
           const patched = deepPatchCredits(JSON.parse(JSON.stringify(parsed)));
@@ -643,6 +676,23 @@
       'fetch details for this resume right now',
     ];
 
+    /* Auto-click "Continue with Free" to dismiss the upgrade pricing
+       modal — it pops up when daily credits run out. */
+    function tryClickContinueWithFree() {
+      const btns = document.querySelectorAll('button, [role="button"], a');
+      for (const b of btns) {
+        if (!b || b.disabled) continue;
+        const r = b.getBoundingClientRect();
+        if (r.width === 0 || r.height === 0) continue;
+        const t = ((b.innerText || b.textContent || '') + '').replace(/\s+/g,' ').trim();
+        if (/^continue\s+with\s+free$/i.test(t)) {
+          try { b.click(); LOG('Auto-dismissed upgrade modal via Continue with Free'); return true; }
+          catch (_) {}
+        }
+      }
+      return false;
+    }
+
     function ownText(el) {
       if (!el) return '';
       let s = '';
@@ -694,6 +744,7 @@
           if (!el || (el.dataset && el.dataset.ohHidden === '1')) continue;
           let matched = false;
           /* Pass 1: ownText (direct text nodes) — fast, precise for plain labels */
+          /* Pass 1: ownText — fastest, catches plain labels */
           const t = ownText(el).trim();
           if (t && t.length <= 250) {
             for (let j = 0; j < HIDE_PATTERNS.length; j++) {
@@ -713,6 +764,10 @@
              style strings where the variable parts are in child spans.
              Constrained to leaf-ish containers so we never match the
              whole page. */
+          /* Pass 2: textContent for elements that wrap variable
+             text (numbers, plan name) in child spans. Constrained
+             to small leaf-ish containers so we never match a huge
+             ancestor that happens to contain a pattern. */
           const tc = (el.textContent || '').replace(/\s+/g, ' ').trim();
           if (!tc || tc.length > 350) continue;
           const childElems = el.children ? el.children.length : 0;
@@ -2544,6 +2599,8 @@
 
     /* Use the shared cached helper (1.5s TTL) instead of doing our
        own storage read on every tick. */
+    /* Use the shared cached helper (declared at top of file) instead
+       of doing our own storage read on every tick. */
     const automationActive = () => isAutomationActive();
 
     async function maybeClick(re, label) {
@@ -2649,6 +2706,290 @@
     }
     if (document.body) startObserver();
     else document.addEventListener('DOMContentLoaded', startObserver);
+  })();
+
+  /* ── T41 / T42 / T43: End-to-end flow controller ─────────────────────────
+   * T41 — Multi-step Next/Continue/Review advance. After the autofill has
+   *       just finished on the current page (i.e. _fillActive flipped to
+   *       false and stayed false for the settle window), click the
+   *       intermediate-step advance button. Tracked per URL fingerprint
+   *       so we don't double-advance the same step.
+   * T42 — Already-applied / unsupported overlay quick-dismiss. If the
+   *       OptimHire overlay (or the ATS page) reports the job is already
+   *       applied / has no application / is unavailable, click the
+   *       close/dismiss/got-it button to free the queue immediately.
+   * T43 — Generic terminal-submit fallback. ATS-specific handlers do this
+   *       on their domains; on unsupported ATSes, click the page's only
+   *       sensible "Submit Application" button after fill is stable.
+   *
+   * All three gate on:
+   *   - Active automation (csvActiveJobId / isAutoProcessStartJob /
+   *     autoApplyStateUpdate.isRunning) — won't fire during idle browsing.
+   *   - _fillActive false — never click while a fill pass is running.
+   *   - Not within the 30s submit-suppression window — avoid double-submit.
+   * ─────────────────────────────────────────────────────────────────────── */
+  (function installFlowController() {
+    const SETTLE_MS = 1_000;   // wait this long after fill stops before clicking
+    const POLL_MS   =   400;
+    const _clicked  = new WeakSet();
+    const _dismissedFingerprints = new Set();
+
+    /* Track when _fillActive transitions true → false without touching
+       the existing transition points. _everFilledOnThisUrl flips true
+       only AFTER a real fill pass completes — gates T41/T43 so they
+       never click Next/Submit on a page autofill never analysed. */
+    let _wasFilling = false;
+    let _lastFillCompletedTs = 0;
+    let _everFilledOnThisUrl = false;
+    setInterval(() => {
+      if (_wasFilling && !_fillActive) {
+        _lastFillCompletedTs = Date.now();
+        _everFilledOnThisUrl = true;
+      }
+      _wasFilling = _fillActive;
+    }, 200);
+
+    /* Use the shared cached helper (declared at top of file) — its
+       1.5s cache covers our 400ms tick cadence without any storage
+       reads on most ticks. */
+    const automationActive = () => isAutomationActive();
+
+    function fillStable() {
+      if (_fillActive) return false;
+      if (!_everFilledOnThisUrl) return false; // no fill ever happened here
+      if (Date.now() - _lastFillCompletedTs < SETTLE_MS) return false;
+      return true;
+    }
+
+    /* Are all visible REQUIRED fields filled? Used to gate T41/T43 so
+       we never advance/submit past a half-filled form even if fill
+       reported completion. */
+    function requiredFieldsSatisfied() {
+      const reqs = $$(
+        'input[required]:not([type=hidden]):not([type=submit]):not([type=button]),' +
+        'input[aria-required="true"]:not([type=hidden]):not([type=submit]):not([type=button]),' +
+        'textarea[required],textarea[aria-required="true"],' +
+        'select[required],select[aria-required="true"]'
+      ).filter(isVisible);
+      for (const el of reqs) {
+        if (el.type === 'checkbox' || el.type === 'radio') {
+          /* For groups, check that at least one member of the same name
+             is checked; that's good enough for required radio groups. */
+          if (el.type === 'radio' && el.name) {
+            const group = document.getElementsByName(el.name);
+            if (![...group].some(r => r.checked)) return false;
+          } else if (el.type === 'checkbox' && !el.checked) {
+            return false;
+          }
+        } else if (el.tagName === 'SELECT') {
+          if (!el.value) return false;
+        } else if (!el.value || !el.value.trim()) {
+          return false;
+        }
+      }
+      return true;
+    }
+
+    function submitSuppressed() {
+      return _submitAttempted && (Date.now() - _submitAttemptTs) < 30_000;
+    }
+
+    function pageFingerprint(extra) {
+      /* URL + count of visible form controls — changes between steps */
+      const ctrlCount = document.querySelectorAll(
+        'input:not([type=hidden]),textarea,select'
+      ).length;
+      return location.href + '|' + ctrlCount + '|' + (extra || '');
+    }
+
+    function findBtnByText(re, scopeEl) {
+      const root = scopeEl || document;
+      const cands = root.querySelectorAll(
+        'button, [role="button"], input[type="submit"], input[type="button"], a'
+      );
+      for (const el of cands) {
+        if (!el || _clicked.has(el)) continue;
+        if (el.disabled) continue;
+        if (el.getAttribute && el.getAttribute('aria-disabled') === 'true') continue;
+        if (!isVisible(el)) continue;
+        const txt = ((el.innerText || el.value || el.textContent || '') + '')
+                      .replace(/\s+/g, ' ').trim();
+        if (!txt || txt.length > 60) continue;
+        if (re.test(txt)) return el;
+      }
+      return null;
+    }
+
+    /* ── T41: Multi-step intermediate advance ── */
+    const ADVANCE_RE = /^(next|continue|next\s+step|proceed|review|go\s+to\s+review|save\s+and\s+continue|save\s+&\s+continue|save\s+and\s+next|save\s+&\s+next|to\s+the\s+next\s+step)$/i;
+    /* These are TERMINAL — don't click them in the intermediate pass
+       (T43 / T27 handle them). Listed so ADVANCE_RE doesn't pick them up
+       via partial overlap. */
+    const TERMINAL_RE = /^(submit(\s+application)?|send\s+application|complete\s+application|finish(\s+application)?|apply\s+now|confirm\s+and\s+submit|submit\s+my\s+application)$/i;
+
+    async function tickAdvance() {
+      if (!await automationActive()) return;
+      if (!fillStable() || submitSuppressed()) return;
+      /* Don't advance unless every visible required field on this step
+         is filled — preserves the analyse-and-fill behaviour that was
+         working before. The advance click here is a navigation aid for
+         AFTER autofill succeeded, never a way to skip past empty
+         required fields. */
+      if (!requiredFieldsSatisfied()) return;
+
+      /* Don't advance if the page is still showing validation errors */
+      const hasErrors = !!document.querySelector(
+        '[aria-invalid="true"],.error,.is-invalid,[class*="field-error"],[class*="fieldError"],[role="alert"][class*="error" i]'
+      );
+      if (hasErrors) return;
+
+      const btn = findBtnByText(ADVANCE_RE);
+      if (!btn) return;
+      const txt = ((btn.innerText || btn.textContent || '') + '').trim();
+      if (TERMINAL_RE.test(txt)) return; // safety: never advance via a submit-looking word
+
+      /* Per-fingerprint guard so we don't ping-pong on the same step */
+      const fp = pageFingerprint('advance');
+      if (_dismissedFingerprints.has(fp)) return;
+      _dismissedFingerprints.add(fp);
+      _clicked.add(btn);
+      LOG(`Flow: clicking advance "${txt}"`);
+      try { realClick(btn); } catch (_) { try { btn.click(); } catch (__) {} }
+    }
+
+    /* ── T42: Already-applied / unsupported quick-dismiss ── */
+    const ALREADY_TEXT_RE = /(already\s+applied|application\s+already\s+submitted|you\s+have\s+already\s+applied|no\s+application\s+(form|available)|job\s+is\s+no\s+longer\s+available|this\s+position\s+is\s+closed|posting\s+is\s+closed|application\s+window\s+has\s+closed)/i;
+    const DISMISS_RE = /^(ok|okay|got\s*it|close|dismiss|cancel|skip|next\s+job|continue)$/i;
+
+    async function tickAlreadyApplied() {
+      if (!await automationActive()) return;
+      const bodyText = (document.body && document.body.innerText || '').slice(0, 4000);
+      if (!ALREADY_TEXT_RE.test(bodyText)) return;
+
+      /* Look for a close/dismiss button anywhere on the page first; if
+         none, send a skipCurrent so the queue moves on. */
+      const fp = pageFingerprint('alreadyApplied');
+      if (_dismissedFingerprints.has(fp)) return;
+
+      const btn = findBtnByText(DISMISS_RE);
+      if (btn) {
+        _dismissedFingerprints.add(fp);
+        _clicked.add(btn);
+        LOG('Flow: dismissing already-applied / unavailable card');
+        try { realClick(btn); } catch (_) { try { btn.click(); } catch (__) {} }
+        /* Also tell the queue to advance — even if the dismiss closes the
+           modal, the underlying page might not navigate. */
+        setTimeout(() => {
+          try { chrome.runtime.sendMessage({ action: 'skipCurrent' }).catch(() => {}); }
+          catch (_) {}
+        }, 600);
+        return;
+      }
+      /* No dismiss button found — just skip */
+      _dismissedFingerprints.add(fp);
+      LOG('Flow: already-applied detected, no dismiss button — skipping');
+      try { chrome.runtime.sendMessage({ action: 'skipCurrent' }).catch(() => {}); }
+      catch (_) {}
+    }
+
+    /* ── T43: Generic terminal-submit fallback ──
+       Only runs when:
+         - Fill has been stable for SETTLE_MS
+         - No submit has been attempted in the last 30s
+         - No validation errors are visible on the page
+         - The page contains a button whose text matches a terminal pattern
+       Marks _submitAttempted so the stuck watchdog doesn't fire. */
+    const T43_TERMINAL_RE = /^(submit\s+application|send\s+application|submit\s+my\s+application|complete\s+application|submit)$/i;
+
+    async function tickGenericSubmit() {
+      if (!await automationActive()) return;
+      if (!fillStable() || submitSuppressed()) return;
+
+      /* Don't run on the optimhire.com domain — the overlay/cover-letter
+         flow already drives submit there via T39/T40. */
+      if (/optimhire\.com$/i.test(location.hostname) ||
+          /\.optimhire\.com$/i.test(location.hostname)) return;
+
+      const hasErrors = !!document.querySelector(
+        '[aria-invalid="true"],.error,.is-invalid,[class*="field-error"],[class*="fieldError"]'
+      );
+      if (hasErrors) return;
+
+      const btn = findBtnByText(T43_TERMINAL_RE);
+      if (!btn) return;
+      /* Don't double-submit on the same step */
+      const fp = pageFingerprint('submit');
+      if (_dismissedFingerprints.has(fp)) return;
+      _dismissedFingerprints.add(fp);
+      _clicked.add(btn);
+      LOG(`Flow: clicking terminal submit "${((btn.innerText||'')+'').trim()}"`);
+      markSubmitAttempted();
+      try { realClick(btn); } catch (_) { try { btn.click(); } catch (__) {} }
+    }
+
+    /* ── T44: Missing-required-fields skip ──
+       If autofill ran but required fields are STILL not satisfied,
+       OptimHire's overlay shows "Please fill the missing details and
+       submit the form" with a 15-second countdown. The countdown does
+       fire skipCurrent on its own timer in sidepanel-patch.js, but on
+       sites where autofill genuinely cannot fill a field (uncommon
+       knockout question with no profile data, etc.) we don't need to
+       wait the full window — fire the skip MISSING_SKIP_MS after fill
+       completes if required-fields-satisfied is still false. */
+    const MISSING_SKIP_MS = 6_000;
+    let _missingSkipFiredForUrl = '';
+    async function tickMissingSkip() {
+      if (!await automationActive()) return;
+      if (_fillActive) return;
+      if (!_everFilledOnThisUrl) return;
+      if (submitSuppressed()) return;
+      if (_missingSkipFiredForUrl === location.href) return;
+      /* Only if fill has been stable for long enough AND required
+         fields are still not satisfied AND there ARE required fields
+         (so we don't fire on empty pages or pages with no form). */
+      if (Date.now() - _lastFillCompletedTs < MISSING_SKIP_MS) return;
+      const reqCount = $$(
+        'input[required]:not([type=hidden]),input[aria-required="true"]:not([type=hidden]),' +
+        'textarea[required],textarea[aria-required="true"],' +
+        'select[required],select[aria-required="true"]'
+      ).filter(isVisible).length;
+      if (reqCount === 0) return;
+      if (requiredFieldsSatisfied()) return;
+      _missingSkipFiredForUrl = location.href;
+      LOG(`Flow: missing required fields ${MISSING_SKIP_MS/1000}s after fill — skipCurrent`);
+      try { chrome.runtime.sendMessage({ action: 'skipCurrent' }).catch(() => {}); }
+      catch (_) {}
+    }
+
+    /* URL-change resets the fingerprint cache, the per-URL fill flag,
+       and the missing-skip flag so the next step is eligible again. */
+    let _lastUrl = location.href;
+    setInterval(() => {
+      if (location.href !== _lastUrl) {
+        _lastUrl = location.href;
+        _dismissedFingerprints.clear();
+        _everFilledOnThisUrl = false;
+        _missingSkipFiredForUrl = '';
+      }
+    }, 500);
+
+    setInterval(() => {
+      tickAdvance().catch(() => {});
+      tickAlreadyApplied().catch(() => {});
+      tickGenericSubmit().catch(() => {});
+      tickMissingSkip().catch(() => {});
+    }, POLL_MS);
+
+    function startObs() {
+      try {
+        const obs = new MutationObserver(() => {
+          tickAlreadyApplied().catch(() => {});
+        });
+        obs.observe(document.body, { childList: true, subtree: true });
+      } catch (_) {}
+    }
+    if (document.body) startObs();
+    else document.addEventListener('DOMContentLoaded', startObs);
   })();
 
   /* ── T12: Auto-solve captchas ────────────────────────────── */

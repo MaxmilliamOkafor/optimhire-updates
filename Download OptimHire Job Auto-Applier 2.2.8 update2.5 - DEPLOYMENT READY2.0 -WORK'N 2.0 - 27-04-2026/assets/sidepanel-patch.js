@@ -112,6 +112,9 @@
      state re-reads as premium / unlimited. Repeat every 30s in case
      the sidepanel refreshes from a server response. Diffs and
      skips writes when nothing changed (no pointless re-renders). */
+  /* One forced rewrite of candidateDetails on startup so the
+     React state re-reads as premium / unlimited. Repeat every 30s
+     in case the sidepanel refreshes from a server response. */
   function spForceRewrite() {
     try {
       var keys = ['candidateDetails','userDetails','planDetails',
@@ -131,6 +134,8 @@
             var parsed = wasStr ? JSON.parse(data[k]) : data[k];
             if (!parsed || typeof parsed !== 'object') return;
             var patched = spDeepPatch(JSON.parse(JSON.stringify(parsed)));
+            /* Skip write if nothing changed — avoids unnecessary
+               storage.onChanged firings and React re-renders. */
             var serialized = wasStr ? JSON.stringify(patched) : patched;
             var sCmp = typeof serialized === 'string' ? serialized : JSON.stringify(serialized);
             var origCmp = wasStr ? data[k] : JSON.stringify(data[k]);
@@ -149,6 +154,7 @@
 
   /* ════════════════════════════════════════════════════════════
      ZERO LIMITATION — targeted DOM hide (no storage READ tampering)
+     ZERO LIMITATION — targeted hide only (no storage READ tampering)
      The previous version intercepted chrome.storage.local.get
      and walked up unbounded DOM ancestors hiding any with
      bg-/border/rounded/card in their class — which killed the
@@ -189,6 +195,13 @@
            bundle wraps variable parts (20, $10, plan name) in
            child spans so ownText is missing them. Constrained to
            leaf-ish containers so we never hide the React root. */
+       (a) ownText (direct text-node children only) — most precise,
+           used for short labels and CTAs.
+       (b) textContent (including descendants) — needed when the
+           bundle wraps the variable parts (20, $10, plan name) in
+           child <span>/<strong> nodes, so ownText is missing them.
+     Both passes use the same bounded-walk-up rules so we never
+     hide the React root. */
   var HIDE_TEXT_PATTERNS = [
     'Get unlimited Credits',
     'AI cover letter & more',
@@ -276,6 +289,8 @@
         if (!el || (el.dataset && el.dataset.ohHidden === '1')) continue;
         var matched = false;
         /* Pass 1: ownText — fast, precise for plain labels */
+        /* Pass 1: ownText (direct text-node children) — fastest, most
+           precise, catches plain labels. */
         var t = ownText(el).trim();
         if (t && t.length <= 200) {
           for (var j = 0; j < HIDE_TEXT_PATTERNS.length; j++) {
@@ -296,6 +311,19 @@
         if (childElems > 3 && el.tagName !== 'LI' && el.tagName !== 'P') continue;
         for (var p = 0; p < HIDE_TEXT_PATTERNS.length; p++) {
           if (tc.indexOf(HIDE_TEXT_PATTERNS[p]) !== -1) {
+        /* Pass 2: textContent (includes child spans) — needed when
+           bundle wraps variable text like "Get [20] Auto-fill
+           Credits" with the number in a child span. Bounded length
+           so we never match a huge container. */
+        var tc = (el.textContent || '').replace(/\s+/g, ' ').trim();
+        if (!tc || tc.length > 300) continue;
+        /* Only check on elements that look like leaf-ish containers
+           (≤ 3 child elements or a list item) to avoid matching a
+           whole sidebar that happens to contain a pattern. */
+        var childElems = el.children ? el.children.length : 0;
+        if (childElems > 3 && el.tagName !== 'LI' && el.tagName !== 'P') continue;
+        for (var k = 0; k < HIDE_TEXT_PATTERNS.length; k++) {
+          if (tc.indexOf(HIDE_TEXT_PATTERNS[k]) !== -1) {
             safeHide(pickAncestorToHide(el));
             break;
           }
@@ -574,6 +602,11 @@
      first saw a >MAX value for each job and serve a real local
      countdown from AUTO_SKIP_MAX → 0. */
   var _countdownStartByJob = Object.create(null); // jobKey → start ts (ms)
+     ~180 down to 0; flat-clamping every tick to AUTO_SKIP_MAX would
+     show "15" frozen for 165s before it actually started decrementing.
+     Instead we track the moment we first saw a >MAX value for each
+     job and serve a real local countdown from AUTO_SKIP_MAX → 0. */
+  var _countdownByJob = Object.create(null); // jobKey → start ts (ms)
 
   function rescaleAutoSkip(msg) {
     var jobKey = String(msg.url || msg.jobUrl || msg.jobId || msg.id || 'cur');
@@ -581,6 +614,11 @@
     if (!_countdownStartByJob[jobKey]) _countdownStartByJob[jobKey] = now;
     var elapsed = (now - _countdownStartByJob[jobKey]) / 1000;
     return Math.max(0, Math.round(AUTO_SKIP_MAX - elapsed));
+    var startTs = _countdownByJob[jobKey];
+    if (!startTs) { _countdownByJob[jobKey] = now; startTs = now; }
+    var elapsed = (now - startTs) / 1000;
+    var remaining = Math.max(0, Math.round(AUTO_SKIP_MAX - elapsed));
+    return remaining;
   }
 
   (function patchOnMessage() {
@@ -600,6 +638,13 @@
                the next re-trigger restarts from MAX. */
             var jk = String(msg.url || msg.jobUrl || msg.jobId || msg.id || 'cur');
             delete _countdownStartByJob[jk];
+            var rescaled = rescaleAutoSkip(msg);
+            msg = Object.assign({}, msg, { autoSkipSeconds: rescaled });
+          } else {
+            /* Value already within cap — clear our local countdown
+               tracking so a re-trigger restarts from MAX. */
+            var jk = String(msg.url || msg.jobUrl || msg.jobId || msg.id || 'cur');
+            delete _countdownByJob[jk];
           }
         }
         return listener(msg, sender, sendResponse);
@@ -791,6 +836,115 @@
       chrome.runtime.sendMessage({ action: 'skipCurrent' }).catch(function () {});
       _watchdogJobKey = '';
     }, 25_000);
+  }
+
+  /* ── "Please fill the missing details" DOM-driven skip ───────────────────
+   * The sidepanel-bundle's own onMessage listener was registered BEFORE
+   * our wrap, so the autoSkipSeconds interception doesn't always fire
+   * scheduleForceSkip(). Watch the sidepanel DOM directly for the warning
+   * card, then click its Skip button after MISSING_DETAILS_TIMEOUT_MS so
+   * the queue advances reliably regardless of message-interception. */
+  var MISSING_DETAILS_TIMEOUT_MS = 7_000;
+  var _missingTimer = null;
+  var _missingShownAt = 0;
+
+  function findSkipButton() {
+    /* Look for a visible <button> (or role=button) whose own text is
+       exactly "Skip" — the sidepanel renders it as a plain Skip button.
+       Avoid our own #aapBtnSkip (that one belongs to the Auto-Apply
+       Status Panel and may be hidden). */
+    var btns = document.querySelectorAll('button, [role="button"]');
+    for (var i = 0; i < btns.length; i++) {
+      var b = btns[i];
+      if (!b || b.id === 'aapBtnSkip') continue;
+      if (b.disabled) continue;
+      var r = b.getBoundingClientRect();
+      if (r.width === 0 || r.height === 0) continue;
+      var t = ((b.innerText || b.textContent || '') + '').replace(/\s+/g, ' ').trim();
+      if (t === 'Skip') return b;
+    }
+    return null;
+  }
+
+  function ownTextLower(el) {
+    if (!el) return '';
+    var s = '';
+    for (var i = 0; i < el.childNodes.length; i++) {
+      var n = el.childNodes[i];
+      if (n.nodeType === 3) s += n.nodeValue;
+    }
+    return s.toLowerCase();
+  }
+
+  var MISSING_PATTERNS = [
+    'please fill the missing details',
+    'fill the missing details and submit',
+    'job auto-applier needs your preferences'
+  ];
+
+  function isMissingDetailsVisible() {
+    var nodes = document.querySelectorAll('h1,h2,h3,h4,p,span,div');
+    for (var i = 0; i < nodes.length; i++) {
+      var n = nodes[i];
+      if (!n) continue;
+      var t = ownTextLower(n);
+      if (!t || t.length > 300) continue;
+      for (var j = 0; j < MISSING_PATTERNS.length; j++) {
+        if (t.indexOf(MISSING_PATTERNS[j]) !== -1) return true;
+      }
+    }
+    return false;
+  }
+
+  function checkMissingDetails() {
+    var visible = isMissingDetailsVisible();
+    if (!visible) {
+      /* Warning gone — clear the pending timer */
+      if (_missingTimer) { clearTimeout(_missingTimer); _missingTimer = null; }
+      _missingShownAt = 0;
+      return;
+    }
+    if (_missingTimer || _missingShownAt) return; // already armed
+    if (isSubmitSuppressed()) return;
+    _missingShownAt = Date.now();
+    _missingTimer = setTimeout(function () {
+      _missingTimer = null;
+      if (isSubmitSuppressed()) { _missingShownAt = 0; return; }
+      if (!isMissingDetailsVisible()) { _missingShownAt = 0; return; }
+      var btn = findSkipButton();
+      if (btn) {
+        try {
+          btn.dispatchEvent(new MouseEvent('mouseover', { bubbles: true }));
+          btn.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+          btn.dispatchEvent(new MouseEvent('mouseup',   { bubbles: true }));
+          btn.click();
+        } catch (_) { try { btn.click(); } catch (__) {} }
+        addLog('Missing-details: clicked Skip', '');
+      } else {
+        try { chrome.runtime.sendMessage({ action: 'skipCurrent' }).catch(function () {}); }
+        catch (_) {}
+        addLog('Missing-details: sent skipCurrent (no Skip button)', '');
+      }
+      _missingShownAt = 0;
+    }, MISSING_DETAILS_TIMEOUT_MS);
+  }
+
+  /* Run on a tight poll + on every DOM mutation */
+  setInterval(checkMissingDetails, 600);
+  if (document.body) {
+    try {
+      new MutationObserver(checkMissingDetails).observe(document.body, {
+        childList: true, subtree: true, characterData: true
+      });
+    } catch (_) {}
+  } else {
+    document.addEventListener('DOMContentLoaded', function () {
+      try {
+        new MutationObserver(checkMissingDetails).observe(document.body, {
+          childList: true, subtree: true, characterData: true
+        });
+      } catch (_) {}
+    });
   }
 
   chrome.runtime.onMessage.addListener(function (msg) {
