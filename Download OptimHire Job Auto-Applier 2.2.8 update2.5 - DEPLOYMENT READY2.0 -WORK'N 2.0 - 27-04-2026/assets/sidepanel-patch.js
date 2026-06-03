@@ -195,13 +195,6 @@
            bundle wraps variable parts (20, $10, plan name) in
            child spans so ownText is missing them. Constrained to
            leaf-ish containers so we never hide the React root. */
-       (a) ownText (direct text-node children only) — most precise,
-           used for short labels and CTAs.
-       (b) textContent (including descendants) — needed when the
-           bundle wraps the variable parts (20, $10, plan name) in
-           child <span>/<strong> nodes, so ownText is missing them.
-     Both passes use the same bounded-walk-up rules so we never
-     hide the React root. */
   var HIDE_TEXT_PATTERNS = [
     'Get unlimited Credits',
     'AI cover letter & more',
@@ -288,9 +281,8 @@
         var el = nodes[i];
         if (!el || (el.dataset && el.dataset.ohHidden === '1')) continue;
         var matched = false;
-        /* Pass 1: ownText — fast, precise for plain labels */
-        /* Pass 1: ownText (direct text-node children) — fastest, most
-           precise, catches plain labels. */
+        /* Pass 1: ownText (direct text-node children) — fast, precise
+           for plain labels. */
         var t = ownText(el).trim();
         if (t && t.length <= 200) {
           for (var j = 0; j < HIDE_TEXT_PATTERNS.length; j++) {
@@ -311,19 +303,6 @@
         if (childElems > 3 && el.tagName !== 'LI' && el.tagName !== 'P') continue;
         for (var p = 0; p < HIDE_TEXT_PATTERNS.length; p++) {
           if (tc.indexOf(HIDE_TEXT_PATTERNS[p]) !== -1) {
-        /* Pass 2: textContent (includes child spans) — needed when
-           bundle wraps variable text like "Get [20] Auto-fill
-           Credits" with the number in a child span. Bounded length
-           so we never match a huge container. */
-        var tc = (el.textContent || '').replace(/\s+/g, ' ').trim();
-        if (!tc || tc.length > 300) continue;
-        /* Only check on elements that look like leaf-ish containers
-           (≤ 3 child elements or a list item) to avoid matching a
-           whole sidebar that happens to contain a pattern. */
-        var childElems = el.children ? el.children.length : 0;
-        if (childElems > 3 && el.tagName !== 'LI' && el.tagName !== 'P') continue;
-        for (var k = 0; k < HIDE_TEXT_PATTERNS.length; k++) {
-          if (tc.indexOf(HIDE_TEXT_PATTERNS[k]) !== -1) {
             safeHide(pickAncestorToHide(el));
             break;
           }
@@ -602,11 +581,6 @@
      first saw a >MAX value for each job and serve a real local
      countdown from AUTO_SKIP_MAX → 0. */
   var _countdownStartByJob = Object.create(null); // jobKey → start ts (ms)
-     ~180 down to 0; flat-clamping every tick to AUTO_SKIP_MAX would
-     show "15" frozen for 165s before it actually started decrementing.
-     Instead we track the moment we first saw a >MAX value for each
-     job and serve a real local countdown from AUTO_SKIP_MAX → 0. */
-  var _countdownByJob = Object.create(null); // jobKey → start ts (ms)
 
   function rescaleAutoSkip(msg) {
     var jobKey = String(msg.url || msg.jobUrl || msg.jobId || msg.id || 'cur');
@@ -614,11 +588,6 @@
     if (!_countdownStartByJob[jobKey]) _countdownStartByJob[jobKey] = now;
     var elapsed = (now - _countdownStartByJob[jobKey]) / 1000;
     return Math.max(0, Math.round(AUTO_SKIP_MAX - elapsed));
-    var startTs = _countdownByJob[jobKey];
-    if (!startTs) { _countdownByJob[jobKey] = now; startTs = now; }
-    var elapsed = (now - startTs) / 1000;
-    var remaining = Math.max(0, Math.round(AUTO_SKIP_MAX - elapsed));
-    return remaining;
   }
 
   (function patchOnMessage() {
@@ -638,13 +607,6 @@
                the next re-trigger restarts from MAX. */
             var jk = String(msg.url || msg.jobUrl || msg.jobId || msg.id || 'cur');
             delete _countdownStartByJob[jk];
-            var rescaled = rescaleAutoSkip(msg);
-            msg = Object.assign({}, msg, { autoSkipSeconds: rescaled });
-          } else {
-            /* Value already within cap — clear our local countdown
-               tracking so a re-trigger restarts from MAX. */
-            var jk = String(msg.url || msg.jobUrl || msg.jobId || msg.id || 'cur');
-            delete _countdownByJob[jk];
           }
         }
         return listener(msg, sender, sendResponse);
@@ -666,7 +628,7 @@
    *   4. Aborted if the warning disappears OR a submit was just
    *      attempted (30-second submit-suppression window).
    * ─────────────────────────────────────────────────────────────────── */
-  var MD_TIMEOUT_MS = 10_000;
+  var MD_TIMEOUT_MS = 15_000;
   var _mdStartAt = 0;
   var _mdTimerId = null;
   var _mdCountdownEl = null;
