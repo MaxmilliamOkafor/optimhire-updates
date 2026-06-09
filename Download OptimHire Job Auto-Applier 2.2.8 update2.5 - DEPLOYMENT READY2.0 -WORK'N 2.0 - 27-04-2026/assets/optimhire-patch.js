@@ -2548,14 +2548,45 @@
        PAGE_SETTLE_MS gives the fetch a chance to complete (or
        definitively fail, which we then handle with "Use My
        Original Resume") before we click anything. */
-    const POLL_MS        =    50;
-    const PAGE_SETTLE_MS = 2_000;
+    const POLL_MS        =    100;
+    const PAGE_SETTLE_MS = 1_500;   // minimum wait per URL
+    const MAX_WAIT_MS    = 20_000;  // hard cap — click anyway after this
+    const FETCH_FAIL_STABLE_MS = 2_000; // error must persist this long
     const _clicked       = new WeakSet();
     const _pageEnteredAt = new Map(); // url → ts(ms) of first sight
+    const _fetchFailedSince = new Map(); // url → ts(ms) of first fetchFailed sighting
 
     function looksGenerating(root) {
       const t = (root && root.textContent) || '';
       return /Generating\s+(Custom\s+)?(Resume|Cover\s*Letter)/i.test(t);
+    }
+
+    /* Resume editor: AI-tailored CV is ready when the preview area
+       has substantial text content. The editor controls + skeleton
+       are ~500-800 chars; a populated resume is 2000+ chars. */
+    function resumeContentReady() {
+      const main = document.querySelector('main') || document.body;
+      const t = (main.innerText || '').trim();
+      if (t.length < 1500) return false;
+      /* Resume sections like SUMMARY, EXPERIENCE, EDUCATION typically
+         appear in any populated CV. Look for at least 2 of them. */
+      var marks = 0;
+      ['summary','experience','education','skills','employment','work history']
+        .forEach(function (m) { if (new RegExp('\\b' + m + '\\b','i').test(t)) marks++; });
+      return marks >= 2;
+    }
+
+    /* Cover letter modal: AI-generated letter is ready when the
+       editor textarea / contenteditable has substantial body text. */
+    function coverLetterContentReady() {
+      const eds = document.querySelectorAll(
+        'textarea, [contenteditable="true"], [contenteditable=""]'
+      );
+      for (const ed of eds) {
+        const t = (ed.value || ed.innerText || ed.textContent || '').trim();
+        if (t.length >= 150) return true;
+      }
+      return false;
     }
 
     /* Find a visible+enabled button whose own text matches `re` */
@@ -2608,64 +2639,96 @@
       return FETCH_FAILED_RE.test(t.slice(0, 8000));
     }
 
-    /* Per-URL settle gate. The first time we see a given URL, record
-       a timestamp; auto-clickers refuse to fire until PAGE_SETTLE_MS
-       has elapsed since then. This prevents racing the resume-fetch
-       API on rapid job transitions. If the page has visibly errored
-       out (fetchFailed) we skip the gate so "Use My Original Resume"
-       fires immediately. */
-    function pageSettled() {
+    /* fetchFailed is only actionable if it's STABLE for at least
+       FETCH_FAIL_STABLE_MS — otherwise transient loading states
+       could trigger the "Use My Original Resume" fallback when the
+       AI version would have arrived a moment later. */
+    function fetchFailedStable() {
+      const url = location.href;
+      const now = Date.now();
+      if (fetchFailed()) {
+        if (!_fetchFailedSince.has(url)) {
+          _fetchFailedSince.set(url, now);
+          return false;
+        }
+        return now - _fetchFailedSince.get(url) >= FETCH_FAIL_STABLE_MS;
+      }
+      /* Error gone — reset tracking for this URL */
+      _fetchFailedSince.delete(url);
+      return false;
+    }
+
+    function elapsedOnPage() {
       const url = location.href;
       const now = Date.now();
       if (!_pageEnteredAt.has(url)) {
         _pageEnteredAt.set(url, now);
-        /* Cap the map size at 50 entries (FIFO) so it doesn't grow
-           unbounded over a long-running queue. */
         if (_pageEnteredAt.size > 50) {
-          const firstKey = _pageEnteredAt.keys().next().value;
-          _pageEnteredAt.delete(firstKey);
+          _pageEnteredAt.delete(_pageEnteredAt.keys().next().value);
         }
-        return false;
+        return 0;
       }
-      return now - _pageEnteredAt.get(url) >= PAGE_SETTLE_MS;
+      return now - _pageEnteredAt.get(url);
     }
 
     /* T39 — Save & Next →  (only on optimhire.com resume editor)
-       If resume fetch failed and "Use My Original Resume" link is
-       present, click that instead — falls back to the user's
-       uploaded CV. Saves the application from breaking on a
-       server-side resume-generation outage. Otherwise click Save
-       & Next normally. */
+       Order of operations:
+         1. Wait minimum PAGE_SETTLE_MS so the fetch can start.
+         2. If fetchFailed has been STABLE for 2s, fall back to
+            "Use My Original Resume" — uses the uploaded CV.
+         3. Otherwise wait until the AI-tailored CV is actually
+            populated in the preview area (resumeContentReady).
+         4. If MAX_WAIT_MS elapses with no content, click Save &
+            Next anyway so the queue advances (better than stalling). */
     async function tickSaveNext() {
       if (!/optimhire\.com$/i.test(location.hostname) &&
           !/\.optimhire\.com$/i.test(location.hostname)) return;
       if (!(await automationActive())) return;
 
-      /* If the page has already errored out, skip the settle wait
-         and fall back to the user's original resume immediately. */
-      if (fetchFailed()) {
+      const elapsed = elapsedOnPage();
+      if (elapsed < PAGE_SETTLE_MS) return;
+
+      /* Fetch-error fallback (only if stable, not transient) */
+      if (fetchFailedStable()) {
         const orig = findBtn(/^Use\s+My\s+Original\s+Resume$/i);
         if (orig) {
           _clicked.add(orig);
-          LOG('Resume fetch failed — clicking Use My Original Resume');
+          LOG('Resume fetch failed (stable) — clicking Use My Original Resume');
           try { realClick(orig); } catch (_) { try { orig.click(); } catch (__) {} }
           return;
         }
       }
 
-      /* Otherwise wait until the page has been around long enough
-         that the resume-fetch has had a chance to complete. */
-      if (!pageSettled()) return;
+      /* Wait for AI content to populate, OR force-click after MAX_WAIT */
+      const ready = resumeContentReady();
+      if (!ready && elapsed < MAX_WAIT_MS) return;
+      if (!ready) LOG(`Save & Next: content not ready after ${MAX_WAIT_MS}ms — clicking anyway`);
 
       await maybeClick(/^Save\s*&\s*Next(\s*[→>›])?$/i, 'Save & Next →');
     }
 
     /* T40 — Apply Now  (any URL with the cover-letter modal)
-       Cover letter is optional on most ATSes, but we still wait
-       for the page to settle so the generation API isn't raced. */
+       Same content-wait approach: only click once the cover letter
+       editor has substantial text content, or after MAX_WAIT. */
     async function tickApplyNow() {
       if (!(await automationActive())) return;
-      if (!pageSettled()) return;
+
+      const btn = findBtn(/^Apply\s*Now$/i);
+      if (!btn) return; // no modal open
+
+      const elapsed = elapsedOnPage();
+      if (elapsed < PAGE_SETTLE_MS) return;
+
+      /* On optimhire.com domains, also honour stable fetchFailed */
+      if (/optimhire\.com$/i.test(location.hostname) && fetchFailedStable()) {
+        LOG('Cover-letter fetch failed (stable) — clicking Apply Now anyway');
+        /* Cover letter is optional — proceed to apply */
+      } else {
+        const ready = coverLetterContentReady();
+        if (!ready && elapsed < MAX_WAIT_MS) return;
+        if (!ready) LOG(`Apply Now: cover-letter not ready after ${MAX_WAIT_MS}ms — clicking anyway`);
+      }
+
       await maybeClick(/^Apply\s*Now$/i, 'Apply Now');
     }
 
