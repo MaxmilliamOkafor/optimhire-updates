@@ -1425,8 +1425,14 @@
     if (/last.?name/.test(l))                             return p.last_name     || '';
     if (/full.?name|your.?name/.test(l))                  return fullName;
     if (/preferred.?name|display.?name|nickname/.test(l)) return fullName;
-    if (/\bemail\b/.test(l))                              return p.email         || '';
-    if (/phone|mobile|cell/.test(l))                      return p.phone         || '';
+    /* Email: handle "Email", "Email Address", "E-mail", "E mail", "EMail".
+       Note: label is pre-processed so non-alphanumerics become spaces, so
+       "E-mail" becomes "e mail" — \se?mail covers both forms. */
+    if (/\be\s?mail\b/.test(l))                           return p.email         || '';
+    /* Phone: handle "Phone", "Mobile", "Cell", "Tel", "Telephone",
+       "Cell Phone", "Mobile Number", "Contact Number", "Contact No", etc. */
+    if (/phone|mobile|cell|\btel\b|telephone|contact.*(?:number|\bno\b|num\b)/.test(l))
+                                                          return p.phone         || '';
     if (/^city$|city\b|current.?location|location.*city/.test(l))
                                                           return p.city          || 'Dublin';
     if (/state|province/.test(l))                         return p.state         || '';
