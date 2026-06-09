@@ -902,26 +902,44 @@
       if (lbl && lbl !== el && lbl.textContent.trim()) return lbl.textContent.trim();
     }
 
-    /* 7) Preceding-sibling label-ish element (legend-style custom forms) */
+    /* 7) Preceding-sibling label-ish element (legend-style custom forms).
+       Two passes: prefer a real LABEL/LEGEND first, then fall back to
+       headings / paragraphs / spans — so a "Hint:" span before the
+       input never wins over the real label. */
+    const sibs = [];
     let sib = el.previousElementSibling;
-    for (let i = 0; i < 3 && sib; i++) {
-      if (/^(LABEL|LEGEND|H1|H2|H3|H4|H5|H6|P|SPAN|DIV)$/i.test(sib.tagName)) {
-        const t = (sib.textContent || '').trim();
-        if (t && t.length < 200) return t;
-      }
-      sib = sib.previousElementSibling;
-    }
+    for (let i = 0; i < 4 && sib; i++) { sibs.push(sib); sib = sib.previousElementSibling; }
+    const sibLabel = sibs.find(s => /^(LABEL|LEGEND)$/i.test(s.tagName) &&
+                                    (s.textContent || '').trim() &&
+                                    (s.textContent || '').trim().length < 200);
+    if (sibLabel) return sibLabel.textContent.trim();
+    const sibOther = sibs.find(s => /^(H1|H2|H3|H4|H5|H6|P|SPAN|DIV)$/i.test(s.tagName) &&
+                                    (s.textContent || '').trim() &&
+                                    (s.textContent || '').trim().length < 200);
+    if (sibOther) return sibOther.textContent.trim();
 
-    /* 8) Parent's first text node (e.g. <div>Label <input/></div>) */
+    /* 8) Within the parent, prefer a real <label> child that precedes the
+       input; otherwise fall back to the first meaningful text node or
+       label-ish element. Avoids returning a "Hint:" span when a real
+       <label> is also present. */
     const parent = el.parentElement;
     if (parent) {
+      /* Pass A: a <label> element appearing before the input */
+      for (const child of parent.childNodes) {
+        if (child === el) break;
+        if (child.nodeType === 1 && /^(LABEL|LEGEND)$/i.test(child.tagName)) {
+          const t = child.textContent.trim();
+          if (t && t.length < 200) return t;
+        }
+      }
+      /* Pass B: first text node or other label-ish element */
       for (const child of parent.childNodes) {
         if (child === el) break;
         if (child.nodeType === 3) {
           const t = child.nodeValue.trim();
           if (t && t.length < 200) return t;
         } else if (child.nodeType === 1 &&
-                   /^(LABEL|SPAN|STRONG|B|H1|H2|H3|H4|H5|H6|P)$/i.test(child.tagName)) {
+                   /^(SPAN|STRONG|B|H1|H2|H3|H4|H5|H6|P)$/i.test(child.tagName)) {
           const t = child.textContent.trim();
           if (t && t.length < 200) return t;
         }
@@ -1860,16 +1878,27 @@
     const contains = opts.find(o => o.text.toLowerCase().includes(t) || t.includes(o.text.toLowerCase()));
     if (contains) return contains;
 
+    /* Normalise money/number shorthand so salary dropdowns match:
+       strips "$" and thousands-commas, and expands k/m suffixes
+       ("50k" → "50000", "1.5m" → "1500000"). Applied to both the
+       target and each option's text before numeric range matching. */
+    const normNum = (s) => String(s)
+      .replace(/\$/g, '')
+      .replace(/,/g, '')
+      .replace(/(\d+(?:\.\d+)?)\s*([km])\b/gi, (_, n, suf) =>
+        String(Math.round(parseFloat(n) * (/[kK]/.test(suf) ? 1e3 : 1e6))));
+
     /* Numeric-range smart-match: when the target is purely numeric (e.g.
        "7" for years of experience or "80000" for salary), find the option
        whose range CONTAINS the number — covers "5-10 years", "5 to 10",
-       "5+ years", "Over 5 years", "Less than 10 years", etc. */
-    const num = parseFloat(t);
+       "5+ years", "Over 5 years", "Less than 10 years", "$50,000-$80,000",
+       "50k-80k", etc. */
+    const num = parseFloat(normNum(t));
     if (!isNaN(num)) {
       let bestOpt = null;
       let bestSpan = Infinity;
       for (const o of opts) {
-        const txt = o.text.toLowerCase();
+        const txt = normNum(o.text.toLowerCase());
         /* "X - Y" / "X to Y" / "X – Y" */
         const range = txt.match(/(\d+(?:\.\d+)?)\s*(?:-|to|–|—)\s*(\d+(?:\.\d+)?)/);
         if (range) {
