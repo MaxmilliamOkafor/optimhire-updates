@@ -77,44 +77,52 @@
   }
 
   /* Wrap chrome.storage.local.set so any future writes carry
-     premium / unlimited values. SAFE: doesn't change read paths. */
-  try {
-    var _spOrigSet = chrome.storage.local.set.bind(chrome.storage.local);
-    chrome.storage.local.set = function (items, cb) {
-      try {
-        if (items && typeof items === 'object') {
-          Object.keys(items).forEach(function (k) {
-            var v = items[k];
-            if (v && typeof v === 'object') {
-              try { items[k] = spDeepPatch(JSON.parse(JSON.stringify(v))); } catch (_) {}
-            } else if (typeof v === 'string' && /^[\[{]/.test(v.trim())) {
-              try {
-                var parsed = JSON.parse(v);
-                if (parsed && typeof parsed === 'object') {
-                  items[k] = JSON.stringify(spDeepPatch(parsed));
-                }
-              } catch (_) {}
-            } else if (typeof v === 'number' && SP_COUNTER_ZERO.indexOf(k) !== -1 && v > 0) {
-              items[k] = 0;
-            }
-          });
+     premium / unlimited values. Defensive: bails to original on
+     any unexpected return type. */
+  function installSetWrap() {
+    try {
+      var _spOrigSet = chrome.storage.local.set.bind(chrome.storage.local);
+      if (chrome.storage.local.set.__ohWrapped) return; // idempotent
+      var wrapped = function (items, cb) {
+        try {
+          if (items && typeof items === 'object') {
+            Object.keys(items).forEach(function (k) {
+              var v = items[k];
+              if (v && typeof v === 'object') {
+                try { items[k] = spDeepPatch(JSON.parse(JSON.stringify(v))); } catch (_) {}
+              } else if (typeof v === 'string' && /^[\[{]/.test(v.trim())) {
+                try {
+                  var parsed = JSON.parse(v);
+                  if (parsed && typeof parsed === 'object') {
+                    items[k] = JSON.stringify(spDeepPatch(parsed));
+                  }
+                } catch (_) {}
+              } else if (typeof v === 'number' && SP_COUNTER_ZERO.indexOf(k) !== -1 && v > 0) {
+                items[k] = 0;
+              }
+            });
+          }
+        } catch (_) {}
+        if (typeof cb === 'function') {
+          try { return _spOrigSet(items, cb); }
+          catch (_) { try { cb(); } catch (__) {} return; }
         }
-      } catch (_) {}
-      if (typeof cb === 'function') {
-        try { return _spOrigSet(items, cb); }
-        catch (_) { try { cb(); } catch (__) {} return; }
-      }
-      return _spOrigSet(items).catch(function () {});
-    };
-  } catch (_) {}
+        try {
+          var ret = _spOrigSet(items);
+          /* Defensive: only attach .catch if ret looks like a Promise */
+          if (ret && typeof ret.catch === 'function') {
+            return ret.catch(function () {});
+          }
+          return ret;
+        } catch (_) { return undefined; }
+      };
+      wrapped.__ohWrapped = true;
+      chrome.storage.local.set = wrapped;
+    } catch (_) {}
+  }
 
-  /* One forced rewrite of candidateDetails on startup so the React
-     state re-reads as premium / unlimited. Repeat every 30s in case
-     the sidepanel refreshes from a server response. Diffs and
-     skips writes when nothing changed (no pointless re-renders). */
-  /* One forced rewrite of candidateDetails on startup so the
-     React state re-reads as premium / unlimited. Repeat every 30s
-     in case the sidepanel refreshes from a server response. */
+  /* Periodic re-write so candidateDetails stays premium. Diff-checks
+     to avoid pointless storage.onChanged firings. */
   function spForceRewrite() {
     try {
       var keys = ['candidateDetails','userDetails','planDetails',
@@ -134,8 +142,6 @@
             var parsed = wasStr ? JSON.parse(data[k]) : data[k];
             if (!parsed || typeof parsed !== 'object') return;
             var patched = spDeepPatch(JSON.parse(JSON.stringify(parsed)));
-            /* Skip write if nothing changed — avoids unnecessary
-               storage.onChanged firings and React re-renders. */
             var serialized = wasStr ? JSON.stringify(patched) : patched;
             var sCmp = typeof serialized === 'string' ? serialized : JSON.stringify(serialized);
             var origCmp = wasStr ? data[k] : JSON.stringify(data[k]);
@@ -149,8 +155,17 @@
       });
     } catch (_) {}
   }
-  spForceRewrite();
-  setInterval(spForceRewrite, 30_000);
+
+  /* DEFER both the storage write-wrap AND the first force-rewrite.
+     The 2.6.1 bundle's React init reads storage synchronously near
+     mount; wrapping/writing too early can race that init and leave
+     the sidepanel blank. 1.5s gives React time to mount its tree
+     before we start interfering. */
+  setTimeout(function () {
+    installSetWrap();
+    spForceRewrite();
+    setInterval(spForceRewrite, 30_000);
+  }, 1500);
 
   /* ════════════════════════════════════════════════════════════
      ZERO LIMITATION — targeted DOM hide (no storage READ tampering)
