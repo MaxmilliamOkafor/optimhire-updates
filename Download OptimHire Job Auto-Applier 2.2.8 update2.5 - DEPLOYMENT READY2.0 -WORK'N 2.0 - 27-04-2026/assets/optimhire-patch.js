@@ -155,6 +155,23 @@
     return r.width > 0 && r.height > 0 && el.offsetParent !== null;
   }
 
+  /* ── optimHireBusy: is OptimHire's own autofill actively working? ──
+   * Shared by the stuck watchdog and the missing-fields skip so neither
+   * skips a job while OptimHire is mid-flow (loading details, analysing,
+   * generating cover letter, uploading CV, submitting). Detects the
+   * overlay text OptimHire injects + any visible spinner/loader. */
+  const OH_BUSY_RE = /hang tight|loading your details|we['’]re loading|analy[sz]ing|checking page|submitting|generating|uploading|please wait|filling (out )?(the )?form/i;
+  function optimHireBusy() {
+    try {
+      const t = (document.body && document.body.innerText || '').slice(0, 4000);
+      if (OH_BUSY_RE.test(t)) return true;
+      if (document.querySelector(
+        '[class*="spinner" i],[class*="loader" i],[class*="loading" i],[role="progressbar"]'
+      )) return true;
+    } catch (_) {}
+    return false;
+  }
+
   /* ── T1: Supported ATS domains ─────────────────────────── */
   const ATS_DOMAINS = {
     'greenhouse.io':       'Greenhouse',
@@ -2509,54 +2526,84 @@
   })();
 
   /* ── General stuck-job watchdog (content script) ────────────────────────────
-   * If the automation is running but the same URL has been "active" for more
-   * than 25 seconds, something is stuck — send skipCurrent.
-   * Guards against any future stall source, not just missing-details iframe.
+   * Progress-tracking safety net. It tracks a "last progress" timestamp
+   * that resets whenever ANY sign of activity is seen, and only fires
+   * skipCurrent when nothing has progressed for STUCK_TIMEOUT_MS.
+   *
+   * Critically, on third-party ATSes OptimHire's OWN autofill does the
+   * work (our _fillActive flag stays false), and its "Hang tight!
+   * We're loading your details…" / "Submitting…" phase can take 30-60s.
+   * The old 7s timer skipped mid-load, which both abandoned good jobs
+   * AND thrashed the applied counter (skip → re-add → skip). We now
+   * treat OptimHire's working indicators and any form-field changes as
+   * progress, so we never skip while it's actively applying.
    * ─────────────────────────────────────────────────────────────────────── */
   (function installStuckWatchdog() {
-    let _watchdogUrl = '';
-    let _watchdogTimer = null;
-    /* 7s — user preference for high-throughput 2000+ queues. _fillActive
-       and _submitAttempted guards still suppress the skip during real
-       form filling / submit attempts, so we only skip when the page is
-       truly idle on the same URL for 7s straight. */
-    const STUCK_TIMEOUT_MS = 7_000;
+    /* 60s of genuine inactivity = stuck. This is a safety net, NOT the
+       throughput driver — OptimHire's full per-job flow (load details →
+       fill → generate cover letter → upload CV → submit) legitimately
+       takes 30-60s on slower ATSes. Skipping earlier abandons real
+       applications. */
+    const STUCK_TIMEOUT_MS = 60_000;
+    const POLL_MS = 2_000;
+
+    let _lastUrl = '';
+    let _lastProgressTs = Date.now();
+    let _lastFormSignature = '';
+
+    /* Cheap signature of current form field values — if it changes
+       between polls, something is being filled (progress). */
+    function formSignature() {
+      try {
+        let sig = '';
+        const els = $$(
+          'input:not([type=hidden]):not([type=submit]):not([type=button]),textarea,select'
+        );
+        for (let i = 0; i < els.length && i < 60; i++) {
+          const v = els[i].value || '';
+          sig += v.length + ':' + (els[i].checked ? '1' : '0') + '|';
+        }
+        return sig;
+      } catch (_) { return ''; }
+    }
 
     async function checkStuck() {
-      const { csvActiveJobId, isAutoProcessStartJob } = await ST.get([
-        'csvActiveJobId', 'isAutoProcessStartJob',
-      ]);
-      if (!csvActiveJobId && !isAutoProcessStartJob) {
-        _watchdogUrl = '';
-        return;
-      }
+      let active = false;
+      try {
+        const { csvActiveJobId, isAutoProcessStartJob } = await ST.get([
+          'csvActiveJobId', 'isAutoProcessStartJob',
+        ]);
+        active = !!csvActiveJobId || !!isAutoProcessStartJob;
+      } catch (_) { return; }
+
+      if (!active) { _lastProgressTs = Date.now(); return; }
+
       const cur = normalizeUrl(location.href);
-      if (cur !== _watchdogUrl) {
-        _watchdogUrl = cur;
-        clearTimeout(_watchdogTimer);
-        _watchdogTimer = setTimeout(() => {
-          // Do NOT skip if fill is actively running or a submit was just attempted
-          if (_fillActive) {
-            LOG('Stuck watchdog: skipping because _fillActive is true');
-            _watchdogUrl = ''; // reset so next poll re-arms the timer
-            return;
-          }
-          if (_submitAttempted && Date.now() - _submitAttemptTs < 30_000) {
-            LOG('Stuck watchdog: skipping because submit was recently attempted');
-            _watchdogUrl = '';
-            return;
-          }
-          LOG(`Stuck watchdog: still on ${cur} after ${STUCK_TIMEOUT_MS/1000}s — force-skipping`);
-          chrome.runtime.sendMessage({ action: 'skipCurrent' }).catch(() => {});
-          _watchdogUrl = '';
-        }, STUCK_TIMEOUT_MS);
+      const now = Date.now();
+
+      /* Any of these counts as progress → reset the inactivity clock */
+      let progressed = false;
+      if (cur !== _lastUrl) { _lastUrl = cur; progressed = true; }       // navigation
+      if (_fillActive) progressed = true;                                 // our autofill
+      if (_submitAttempted && now - _submitAttemptTs < 30_000) progressed = true;
+      if (optimHireBusy()) progressed = true;                             // OH overlay/spinner
+      const sig = formSignature();
+      if (sig !== _lastFormSignature) { _lastFormSignature = sig; progressed = true; }
+
+      if (progressed) { _lastProgressTs = now; return; }
+
+      /* No progress signal at all — has it been long enough? */
+      if (now - _lastProgressTs >= STUCK_TIMEOUT_MS) {
+        LOG(`Stuck watchdog: no progress for ${STUCK_TIMEOUT_MS/1000}s on ${cur} — force-skipping`);
+        chrome.runtime.sendMessage({ action: 'skipCurrent' }).catch(() => {});
+        _lastProgressTs = now; // cooldown so we don't spam skips
       }
     }
 
-    // Poll every 15 seconds for URL / active status changes
-    setInterval(checkStuck, 3_000); // poll every 3s so 7s stalls are caught promptly
+    setInterval(checkStuck, POLL_MS);
     checkStuck();
   })();
+
 
   /* ── T39 / T40: Zero-manual-effort auto-clickers ─────────────────────────
    * The 2.6.0 release added two interstitial screens that block the queue
@@ -3012,13 +3059,17 @@
        knockout question with no profile data, etc.) we don't need to
        wait the full window — fire the skip MISSING_SKIP_MS after fill
        completes if required-fields-satisfied is still false. */
-    const MISSING_SKIP_MS = 6_000;
+    const MISSING_SKIP_MS = 12_000;
     let _missingSkipFiredForUrl = '';
     async function tickMissingSkip() {
       if (!await automationActive()) return;
       if (_fillActive) return;
       if (!_everFilledOnThisUrl) return;
       if (submitSuppressed()) return;
+      /* Never skip while OptimHire is mid-flow (generating cover
+         letter, uploading CV, submitting) — a required field may be
+         populated a moment later. */
+      if (optimHireBusy()) return;
       if (_missingSkipFiredForUrl === location.href) return;
       /* Only if fill has been stable for long enough AND required
          fields are still not satisfied AND there ARE required fields
