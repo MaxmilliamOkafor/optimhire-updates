@@ -86,7 +86,7 @@
             "js": [
                 "assets/optimhire-patch.js"
             ],
-            "all_frames": false,
+            "all_frames": true,
             "run_at": "document_idle",
             "css": []
         }

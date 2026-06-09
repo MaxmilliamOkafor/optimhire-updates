@@ -119,6 +119,29 @@
 (function () {
   'use strict';
 
+  /* ── Iframe gate ──────────────────────────────────────────
+   * Manifest now sets all_frames:true so we run inside ATS-form
+   * iframes (Greenhouse / Lever / Workable / Recruitee / etc.
+   * commonly embed their application forms via iframe in company
+   * career sites). But running in EVERY iframe (analytics, ads,
+   * social embeds, chat widgets) is wasteful. So: in any subframe
+   * whose hostname isn't a known ATS or doesn't look like a job
+   * application page, bail out immediately. The top frame always
+   * runs (it might navigate to an ATS later).
+   * ──────────────────────────────────────────────────────── */
+  try {
+    const inIframe = window.top !== window.self;
+    if (inIframe) {
+      const h = (location.hostname || '').toLowerCase();
+      const ATS_HOST_RE = /(greenhouse|lever\.co|breezy|workday|icims|taleo|oraclecloud|smartrecruiters|ashbyhq|bamboohr|jobvite|workable|paylocity|jazzhr|resumatorapi|teamtailor|ziprecruiter|manatal|bullhorn|hiring\.cafe|gohire|forhyre|careers-page|gh-widget|successfactors|sapsf|ukg|ultipro|avature|recruitee|pinpoint|rippling|ats\.|jobs\.|careers\.|apply\.)/i;
+      const looksLikeJobApp = /\/(apply|application|job|career|position|opening)/i.test(location.pathname);
+      if (!ATS_HOST_RE.test(h) && !looksLikeJobApp) {
+        /* Quietly no-op in non-ATS iframes (analytics, ads, etc.) */
+        return;
+      }
+    }
+  } catch (_) {}
+
   /* ── Helpers ───────────────────────────────────────────── */
   const LOG = (...a) => console.log('[OH-Patch]', ...a);
   const ST  = chrome.storage.local;
@@ -153,6 +176,23 @@
     if (!el) return false;
     const r = el.getBoundingClientRect();
     return r.width > 0 && r.height > 0 && el.offsetParent !== null;
+  }
+
+  /* ── optimHireBusy: is OptimHire's own autofill actively working? ──
+   * Shared by the stuck watchdog and the missing-fields skip so neither
+   * skips a job while OptimHire is mid-flow (loading details, analysing,
+   * generating cover letter, uploading CV, submitting). Detects the
+   * overlay text OptimHire injects + any visible spinner/loader. */
+  const OH_BUSY_RE = /hang tight|loading your details|we['’]re loading|analy[sz]ing|checking page|submitting|generating|uploading|please wait|filling (out )?(the )?form/i;
+  function optimHireBusy() {
+    try {
+      const t = (document.body && document.body.innerText || '').slice(0, 4000);
+      if (OH_BUSY_RE.test(t)) return true;
+      if (document.querySelector(
+        '[class*="spinner" i],[class*="loader" i],[class*="loading" i],[role="progressbar"]'
+      )) return true;
+    } catch (_) {}
+    return false;
   }
 
   /* ── T1: Supported ATS domains ─────────────────────────── */
@@ -902,26 +942,44 @@
       if (lbl && lbl !== el && lbl.textContent.trim()) return lbl.textContent.trim();
     }
 
-    /* 7) Preceding-sibling label-ish element (legend-style custom forms) */
+    /* 7) Preceding-sibling label-ish element (legend-style custom forms).
+       Two passes: prefer a real LABEL/LEGEND first, then fall back to
+       headings / paragraphs / spans — so a "Hint:" span before the
+       input never wins over the real label. */
+    const sibs = [];
     let sib = el.previousElementSibling;
-    for (let i = 0; i < 3 && sib; i++) {
-      if (/^(LABEL|LEGEND|H1|H2|H3|H4|H5|H6|P|SPAN|DIV)$/i.test(sib.tagName)) {
-        const t = (sib.textContent || '').trim();
-        if (t && t.length < 200) return t;
-      }
-      sib = sib.previousElementSibling;
-    }
+    for (let i = 0; i < 4 && sib; i++) { sibs.push(sib); sib = sib.previousElementSibling; }
+    const sibLabel = sibs.find(s => /^(LABEL|LEGEND)$/i.test(s.tagName) &&
+                                    (s.textContent || '').trim() &&
+                                    (s.textContent || '').trim().length < 200);
+    if (sibLabel) return sibLabel.textContent.trim();
+    const sibOther = sibs.find(s => /^(H1|H2|H3|H4|H5|H6|P|SPAN|DIV)$/i.test(s.tagName) &&
+                                    (s.textContent || '').trim() &&
+                                    (s.textContent || '').trim().length < 200);
+    if (sibOther) return sibOther.textContent.trim();
 
-    /* 8) Parent's first text node (e.g. <div>Label <input/></div>) */
+    /* 8) Within the parent, prefer a real <label> child that precedes the
+       input; otherwise fall back to the first meaningful text node or
+       label-ish element. Avoids returning a "Hint:" span when a real
+       <label> is also present. */
     const parent = el.parentElement;
     if (parent) {
+      /* Pass A: a <label> element appearing before the input */
+      for (const child of parent.childNodes) {
+        if (child === el) break;
+        if (child.nodeType === 1 && /^(LABEL|LEGEND)$/i.test(child.tagName)) {
+          const t = child.textContent.trim();
+          if (t && t.length < 200) return t;
+        }
+      }
+      /* Pass B: first text node or other label-ish element */
       for (const child of parent.childNodes) {
         if (child === el) break;
         if (child.nodeType === 3) {
           const t = child.nodeValue.trim();
           if (t && t.length < 200) return t;
         } else if (child.nodeType === 1 &&
-                   /^(LABEL|SPAN|STRONG|B|H1|H2|H3|H4|H5|H6|P)$/i.test(child.tagName)) {
+                   /^(SPAN|STRONG|B|H1|H2|H3|H4|H5|H6|P)$/i.test(child.tagName)) {
           const t = child.textContent.trim();
           if (t && t.length < 200) return t;
         }
@@ -1278,8 +1336,13 @@
    * where the only action is a Submit button. Detect this state and
    * click Submit without re-filling anything.
    * ────────────────────────────────────────────────────────────────── */
-  const REVIEW_PAGE_RE = /review\s+your\s+application|review\s+and\s+submit|confirm\s+and\s+submit|please\s+review|final\s+review|application\s+summary/i;
-  const SUBMIT_BTN_RE = /^(submit|submit application|send application|apply|finish|confirm|complete application|submit my application)$/i;
+  const REVIEW_PAGE_RE = /review\s+your\s+application|review\s+and\s+submit|confirm\s+and\s+submit|please\s+review|final\s+review|application\s+summary|review\s+your\s+answers|please\s+confirm/i;
+  /* Submit-button text patterns. Anchored with ^…$ so we match the
+     button's own text exactly, not a substring (avoids matching
+     "Submit a question" or "Apply filter"). Expanded to cover
+     "Submit Now", "Send Your Application", "Apply", "I'm done",
+     "Done", "Save and Submit", "Continue & Submit", etc. */
+  const SUBMIT_BTN_RE = /^(submit|submit(\s+(application|now|my\s+application|form|résumé|resume))?|send(\s+(application|your\s+application))?|apply(\s+now)?|finish(\s+application)?|confirm(\s+(and\s+)?submit)?|complete(\s+application)?|done|i['’]m\s+done|save\s+(and|&)\s+submit|continue\s+(and|&)\s+submit)$/i;
 
   function isReviewPage() {
     const bodyText = (document.body?.innerText || '').slice(0, 8000);
@@ -1425,8 +1488,14 @@
     if (/last.?name/.test(l))                             return p.last_name     || '';
     if (/full.?name|your.?name/.test(l))                  return fullName;
     if (/preferred.?name|display.?name|nickname/.test(l)) return fullName;
-    if (/\bemail\b/.test(l))                              return p.email         || '';
-    if (/phone|mobile|cell/.test(l))                      return p.phone         || '';
+    /* Email: handle "Email", "Email Address", "E-mail", "E mail", "EMail".
+       Note: label is pre-processed so non-alphanumerics become spaces, so
+       "E-mail" becomes "e mail" — \se?mail covers both forms. */
+    if (/\be\s?mail\b/.test(l))                           return p.email         || '';
+    /* Phone: handle "Phone", "Mobile", "Cell", "Tel", "Telephone",
+       "Cell Phone", "Mobile Number", "Contact Number", "Contact No", etc. */
+    if (/phone|mobile|cell|\btel\b|telephone|contact.*(?:number|\bno\b|num\b)/.test(l))
+                                                          return p.phone         || '';
     if (/^city$|city\b|current.?location|location.*city/.test(l))
                                                           return p.city          || 'Dublin';
     if (/state|province/.test(l))                         return p.state         || '';
@@ -1854,16 +1923,27 @@
     const contains = opts.find(o => o.text.toLowerCase().includes(t) || t.includes(o.text.toLowerCase()));
     if (contains) return contains;
 
+    /* Normalise money/number shorthand so salary dropdowns match:
+       strips "$" and thousands-commas, and expands k/m suffixes
+       ("50k" → "50000", "1.5m" → "1500000"). Applied to both the
+       target and each option's text before numeric range matching. */
+    const normNum = (s) => String(s)
+      .replace(/\$/g, '')
+      .replace(/,/g, '')
+      .replace(/(\d+(?:\.\d+)?)\s*([km])\b/gi, (_, n, suf) =>
+        String(Math.round(parseFloat(n) * (/[kK]/.test(suf) ? 1e3 : 1e6))));
+
     /* Numeric-range smart-match: when the target is purely numeric (e.g.
        "7" for years of experience or "80000" for salary), find the option
        whose range CONTAINS the number — covers "5-10 years", "5 to 10",
-       "5+ years", "Over 5 years", "Less than 10 years", etc. */
-    const num = parseFloat(t);
+       "5+ years", "Over 5 years", "Less than 10 years", "$50,000-$80,000",
+       "50k-80k", etc. */
+    const num = parseFloat(normNum(t));
     if (!isNaN(num)) {
       let bestOpt = null;
       let bestSpan = Infinity;
       for (const o of opts) {
-        const txt = o.text.toLowerCase();
+        const txt = normNum(o.text.toLowerCase());
         /* "X - Y" / "X to Y" / "X – Y" */
         const range = txt.match(/(\d+(?:\.\d+)?)\s*(?:-|to|–|—)\s*(\d+(?:\.\d+)?)/);
         if (range) {
@@ -2474,54 +2554,84 @@
   })();
 
   /* ── General stuck-job watchdog (content script) ────────────────────────────
-   * If the automation is running but the same URL has been "active" for more
-   * than 25 seconds, something is stuck — send skipCurrent.
-   * Guards against any future stall source, not just missing-details iframe.
+   * Progress-tracking safety net. It tracks a "last progress" timestamp
+   * that resets whenever ANY sign of activity is seen, and only fires
+   * skipCurrent when nothing has progressed for STUCK_TIMEOUT_MS.
+   *
+   * Critically, on third-party ATSes OptimHire's OWN autofill does the
+   * work (our _fillActive flag stays false), and its "Hang tight!
+   * We're loading your details…" / "Submitting…" phase can take 30-60s.
+   * The old 7s timer skipped mid-load, which both abandoned good jobs
+   * AND thrashed the applied counter (skip → re-add → skip). We now
+   * treat OptimHire's working indicators and any form-field changes as
+   * progress, so we never skip while it's actively applying.
    * ─────────────────────────────────────────────────────────────────────── */
   (function installStuckWatchdog() {
-    let _watchdogUrl = '';
-    let _watchdogTimer = null;
-    /* 7s — user preference for high-throughput 2000+ queues. _fillActive
-       and _submitAttempted guards still suppress the skip during real
-       form filling / submit attempts, so we only skip when the page is
-       truly idle on the same URL for 7s straight. */
-    const STUCK_TIMEOUT_MS = 7_000;
+    /* 60s of genuine inactivity = stuck. This is a safety net, NOT the
+       throughput driver — OptimHire's full per-job flow (load details →
+       fill → generate cover letter → upload CV → submit) legitimately
+       takes 30-60s on slower ATSes. Skipping earlier abandons real
+       applications. */
+    const STUCK_TIMEOUT_MS = 60_000;
+    const POLL_MS = 2_000;
+
+    let _lastUrl = '';
+    let _lastProgressTs = Date.now();
+    let _lastFormSignature = '';
+
+    /* Cheap signature of current form field values — if it changes
+       between polls, something is being filled (progress). */
+    function formSignature() {
+      try {
+        let sig = '';
+        const els = $$(
+          'input:not([type=hidden]):not([type=submit]):not([type=button]),textarea,select'
+        );
+        for (let i = 0; i < els.length && i < 60; i++) {
+          const v = els[i].value || '';
+          sig += v.length + ':' + (els[i].checked ? '1' : '0') + '|';
+        }
+        return sig;
+      } catch (_) { return ''; }
+    }
 
     async function checkStuck() {
-      const { csvActiveJobId, isAutoProcessStartJob } = await ST.get([
-        'csvActiveJobId', 'isAutoProcessStartJob',
-      ]);
-      if (!csvActiveJobId && !isAutoProcessStartJob) {
-        _watchdogUrl = '';
-        return;
-      }
+      let active = false;
+      try {
+        const { csvActiveJobId, isAutoProcessStartJob } = await ST.get([
+          'csvActiveJobId', 'isAutoProcessStartJob',
+        ]);
+        active = !!csvActiveJobId || !!isAutoProcessStartJob;
+      } catch (_) { return; }
+
+      if (!active) { _lastProgressTs = Date.now(); return; }
+
       const cur = normalizeUrl(location.href);
-      if (cur !== _watchdogUrl) {
-        _watchdogUrl = cur;
-        clearTimeout(_watchdogTimer);
-        _watchdogTimer = setTimeout(() => {
-          // Do NOT skip if fill is actively running or a submit was just attempted
-          if (_fillActive) {
-            LOG('Stuck watchdog: skipping because _fillActive is true');
-            _watchdogUrl = ''; // reset so next poll re-arms the timer
-            return;
-          }
-          if (_submitAttempted && Date.now() - _submitAttemptTs < 30_000) {
-            LOG('Stuck watchdog: skipping because submit was recently attempted');
-            _watchdogUrl = '';
-            return;
-          }
-          LOG(`Stuck watchdog: still on ${cur} after ${STUCK_TIMEOUT_MS/1000}s — force-skipping`);
-          chrome.runtime.sendMessage({ action: 'skipCurrent' }).catch(() => {});
-          _watchdogUrl = '';
-        }, STUCK_TIMEOUT_MS);
+      const now = Date.now();
+
+      /* Any of these counts as progress → reset the inactivity clock */
+      let progressed = false;
+      if (cur !== _lastUrl) { _lastUrl = cur; progressed = true; }       // navigation
+      if (_fillActive) progressed = true;                                 // our autofill
+      if (_submitAttempted && now - _submitAttemptTs < 30_000) progressed = true;
+      if (optimHireBusy()) progressed = true;                             // OH overlay/spinner
+      const sig = formSignature();
+      if (sig !== _lastFormSignature) { _lastFormSignature = sig; progressed = true; }
+
+      if (progressed) { _lastProgressTs = now; return; }
+
+      /* No progress signal at all — has it been long enough? */
+      if (now - _lastProgressTs >= STUCK_TIMEOUT_MS) {
+        LOG(`Stuck watchdog: no progress for ${STUCK_TIMEOUT_MS/1000}s on ${cur} — force-skipping`);
+        chrome.runtime.sendMessage({ action: 'skipCurrent' }).catch(() => {});
+        _lastProgressTs = now; // cooldown so we don't spam skips
       }
     }
 
-    // Poll every 15 seconds for URL / active status changes
-    setInterval(checkStuck, 3_000); // poll every 3s so 7s stalls are caught promptly
+    setInterval(checkStuck, POLL_MS);
     checkStuck();
   })();
+
 
   /* ── T39 / T40: Zero-manual-effort auto-clickers ─────────────────────────
    * The 2.6.0 release added two interstitial screens that block the queue
@@ -2977,13 +3087,17 @@
        knockout question with no profile data, etc.) we don't need to
        wait the full window — fire the skip MISSING_SKIP_MS after fill
        completes if required-fields-satisfied is still false. */
-    const MISSING_SKIP_MS = 6_000;
+    const MISSING_SKIP_MS = 12_000;
     let _missingSkipFiredForUrl = '';
     async function tickMissingSkip() {
       if (!await automationActive()) return;
       if (_fillActive) return;
       if (!_everFilledOnThisUrl) return;
       if (submitSuppressed()) return;
+      /* Never skip while OptimHire is mid-flow (generating cover
+         letter, uploading CV, submitting) — a required field may be
+         populated a moment later. */
+      if (optimHireBusy()) return;
       if (_missingSkipFiredForUrl === location.href) return;
       /* Only if fill has been stable for long enough AND required
          fields are still not satisfied AND there ARE required fields

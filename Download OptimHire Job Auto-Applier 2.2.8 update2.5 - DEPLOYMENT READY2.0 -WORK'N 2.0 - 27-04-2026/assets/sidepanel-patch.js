@@ -1076,6 +1076,128 @@
     if (area === 'local' && changes.csvJobQueue) syncCounter();
   });
 
+  /* ════════════════════════════════════════════════════════════
+     THROUGHPUT + ETA + STALL AUTO-RECOVERY
+     ════════════════════════════════════════════════════════════
+     For unattended 2000-job runs: show live apply rate (jobs/hr)
+     and ETA for the remaining queue, and if progress silently
+     stalls (applied count flat for STALL_MS while running) nudge
+     the queue with a skipCurrent so an overnight run can't get
+     stuck on one bad job and waste hours.
+     ────────────────────────────────────────────────────────── */
+  (function installThroughputMonitor() {
+    var STALL_MS       = 120000; // 2 min of no progress while running = stalled
+    var NUDGE_COOLDOWN = 30000;  // wait 30s between recovery nudges
+    var RATE_WINDOW_MS = 600000; // compute rate over the last 10 min
+    var TICK_MS        = 5000;
+
+    var _samples = [];        // [{t, done}]
+    var _lastDone = -1;
+    var _lastProgressTs = Date.now();
+    var _lastNudgeTs = 0;
+    var _statsEl = null;
+
+    /* Build / locate the stats line just under the counter. Created
+       once; lives inside our own #oh-aap panel so it never touches
+       the React tree. */
+    function ensureStatsEl() {
+      if (_statsEl && document.body.contains(_statsEl)) return _statsEl;
+      var counterEl = document.getElementById('aapCounter');
+      var host = counterEl && counterEl.parentElement;
+      if (!host) return null;
+      _statsEl = document.createElement('div');
+      _statsEl.id = 'oh-throughput';
+      _statsEl.style.cssText =
+        'font-size:11px;color:#94a3b8;margin-top:2px;width:100%;' +
+        'font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,sans-serif;';
+      /* insert after the header-left group so it sits below the counter */
+      var headerLeft = counterEl.closest('.aap-header-left') || host;
+      if (headerLeft.parentElement) {
+        headerLeft.parentElement.insertBefore(_statsEl, headerLeft.nextSibling);
+      } else {
+        host.appendChild(_statsEl);
+      }
+      return _statsEl;
+    }
+
+    function fmtDuration(ms) {
+      if (!isFinite(ms) || ms <= 0) return '—';
+      var mins = Math.round(ms / 60000);
+      if (mins < 60) return mins + 'm';
+      var h = Math.floor(mins / 60), m = mins % 60;
+      if (h < 24) return h + 'h ' + m + 'm';
+      var d = Math.floor(h / 24); h = h % 24;
+      return d + 'd ' + h + 'h';
+    }
+
+    function computeRatePerHour() {
+      var now = Date.now();
+      /* drop samples outside the window */
+      while (_samples.length > 2 && now - _samples[0].t > RATE_WINDOW_MS) {
+        _samples.shift();
+      }
+      if (_samples.length < 2) return 0;
+      var first = _samples[0], last = _samples[_samples.length - 1];
+      var dDone = last.done - first.done;
+      var dMs = last.t - first.t;
+      if (dDone <= 0 || dMs <= 0) return 0;
+      return (dDone / dMs) * 3600000; // per hour
+    }
+
+    function tick() {
+      try {
+        if (!_isRunning) return;            // only while a run is active
+        var done = _totalApplied;
+        var total = _totalJobs;
+        var now = Date.now();
+
+        /* Record a sample when progress changes */
+        if (done !== _lastDone) {
+          _samples.push({ t: now, done: done });
+          if (_samples.length > 40) _samples.shift();
+          if (done > _lastDone) _lastProgressTs = now;
+          _lastDone = done;
+        }
+
+        /* Render stats line */
+        var el = ensureStatsEl();
+        if (el) {
+          var rate = computeRatePerHour();
+          var remaining = Math.max(0, total - done);
+          var etaMs = rate > 0 ? (remaining / rate) * 3600000 : Infinity;
+          var stalledFor = now - _lastProgressTs;
+          if (stalledFor >= STALL_MS && remaining > 0) {
+            el.innerHTML = '<span style="color:#f59e0b">⚠ Stalled ' +
+              fmtDuration(stalledFor) + ' — recovering…</span>';
+          } else if (rate > 0) {
+            el.textContent = Math.round(rate) + '/hr · ' +
+              remaining + ' left · ETA ' + fmtDuration(etaMs);
+          } else {
+            el.textContent = remaining + ' left';
+          }
+        }
+
+        /* Stall auto-recovery: applied count flat for STALL_MS while
+           a run is active and there are jobs left → nudge the queue.
+           Honour the submit-suppression window so we never interrupt
+           a real submit, and cool down between nudges. */
+        var remaining2 = Math.max(0, total - done);
+        if (remaining2 > 0 &&
+            (now - _lastProgressTs) >= STALL_MS &&
+            (now - _lastNudgeTs) >= NUDGE_COOLDOWN &&
+            !isSubmitSuppressed()) {
+          _lastNudgeTs = now;
+          addLog('Throughput monitor: no progress for ' +
+                 fmtDuration(now - _lastProgressTs) + ' — nudging queue', '');
+          try { chrome.runtime.sendMessage({ action: 'skipCurrent' }).catch(function(){}); }
+          catch (_) {}
+        }
+      } catch (_) {}
+    }
+
+    setInterval(tick, TICK_MS);
+  })();
+
   /* ── MutationObserver fallback to kill referral cards React renders ── */
   if (document.body) {
     new MutationObserver(function () {
