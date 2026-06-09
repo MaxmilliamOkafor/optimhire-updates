@@ -119,6 +119,29 @@
 (function () {
   'use strict';
 
+  /* ── Iframe gate ──────────────────────────────────────────
+   * Manifest now sets all_frames:true so we run inside ATS-form
+   * iframes (Greenhouse / Lever / Workable / Recruitee / etc.
+   * commonly embed their application forms via iframe in company
+   * career sites). But running in EVERY iframe (analytics, ads,
+   * social embeds, chat widgets) is wasteful. So: in any subframe
+   * whose hostname isn't a known ATS or doesn't look like a job
+   * application page, bail out immediately. The top frame always
+   * runs (it might navigate to an ATS later).
+   * ──────────────────────────────────────────────────────── */
+  try {
+    const inIframe = window.top !== window.self;
+    if (inIframe) {
+      const h = (location.hostname || '').toLowerCase();
+      const ATS_HOST_RE = /(greenhouse|lever\.co|breezy|workday|icims|taleo|oraclecloud|smartrecruiters|ashbyhq|bamboohr|jobvite|workable|paylocity|jazzhr|resumatorapi|teamtailor|ziprecruiter|manatal|bullhorn|hiring\.cafe|gohire|forhyre|careers-page|gh-widget|successfactors|sapsf|ukg|ultipro|avature|recruitee|pinpoint|rippling|ats\.|jobs\.|careers\.|apply\.)/i;
+      const looksLikeJobApp = /\/(apply|application|job|career|position|opening)/i.test(location.pathname);
+      if (!ATS_HOST_RE.test(h) && !looksLikeJobApp) {
+        /* Quietly no-op in non-ATS iframes (analytics, ads, etc.) */
+        return;
+      }
+    }
+  } catch (_) {}
+
   /* ── Helpers ───────────────────────────────────────────── */
   const LOG = (...a) => console.log('[OH-Patch]', ...a);
   const ST  = chrome.storage.local;
@@ -1313,8 +1336,13 @@
    * where the only action is a Submit button. Detect this state and
    * click Submit without re-filling anything.
    * ────────────────────────────────────────────────────────────────── */
-  const REVIEW_PAGE_RE = /review\s+your\s+application|review\s+and\s+submit|confirm\s+and\s+submit|please\s+review|final\s+review|application\s+summary/i;
-  const SUBMIT_BTN_RE = /^(submit|submit application|send application|apply|finish|confirm|complete application|submit my application)$/i;
+  const REVIEW_PAGE_RE = /review\s+your\s+application|review\s+and\s+submit|confirm\s+and\s+submit|please\s+review|final\s+review|application\s+summary|review\s+your\s+answers|please\s+confirm/i;
+  /* Submit-button text patterns. Anchored with ^…$ so we match the
+     button's own text exactly, not a substring (avoids matching
+     "Submit a question" or "Apply filter"). Expanded to cover
+     "Submit Now", "Send Your Application", "Apply", "I'm done",
+     "Done", "Save and Submit", "Continue & Submit", etc. */
+  const SUBMIT_BTN_RE = /^(submit|submit(\s+(application|now|my\s+application|form|résumé|resume))?|send(\s+(application|your\s+application))?|apply(\s+now)?|finish(\s+application)?|confirm(\s+(and\s+)?submit)?|complete(\s+application)?|done|i['’]m\s+done|save\s+(and|&)\s+submit|continue\s+(and|&)\s+submit)$/i;
 
   function isReviewPage() {
     const bodyText = (document.body?.innerText || '').slice(0, 8000);
