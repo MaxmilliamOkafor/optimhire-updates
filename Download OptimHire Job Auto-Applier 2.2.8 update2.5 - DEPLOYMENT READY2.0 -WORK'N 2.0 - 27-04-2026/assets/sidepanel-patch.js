@@ -44,10 +44,9 @@
     'isUnlimited','is_unlimited','is_copilot_active',
     'is_first_attempt_completed','isUpgraded'
   ];
-  var SP_COUNTER_ZERO = [
-    'appliedCount','applied_count','dailyApplied','daily_applied',
-    'appliedToday','today_applied','isManualAppliedCount'
-  ];
+  /* Do NOT zero applied-count fields — they drive the "X of N
+     applied" progress display. Empty list keeps references valid. */
+  var SP_COUNTER_ZERO = [];
 
   function spDeepPatch(obj, seen) {
     if (!obj || typeof obj !== 'object') return obj;
