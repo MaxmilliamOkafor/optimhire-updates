@@ -290,10 +290,15 @@
       return _automationCache.active;
     }
     try {
-      const { csvActiveJobId, isAutoProcessStartJob, autoApplyStateUpdate } =
-        await ST.get(['csvActiveJobId', 'isAutoProcessStartJob', 'autoApplyStateUpdate']);
+      const { csvActiveJobId, isAutoProcessStartJob, autoApplyStateUpdate, ohJobQueueActive } =
+        await ST.get(['csvActiveJobId', 'isAutoProcessStartJob', 'autoApplyStateUpdate', 'ohJobQueueActive']);
       const isRunning = !!(autoApplyStateUpdate && autoApplyStateUpdate.isRunning);
+      /* ohJobQueueActive is OUR CSV queue runner — treat it just like
+         OptimHire's own automation flags so all existing autofill
+         triggers (autoFillPage, T39/T40, watchdog, etc.) fire on
+         queue-driven job pages. */
       const active = !!csvActiveJobId || !!isAutoProcessStartJob || isRunning ||
+                     !!ohJobQueueActive ||
                      (Date.now() - _manualTriggerTs < 30_000);
       _automationCache = { active, ts: Date.now() };
       return active;
@@ -5420,6 +5425,168 @@
       }
     }, 4000);
 
+  })();
+
+  /* ════════════════════════════════════════════════════════════
+     CSV JOB QUEUE RUNNER — content-script side
+     ════════════════════════════════════════════════════════════
+     When the user starts the CSV queue (via Queue Manager), each
+     pending job is opened in a tab. This runner notices that the
+     current page IS the active queue job, lets the existing autofill
+     pipeline do its thing (it already fires because we made
+     isAutomationActive include ohJobQueueActive), then watches for
+     completion and advances to the next pending job.
+
+     Completion signals (any of):
+       - URL navigated to a thank-you / confirmation / success URL
+       - Body text contains a success phrase
+       - markSubmitAttempted was called AND no validation error
+         appeared within 8s after
+       - The whole job's hard time budget (JOB_TIMEOUT_MS) elapses
+         → mark failed and move on so the queue can't hang
+     ────────────────────────────────────────────────────────── */
+  (function installQueueRunner() {
+    const POLL_MS         = 2_000;
+    const JOB_TIMEOUT_MS  = 180_000;  // 3 min hard cap per job
+    const SUBMIT_GRACE_MS = 8_000;    // wait this long after submit before declaring success
+    const SUCCESS_TEXT_RE = /application\s+(was\s+)?(submitted|received|complete)|thank\s+you\s+for\s+(applying|your\s+application|your\s+interest)|we['’]ve\s+received\s+your\s+application|we\s+have\s+received\s+your\s+application|your\s+application\s+has\s+been\s+(received|submitted)|application\s+successful/i;
+    const SUCCESS_URL_RE  = /(thank|success|confirm|complete|received|submitted|done)/i;
+    const FAILURE_TEXT_RE = /(already\s+applied|application\s+already\s+submitted|you\s+have\s+already\s+applied|no\s+application\s+(form|available)|job\s+is\s+no\s+longer\s+available|this\s+position\s+is\s+closed|posting\s+is\s+closed|application\s+window\s+has\s+closed|page\s+not\s+found|404)/i;
+
+    let _currentJob = null;
+    let _advancing = false;
+    let _jobStartTs = 0;
+    let _submitSeenAt = 0;
+
+    function urlsRoughlyMatch(a, b) {
+      try {
+        const ua = new URL(a), ub = new URL(b);
+        if (ua.hostname.toLowerCase() !== ub.hostname.toLowerCase()) return false;
+        /* Match on hostname + first path segment so post-submit
+           redirects (/jobs/123/apply → /jobs/123/thanks) still match. */
+        const pa = ua.pathname.split('/').filter(Boolean);
+        const pb = ub.pathname.split('/').filter(Boolean);
+        if (!pa.length || !pb.length) return true;
+        return pa[0] === pb[0];
+      } catch (_) { return false; }
+    }
+
+    function pageHasSuccess() {
+      try {
+        if (SUCCESS_URL_RE.test(location.pathname.toLowerCase())) return true;
+        const t = (document.body && document.body.innerText || '').slice(0, 4000);
+        return SUCCESS_TEXT_RE.test(t);
+      } catch (_) { return false; }
+    }
+    function pageHasFailure() {
+      try {
+        const t = (document.body && document.body.innerText || '').slice(0, 4000);
+        return FAILURE_TEXT_RE.test(t);
+      } catch (_) { return false; }
+    }
+    function pageHasValidationError() {
+      try {
+        return !!document.querySelector(
+          '[aria-invalid="true"],.error,.is-invalid,[class*="field-error"],' +
+          '[class*="fieldError"],[role="alert"]'
+        );
+      } catch (_) { return false; }
+    }
+
+    async function loadCurrentJob() {
+      try {
+        const d = await ST.get(['ohJobQueueActive', 'ohJobQueueCurrentId', 'ohJobQueue']);
+        if (!d.ohJobQueueActive || !d.ohJobQueueCurrentId) return null;
+        const q = Array.isArray(d.ohJobQueue) ? d.ohJobQueue : [];
+        return q.find(j => j.id === d.ohJobQueueCurrentId) || null;
+      } catch (_) { return null; }
+    }
+
+    async function advance(job, status, error) {
+      if (_advancing) return; _advancing = true;
+      try {
+        const d = await ST.get(['ohJobQueue']);
+        let q = Array.isArray(d.ohJobQueue) ? d.ohJobQueue : [];
+        const i = q.findIndex(x => x.id === job.id);
+        if (i >= 0) {
+          q[i].status = status;
+          q[i].appliedAt = status === 'applied' ? Date.now() : (q[i].appliedAt || 0);
+          q[i].lastError = error || '';
+          q[i].lastActionTs = Date.now();
+        }
+        const next = q.find(j => j.status === 'pending');
+        if (next) {
+          next.status = 'running';
+          next.attempts = (next.attempts || 0) + 1;
+          next.lastActionTs = Date.now();
+          await new Promise(res => ST.set({
+            ohJobQueue: q,
+            ohJobQueueCurrentId: next.id,
+            ohJobQueueStartTs: Date.now(),
+          }, res));
+          LOG(`[Queue Runner] ${job.title || job.url}: ${status} — advancing to next`);
+          /* Navigate the current tab to the next job. */
+          try { location.href = next.url; } catch (_) {}
+        } else {
+          await new Promise(res => ST.set({
+            ohJobQueue: q,
+            ohJobQueueActive: false,
+            ohJobQueueCurrentId: null,
+          }, res));
+          LOG(`[Queue Runner] queue complete — last job: ${status}`);
+          try {
+            /* Open the manager so the user sees the final state. */
+            const mgr = chrome.runtime.getURL('tabs/jobQueue.html');
+            if (!location.href.startsWith(mgr)) location.href = mgr;
+          } catch (_) {}
+        }
+      } catch (e) {
+        LOG('[Queue Runner] advance failed:', e);
+      } finally {
+        _advancing = false;
+      }
+    }
+
+    async function tick() {
+      try {
+        /* Iframe gate already bailed for non-ATS frames; only run this
+           loop in the top frame. */
+        if (window.top !== window.self) return;
+        const job = await loadCurrentJob();
+        if (!job) { _currentJob = null; _jobStartTs = 0; _submitSeenAt = 0; return; }
+        if (!urlsRoughlyMatch(location.href, job.url)) return; // wrong tab/page
+
+        if (_currentJob !== job.id) {
+          _currentJob = job.id;
+          _jobStartTs = Date.now();
+          _submitSeenAt = 0;
+          LOG(`[Queue Runner] on job: ${job.title || job.url}`);
+        }
+
+        const now = Date.now();
+
+        /* Failure signals first */
+        if (pageHasFailure()) {
+          return advance(job, 'skipped', 'already-applied / posting closed');
+        }
+
+        /* Submit fired by our flow → start grace timer */
+        if (_submitAttempted && !_submitSeenAt) _submitSeenAt = _submitAttemptTs || now;
+
+        /* Success */
+        if (pageHasSuccess() || (_submitSeenAt && now - _submitSeenAt > SUBMIT_GRACE_MS && !pageHasValidationError())) {
+          return advance(job, 'applied', '');
+        }
+
+        /* Hard timeout */
+        if (now - _jobStartTs > JOB_TIMEOUT_MS) {
+          return advance(job, 'failed', 'timeout');
+        }
+      } catch (_) {}
+    }
+
+    setInterval(tick, POLL_MS);
+    setTimeout(tick, 1500); // first kick after page settles
   })();
 
   LOG(`v5.0 loaded | ${CURRENT_ATS || HOST}`);
