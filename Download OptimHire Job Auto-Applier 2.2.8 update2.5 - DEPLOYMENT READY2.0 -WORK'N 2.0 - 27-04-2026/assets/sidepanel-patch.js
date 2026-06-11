@@ -1198,6 +1198,91 @@
     setInterval(tick, TICK_MS);
   })();
 
+  /* ════════════════════════════════════════════════════════════
+     CSV JOB QUEUE — sidepanel card
+     ════════════════════════════════════════════════════════════
+     Lives in the otherwise-empty sidepanel space and surfaces the
+     queue's live status. Opens the full Queue Manager in a new tab.
+     ────────────────────────────────────────────────────────── */
+  (function installJobQueueCard() {
+    var KEY_QUEUE = 'ohJobQueue';
+    var KEY_ACTIVE = 'ohJobQueueActive';
+
+    function ensureCard() {
+      var card = document.getElementById('oh-queue-card');
+      if (card && document.body.contains(card)) return card;
+      card = document.createElement('div');
+      card.id = 'oh-queue-card';
+      card.style.cssText =
+        'margin:10px;padding:14px;border:1px solid #2d2f3a;border-radius:10px;' +
+        'background:linear-gradient(135deg,#1a1040,#0f1117);' +
+        'font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,sans-serif;' +
+        'color:#e2e8f0;font-size:13px;';
+      card.innerHTML =
+        '<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px">' +
+          '<div style="font-weight:600;color:#c4b5fd;font-size:13.5px">My Job Queue</div>' +
+          '<span id="oh-qc-indicator" style="display:none;font-size:10.5px;color:#38bdf8;' +
+            'background:rgba(56,189,248,.15);padding:2px 8px;border-radius:10px;font-weight:600">RUNNING</span>' +
+        '</div>' +
+        '<div id="oh-qc-stats" style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px">' +
+          '<span style="background:#2d2f3a;padding:3px 8px;border-radius:6px;color:#94a3b8" id="oh-qc-pending">0 pending</span>' +
+          '<span style="background:rgba(74,222,128,.15);padding:3px 8px;border-radius:6px;color:#4ade80" id="oh-qc-applied">0 applied</span>' +
+          '<span style="background:rgba(239,68,68,.15);padding:3px 8px;border-radius:6px;color:#f87171" id="oh-qc-failed">0 failed</span>' +
+        '</div>' +
+        '<div style="display:flex;gap:6px;flex-wrap:wrap">' +
+          '<button id="oh-qc-open" style="flex:1;background:linear-gradient(135deg,#6366f1,#8b5cf6);' +
+            'color:#fff;border:none;padding:8px 12px;border-radius:8px;font-size:12px;font-weight:600;cursor:pointer">' +
+            'Open Queue Manager</button>' +
+        '</div>';
+      /* Insert into the existing #oh-aap panel if present, else into the
+         empty sidepanel body. Pick the host based on what's available. */
+      var host = document.getElementById('__plasmo') || document.body;
+      if (host && host !== document.body) {
+        host.parentElement.insertBefore(card, host.nextSibling);
+      } else {
+        document.body.appendChild(card);
+      }
+      document.getElementById('oh-qc-open').addEventListener('click', function () {
+        try { chrome.tabs.create({ url: chrome.runtime.getURL('tabs/jobQueue.html'), active: true }); }
+        catch (_) {}
+      });
+      return card;
+    }
+
+    function refresh() {
+      try {
+        ensureCard();
+        chrome.storage.local.get([KEY_QUEUE, KEY_ACTIVE], function (d) {
+          var q = Array.isArray(d[KEY_QUEUE]) ? d[KEY_QUEUE] : [];
+          var c = { pending: 0, applied: 0, failed: 0 };
+          for (var i = 0; i < q.length; i++) {
+            var s = q[i].status; if (c[s] != null) c[s]++;
+          }
+          var p = document.getElementById('oh-qc-pending');
+          var a = document.getElementById('oh-qc-applied');
+          var f = document.getElementById('oh-qc-failed');
+          if (p) p.textContent = c.pending + ' pending';
+          if (a) a.textContent = c.applied + ' applied';
+          if (f) f.textContent = c.failed + ' failed';
+          var ind = document.getElementById('oh-qc-indicator');
+          if (ind) ind.style.display = d[KEY_ACTIVE] ? '' : 'none';
+        });
+      } catch (_) {}
+    }
+
+    function startup() {
+      refresh();
+      setInterval(refresh, 5000);
+      try {
+        chrome.storage.onChanged.addListener(function (changes, area) {
+          if (area === 'local' && (changes[KEY_QUEUE] || changes[KEY_ACTIVE])) refresh();
+        });
+      } catch (_) {}
+    }
+    if (document.body) startup();
+    else document.addEventListener('DOMContentLoaded', startup);
+  })();
+
   /* ── MutationObserver fallback to kill referral cards React renders ── */
   if (document.body) {
     new MutationObserver(function () {

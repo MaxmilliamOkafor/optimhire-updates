@@ -1,0 +1,223 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Job Queue Manager — OptimHire</title>
+<style>
+  :root {
+    --bg: #0f1117;
+    --bg2: #161922;
+    --bg3: #1e2230;
+    --border: #2d2f3a;
+    --text: #e2e8f0;
+    --muted: #94a3b8;
+    --accent: #8b5cf6;
+    --accent2: #6366f1;
+    --success: #4ade80;
+    --warning: #fbbf24;
+    --danger: #ef4444;
+    --running: #38bdf8;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    background: var(--bg); color: var(--text); padding: 20px; min-height: 100vh;
+  }
+  header { display: flex; flex-direction: column; gap: 12px; margin-bottom: 18px; }
+  .title-row { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 10px; }
+  h1 { font-size: 22px; font-weight: 600; color: #c4b5fd; }
+  h1 small { font-size: 13px; color: var(--muted); font-weight: 400; margin-left: 8px; }
+  .stats { display: flex; gap: 12px; flex-wrap: wrap; }
+  .stat { background: var(--bg2); border: 1px solid var(--border); padding: 8px 14px; border-radius: 8px; font-size: 13px; }
+  .stat b { color: #fff; font-size: 16px; margin-right: 4px; }
+  .stat.s-pending b { color: var(--muted); }
+  .stat.s-running b { color: var(--running); }
+  .stat.s-applied b { color: var(--success); }
+  .stat.s-failed b { color: var(--danger); }
+  .stat.s-skipped b { color: var(--warning); }
+  .actions { display: flex; gap: 8px; flex-wrap: wrap; }
+  .filter-bar { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; padding: 10px 0; border-bottom: 1px solid var(--border); }
+  button, .btn {
+    background: var(--bg3); color: var(--text); border: 1px solid var(--border);
+    padding: 8px 14px; border-radius: 8px; font-size: 13px; cursor: pointer;
+    transition: background 0.15s, border-color 0.15s; font-family: inherit;
+  }
+  button:hover, .btn:hover { background: #252a38; border-color: #3a3f4f; }
+  button:active { transform: translateY(1px); }
+  button:disabled { opacity: 0.5; cursor: not-allowed; }
+  .btn-primary { background: linear-gradient(135deg, var(--accent2), var(--accent)); border-color: transparent; color: #fff; }
+  .btn-primary:hover { box-shadow: 0 4px 14px rgba(139, 92, 246, 0.35); }
+  .btn-danger { background: rgba(239, 68, 68, 0.15); color: #f87171; border-color: rgba(239, 68, 68, 0.3); }
+  .btn-danger:hover { background: rgba(239, 68, 68, 0.25); }
+  .btn-success { background: rgba(74, 222, 128, 0.15); color: var(--success); border-color: rgba(74, 222, 128, 0.3); }
+  .btn-small { padding: 4px 8px; font-size: 11px; }
+  input[type="text"], input[type="url"], select, textarea {
+    background: var(--bg2); color: var(--text); border: 1px solid var(--border);
+    padding: 7px 10px; border-radius: 6px; font-size: 13px; font-family: inherit;
+  }
+  input[type="text"]:focus, input[type="url"]:focus, select:focus, textarea:focus {
+    outline: none; border-color: var(--accent); box-shadow: 0 0 0 2px rgba(139, 92, 246, 0.2);
+  }
+  .filter-bar input[type="text"] { flex: 1; min-width: 200px; }
+  table { width: 100%; border-collapse: collapse; margin-top: 14px; }
+  th { text-align: left; padding: 10px 8px; font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px;
+       color: var(--muted); border-bottom: 1px solid var(--border); position: sticky; top: 0; background: var(--bg); }
+  td { padding: 10px 8px; border-bottom: 1px solid var(--bg3); font-size: 13px; vertical-align: middle; }
+  tr:hover td { background: var(--bg2); }
+  tr.running-row td { background: rgba(56, 189, 248, 0.08); }
+  tr.applied-row td { background: rgba(74, 222, 128, 0.04); opacity: 0.7; }
+  tr.failed-row td { background: rgba(239, 68, 68, 0.05); }
+  td.url-col a { color: var(--accent); text-decoration: none; word-break: break-all; }
+  td.url-col a:hover { text-decoration: underline; }
+  .badge {
+    display: inline-block; padding: 3px 8px; border-radius: 10px; font-size: 11px;
+    font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px;
+  }
+  .badge.b-pending { background: #2d2f3a; color: var(--muted); }
+  .badge.b-running { background: rgba(56, 189, 248, 0.2); color: var(--running); }
+  .badge.b-applied { background: rgba(74, 222, 128, 0.2); color: var(--success); }
+  .badge.b-failed { background: rgba(239, 68, 68, 0.2); color: var(--danger); }
+  .badge.b-skipped { background: rgba(251, 191, 36, 0.2); color: var(--warning); }
+  .ats-tag { background: var(--bg3); color: var(--muted); padding: 2px 6px; border-radius: 4px; font-size: 10px; font-weight: 500; }
+  .row-actions { display: flex; gap: 4px; }
+  .empty {
+    text-align: center; padding: 60px 20px; color: var(--muted); font-size: 14px;
+  }
+  .empty h2 { color: var(--text); margin-bottom: 8px; font-size: 18px; font-weight: 500; }
+  .empty p { line-height: 1.6; margin-bottom: 16px; }
+  .modal-bg {
+    position: fixed; inset: 0; background: rgba(0, 0, 0, 0.7); z-index: 100;
+    display: flex; align-items: center; justify-content: center; padding: 20px;
+  }
+  .modal-bg.hidden { display: none; }
+  .modal {
+    background: var(--bg2); border: 1px solid var(--border); border-radius: 12px;
+    padding: 24px; max-width: 520px; width: 100%; max-height: 90vh; overflow-y: auto;
+  }
+  .modal h2 { font-size: 18px; margin-bottom: 16px; color: #c4b5fd; }
+  .modal label { display: block; margin: 10px 0 4px; font-size: 12px; color: var(--muted); font-weight: 500; }
+  .modal input, .modal textarea, .modal select { width: 100%; }
+  .modal textarea { resize: vertical; min-height: 60px; }
+  .modal-actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 20px; }
+  .toast {
+    position: fixed; bottom: 20px; right: 20px; background: var(--bg3); color: var(--text);
+    padding: 12px 18px; border-radius: 8px; border: 1px solid var(--border);
+    box-shadow: 0 4px 14px rgba(0, 0, 0, 0.3); font-size: 13px; max-width: 340px; z-index: 200;
+    animation: slideIn 0.2s ease;
+  }
+  .toast.t-success { border-left: 3px solid var(--success); }
+  .toast.t-error { border-left: 3px solid var(--danger); }
+  .toast.t-info { border-left: 3px solid var(--accent); }
+  @keyframes slideIn { from { transform: translateX(100%); opacity: 0; } to { transform: none; opacity: 1; } }
+  .help-text { font-size: 11px; color: var(--muted); margin-top: 4px; line-height: 1.5; }
+  .runner-indicator {
+    display: inline-flex; align-items: center; gap: 6px; padding: 4px 10px;
+    background: rgba(56, 189, 248, 0.15); color: var(--running); border-radius: 12px;
+    font-size: 12px; font-weight: 500; margin-left: 8px;
+  }
+  .runner-indicator::before {
+    content: ''; width: 8px; height: 8px; border-radius: 50%; background: var(--running);
+    animation: pulse 1.5s ease-in-out infinite;
+  }
+  @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
+  .runner-indicator.hidden { display: none; }
+  .checkbox-cell { width: 28px; text-align: center; }
+  .checkbox-cell input { cursor: pointer; }
+  .bulk-actions { display: none; gap: 6px; padding: 8px 10px; background: var(--bg3); border-radius: 6px; align-items: center; }
+  .bulk-actions.visible { display: flex; }
+  .bulk-actions span { font-size: 12px; color: var(--muted); margin-right: 8px; }
+</style>
+</head>
+<body>
+  <header>
+    <div class="title-row">
+      <h1>Job Queue Manager
+        <small>Apply to jobs from any ATS using your CSV queue.</small>
+        <span id="runnerIndicator" class="runner-indicator hidden">Running</span>
+      </h1>
+      <div class="actions">
+        <button id="btnAdd">+ Add Job</button>
+        <button id="btnImport">Import CSV</button>
+        <button id="btnExport">Export CSV</button>
+        <button id="btnStart" class="btn-primary">▶ Start Queue</button>
+        <button id="btnStop" class="btn-danger" disabled>■ Stop</button>
+      </div>
+    </div>
+    <div class="stats" id="stats"></div>
+    <div class="filter-bar">
+      <input type="text" id="searchInput" placeholder="Search URL, title, company…">
+      <select id="statusFilter">
+        <option value="all">All status</option>
+        <option value="pending">Pending</option>
+        <option value="running">Running</option>
+        <option value="applied">Applied</option>
+        <option value="failed">Failed</option>
+        <option value="skipped">Skipped</option>
+      </select>
+      <select id="atsFilter">
+        <option value="all">All ATS</option>
+      </select>
+      <button id="btnRetryFailed" class="btn-small">Re-queue all failed</button>
+      <button id="btnClearCompleted" class="btn-small">Clear applied</button>
+      <button id="btnClearAll" class="btn-small btn-danger">Clear all</button>
+    </div>
+    <div id="bulkActions" class="bulk-actions">
+      <span id="bulkCount">0 selected</span>
+      <button id="btnBulkDelete" class="btn-small btn-danger">Delete</button>
+      <button id="btnBulkRequeue" class="btn-small">Mark Pending</button>
+      <button id="btnBulkClear" class="btn-small">Clear selection</button>
+    </div>
+  </header>
+  <main>
+    <table id="jobsTable">
+      <thead>
+        <tr>
+          <th class="checkbox-cell"><input type="checkbox" id="selectAll" title="Select all visible"></th>
+          <th>#</th>
+          <th>Status</th>
+          <th>Job URL</th>
+          <th>Title</th>
+          <th>Company</th>
+          <th>ATS</th>
+          <th>Attempts</th>
+          <th>Last action</th>
+          <th>Actions</th>
+        </tr>
+      </thead>
+      <tbody id="jobsTbody"></tbody>
+    </table>
+    <div id="emptyState" class="empty hidden">
+      <h2>No jobs in your queue yet</h2>
+      <p>Add jobs one by one, or import a CSV with a list of application URLs.<br>
+         Each row needs at least a <b>url</b> column; <b>title</b>, <b>company</b>, <b>notes</b> are optional.</p>
+      <button id="btnEmptyAdd" class="btn-primary">+ Add your first job</button>
+      <button id="btnEmptyImport">Import CSV</button>
+      <button id="btnEmptyTemplate">Download CSV template</button>
+    </div>
+  </main>
+
+  <!-- Add/Edit modal -->
+  <div id="editModal" class="modal-bg hidden">
+    <div class="modal">
+      <h2 id="modalTitle">Add Job</h2>
+      <label>Job application URL *</label>
+      <input type="url" id="fldUrl" placeholder="https://boards.greenhouse.io/example/jobs/12345">
+      <div class="help-text">The direct apply page (not the job listing). Detected ATS will appear after you paste.</div>
+      <label>Job title</label>
+      <input type="text" id="fldTitle" placeholder="Senior Software Engineer">
+      <label>Company</label>
+      <input type="text" id="fldCompany" placeholder="Acme Corp">
+      <label>Notes</label>
+      <textarea id="fldNotes" placeholder="Optional notes for this application"></textarea>
+      <div class="modal-actions">
+        <button id="modalCancel">Cancel</button>
+        <button id="modalSave" class="btn-primary">Save</button>
+      </div>
+    </div>
+  </div>
+
+  <input type="file" id="csvInput" accept=".csv,text/csv" style="display:none">
+  <div id="toastContainer"></div>
+  <script src="../assets/jobQueue.js"></script>
+</body>
+</html>
