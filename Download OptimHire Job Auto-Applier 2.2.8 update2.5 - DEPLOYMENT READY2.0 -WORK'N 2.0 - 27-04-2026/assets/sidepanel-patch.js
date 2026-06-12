@@ -297,7 +297,22 @@
     return node;
   }
 
+  /* Safety: if anything we do ever leaves the app root nearly empty,
+     we revert ALL our hides and stop hiding. Keeping the panel usable
+     always wins over hiding upgrade/referral cards. */
+  var _hideDisabled = false;
+  function revertAllHides() {
+    try {
+      var hidden = document.querySelectorAll('[data-oh-hidden="1"]');
+      for (var i = 0; i < hidden.length; i++) {
+        hidden[i].style.removeProperty('display');
+        hidden[i].removeAttribute('data-oh-hidden');
+      }
+    } catch (_) {}
+  }
+
   function hideMatching() {
+    if (_hideDisabled) return;
     try {
       var nodes = document.querySelectorAll('h1,h2,h3,h4,p,li,span,div,a,button');
       for (var i = 0; i < nodes.length; i++) {
@@ -387,6 +402,22 @@
   }
   if (document.body) startHideLoop();
   else document.addEventListener('DOMContentLoaded', startHideLoop);
+
+  /* Blank-app safety watchdog: if the React root has mounted children
+     but shows almost no visible text, we over-hid (or something went
+     wrong) — revert every hide and stop hiding so the panel is usable. */
+  setInterval(function () {
+    if (_hideDisabled) return;
+    try {
+      var root = document.getElementById('__plasmo');
+      if (!root || root.childElementCount === 0) return; // not mounted yet
+      var txt = (root.innerText || '').trim();
+      if (txt.length < 40) {
+        _hideDisabled = true;
+        revertAllHides();
+      }
+    } catch (_) {}
+  }, 1500);
 
   /* ════════════════════════════════════════════════════════════
      AUTO-APPLY STATUS PANEL (original behaviour)

@@ -5557,11 +5557,24 @@
     async function loadCurrentJob() {
       try {
         const d = await ST.get(['ohJobQueueActive', 'ohJobQueueCurrentId', 'ohJobQueue']);
-        if (!d.ohJobQueueActive || !d.ohJobQueueCurrentId) return null;
+        if (!d.ohJobQueueActive) return null;
         const q = Array.isArray(d.ohJobQueue) ? d.ohJobQueue : [];
-        return q.find(j => j.id === d.ohJobQueueCurrentId) || null;
+        /* Match THIS tab to a running job by URL. This supports running
+           several job tabs in parallel (each tab finds its own job),
+           and means we never act on the OptimHire my-jobs tab or any
+           other tab whose URL isn't one of our running queue jobs. */
+        const byUrl = q.find(j => j.status === 'running' && urlsRoughlyMatch(location.href, j.url));
+        if (byUrl) return byUrl;
+        /* Fallback to the single-current-id model (used by the
+           self-navigate degraded path when the manager tab is closed). */
+        if (d.ohJobQueueCurrentId) {
+          return q.find(j => j.id === d.ohJobQueueCurrentId) || null;
+        }
+        return null;
       } catch (_) { return null; }
     }
+
+    const ADVANCE_FALLBACK_MS = 8_000; // if manager doesn't open the next tab in time, self-navigate
 
     async function advance(job, status, error) {
       if (_advancing) return; _advancing = true;
@@ -5575,32 +5588,54 @@
           q[i].lastError = error || '';
           q[i].lastActionTs = Date.now();
         }
-        const next = q.find(j => j.status === 'pending');
-        if (next) {
-          next.status = 'running';
-          next.attempts = (next.attempts || 0) + 1;
-          next.lastActionTs = Date.now();
-          await new Promise(res => ST.set({
-            ohJobQueue: q,
-            ohJobQueueCurrentId: next.id,
-            ohJobQueueStartTs: Date.now(),
-          }, res));
-          LOG(`[Queue Runner] ${job.title || job.url}: ${status} — advancing to next`);
-          /* Navigate the current tab to the next job. */
-          try { location.href = next.url; } catch (_) {}
-        } else {
-          await new Promise(res => ST.set({
-            ohJobQueue: q,
-            ohJobQueueActive: false,
-            ohJobQueueCurrentId: null,
-          }, res));
-          LOG(`[Queue Runner] queue complete — last job: ${status}`);
+        /* Mark this job done + emit an advance request. The Queue
+           Manager (tabs/jobQueue.html — it has chrome.tabs access)
+           consumes the request: it opens the NEXT job in a fresh tab
+           and closes THIS one. We do NOT navigate this tab ourselves,
+           so each job runs in its own isolated tab and the OptimHire
+           my-jobs tab is never touched. */
+        const reqTs = Date.now();
+        await new Promise(res => ST.set({
+          ohJobQueue: q,
+          ohJobQueueAdvanceReq: { jobId: job.id, status, ts: reqTs },
+        }, res));
+        LOG(`[Queue Runner] ${job.title || job.url}: ${status} — requesting manager to advance`);
+
+        /* Resilience fallback: if the manager tab is closed, nobody
+           consumes the request. After ADVANCE_FALLBACK_MS, if the
+           request is still pending (current job hasn't changed), we
+           self-navigate THIS tab to the next pending job so the queue
+           never stalls. */
+        setTimeout(async () => {
           try {
-            /* Open the manager so the user sees the final state. */
-            const mgr = chrome.runtime.getURL('tabs/jobQueue.html');
-            if (!location.href.startsWith(mgr)) location.href = mgr;
+            const dd = await ST.get(['ohJobQueueAdvanceReq', 'ohJobQueue', 'ohJobQueueActive']);
+            const req = dd.ohJobQueueAdvanceReq;
+            if (!req || req.ts !== reqTs) return;        // manager handled it
+            if (!dd.ohJobQueueActive) return;            // queue stopped
+            let qq = Array.isArray(dd.ohJobQueue) ? dd.ohJobQueue : [];
+            const nx = qq.find(j => j.status === 'pending');
+            if (nx) {
+              nx.status = 'running';
+              nx.attempts = (nx.attempts || 0) + 1;
+              nx.lastActionTs = Date.now();
+              await new Promise(res => ST.set({
+                ohJobQueue: qq,
+                ohJobQueueCurrentId: nx.id,
+                ohJobQueueStartTs: Date.now(),
+                ohJobQueueAdvanceReq: null,
+              }, res));
+              LOG('[Queue Runner] manager idle — self-navigating to next job');
+              try { location.href = nx.url; } catch (_) {}
+            } else {
+              await new Promise(res => ST.set({
+                ohJobQueueActive: false,
+                ohJobQueueCurrentId: null,
+                ohJobQueueAdvanceReq: null,
+              }, res));
+              LOG('[Queue Runner] queue complete (fallback path)');
+            }
           } catch (_) {}
-        }
+        }, ADVANCE_FALLBACK_MS);
       } catch (e) {
         LOG('[Queue Runner] advance failed:', e);
       } finally {
