@@ -5063,7 +5063,15 @@
      still requires a genuine application form + active automation, so
      this never fills random pages. */
   const _APPLY_PATH_RE = /\/(apply|application|jobs?|careers?|join|positions?|openings?|vacanc)/i;
-  const _looksApplyPage = _APPLY_PATH_RE.test(location.pathname) || _APPLY_PATH_RE.test(location.href);
+  /* NEVER run the generic trigger on optimhire.com itself — its own
+     pages (/d/my-jobs, /d/membership, resume/cover-letter editors)
+     contain "jobs" in the path and would otherwise be auto-filled,
+     disturbing OptimHire's own flow. optimhire.com is handled by
+     OptimHire + our T39/T40 clickers, never by the generic autofill. */
+  const _isOptimhire = /optimhire\.com$/i.test(location.hostname) ||
+                       /\.optimhire\.com$/i.test(location.hostname);
+  const _looksApplyPage = !_isOptimhire &&
+    (_APPLY_PATH_RE.test(location.pathname) || _APPLY_PATH_RE.test(location.href));
   if (CURRENT_ATS || _looksApplyPage) {
     /* First attempt after 2.5 s (most SPAs have rendered by then) */
     sleep(2500).then(() => autoTriggerAutofill());

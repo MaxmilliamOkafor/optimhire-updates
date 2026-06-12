@@ -709,7 +709,13 @@
 
   var MD_WARNING_PATTERNS = [
     'please fill the missing details',
-    'fill the missing details and submit'
+    'fill the missing details and submit',
+    'fill out the form manually',
+    'fill out this form manually',
+    'fill the form manually',
+    'apply to this job manually',
+    'manually to apply to this job',
+    'you have to fill out'
   ];
 
   function findWarningContainer() {
