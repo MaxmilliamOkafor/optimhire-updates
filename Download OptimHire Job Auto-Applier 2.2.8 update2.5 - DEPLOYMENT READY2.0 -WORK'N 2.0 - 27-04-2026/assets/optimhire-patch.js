@@ -844,6 +844,50 @@
     else document.addEventListener('DOMContentLoaded', start);
   })();
 
+  /* ── Membership-upgrade auto-bounce ───────────────────────────────────
+   * OptimHire sometimes redirects mid-automation to
+   * /d/membership?openUpgradePlan=1, which halts the apply flow. Our
+   * limit bypass should prevent it, but if it still happens we (a) click
+   * "Continue with Free" to dismiss the pricing modal, and (b) if that's
+   * not available, navigate back to the copilot jobs page so the queue
+   * resumes. Only acts on optimhire.com to avoid touching anything else.
+   * ─────────────────────────────────────────────────────────────────── */
+  (function bounceMembershipUpgrade() {
+    if (!/optimhire\.com$/i.test(location.hostname) &&
+        !/\.optimhire\.com$/i.test(location.hostname)) return;
+    let _bouncedAt = 0;
+    function onUpgradePage() {
+      return /\/d\/membership/i.test(location.pathname) &&
+             /openupgradeplan/i.test(location.search.toLowerCase());
+    }
+    function clickContinueFree() {
+      const btns = document.querySelectorAll('button,[role="button"],a');
+      for (const b of btns) {
+        if (!b) continue;
+        const r = b.getBoundingClientRect();
+        if (r.width === 0 || r.height === 0) continue;
+        const t = ((b.innerText || b.textContent || '') + '').replace(/\s+/g, ' ').trim();
+        if (/^continue\s+with\s+free$/i.test(t)) { try { b.click(); return true; } catch (_) {} }
+      }
+      return false;
+    }
+    async function check() {
+      try {
+        if (!onUpgradePage()) return;
+        const active = await isAutomationActive();
+        if (!active) return; // user is intentionally viewing membership — leave it
+        if (clickContinueFree()) { LOG('Membership: dismissed via Continue with Free'); return; }
+        /* Debounce navigation so we don't loop faster than the page loads */
+        if (Date.now() - _bouncedAt < 6000) return;
+        _bouncedAt = Date.now();
+        LOG('Membership upgrade page during automation — bouncing back to copilot jobs');
+        try { location.href = 'https://optimhire.com/d/my-jobs?q=copilot_jobs'; } catch (_) {}
+      } catch (_) {}
+    }
+    setInterval(check, 1200);
+    check();
+  })();
+
   /* ── Profile helper ─────────────────────────────────────── */
   async function getProfile() {
     const keys = ['candidateDetails', 'cachedSeekerInfo', 'seekerDetails', 'userDetails'];
@@ -1733,6 +1777,30 @@
       'input:not([type=hidden]):not([type=file]):not([type=submit]):not([type=button]),' +
       'textarea'
     ).filter(isVisible);
+
+    /* ── Email + confirm-email correction ──
+       OptimHire's generic yes/no fill sometimes drops "Yes" into a
+       "Confirm your email" field (seen on SmartRecruiters), which
+       fails validation ("Please provide a valid email address") and
+       stalls the whole application. Force every email field — and any
+       confirm/verify/re-enter email field — to the real email. */
+    if (p.email) {
+      const EMAIL_RE = /^[^@\s]+@[^@\s]+\.[^@\s]+$/;
+      for (const inp of inputs) {
+        const itype = (inp.type || '').toLowerCase();
+        const lbl = (getLabel(inp) || inp.name || inp.id || '').toLowerCase();
+        const isEmailField = itype === 'email' || /\be?\s?mail\b/.test(lbl);
+        if (!isEmailField) continue;
+        const v = (inp.value || '').trim();
+        const isConfirm = /confirm|verify|re.?enter|repeat|again/.test(lbl);
+        if (isConfirm || !EMAIL_RE.test(v)) {
+          if (v !== p.email) {
+            LOG(`sanitize: email field "${lbl}" → ${p.email}`);
+            inp.focus(); nativeSet(inp, p.email); await sleep(40);
+          }
+        }
+      }
+    }
 
     for (const inp of inputs) {
       const val = inp.value?.trim() || '';
@@ -5483,6 +5551,7 @@
     const JOB_TIMEOUT_MS  = 180_000;  // 3 min hard cap per job
     const NO_FORM_GRACE_MS = 18_000;  // if no fillable form by now → unsupported, skip
     const SUBMIT_GRACE_MS = 8_000;    // wait this long after submit before declaring success
+    const VALIDATION_STUCK_MS = 50_000; // validation errors persisting this long → fail fast
     const SUCCESS_TEXT_RE = /application\s+(was\s+)?(submitted|received|complete)|thank\s+you\s+for\s+(applying|your\s+application|your\s+interest)|we['’]ve\s+received\s+your\s+application|we\s+have\s+received\s+your\s+application|your\s+application\s+has\s+been\s+(received|submitted)|application\s+successful/i;
     const SUCCESS_URL_RE  = /(thank|success|confirm|complete|received|submitted|done)/i;
     const FAILURE_TEXT_RE = /(already\s+applied|application\s+already\s+submitted|you\s+have\s+already\s+applied|no\s+application\s+(form|available)|job\s+is\s+no\s+longer\s+available|this\s+position\s+is\s+closed|posting\s+is\s+closed|application\s+window\s+has\s+closed|page\s+not\s+found|404)/i;
@@ -5491,6 +5560,7 @@
     let _advancing = false;
     let _jobStartTs = 0;
     let _submitSeenAt = 0;
+    let _validErrSince = 0;
 
     function urlsRoughlyMatch(a, b) {
       try {
@@ -5656,6 +5726,7 @@
           _currentJob = job.id;
           _jobStartTs = Date.now();
           _submitSeenAt = 0;
+          _validErrSince = 0;
           LOG(`[Queue Runner] on job: ${job.title || job.url}`);
         }
 
@@ -5664,6 +5735,20 @@
         /* Failure signals first */
         if (pageHasFailure()) {
           return advance(job, 'skipped', 'already-applied / posting closed');
+        }
+
+        /* Validation-error fast-fail: if the form shows persistent
+           validation errors (a required field our autofill couldn't
+           satisfy) and OptimHire isn't busy retrying, don't burn the
+           full 3-min timeout. Track when errors first appeared; if they
+           persist for VALIDATION_STUCK_MS, mark failed and move on. */
+        if (!optimHireBusy() && pageHasValidationError()) {
+          if (!_validErrSince) _validErrSince = now;
+          else if (now - _validErrSince >= VALIDATION_STUCK_MS) {
+            return advance(job, 'failed', 'validation errors could not be resolved');
+          }
+        } else {
+          _validErrSince = 0; // errors cleared (or OH is working) → reset
         }
 
         /* Submit fired by our flow → start grace timer */

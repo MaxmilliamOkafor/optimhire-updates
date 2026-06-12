@@ -1272,22 +1272,26 @@
       if (card && document.body.contains(card)) return card;
       card = document.createElement('div');
       card.id = 'oh-queue-card';
-      /* FIXED compact card at top-right, appended to <body> — entirely
-         OUTSIDE the React DOM tree (#__plasmo) so it can never interfere
-         with React's mount (the blank-middle bug). Sits just under the
-         OptimHire header, narrow so it doesn't cover the main content. */
+      /* Docked to the BOTTOM of the sidepanel (above the Help footer),
+         in the large empty space — never over the OptimHire main card.
+         Appended to <body>, entirely OUTSIDE the React tree (#__plasmo)
+         so it can't interfere with React's mount. */
       card.style.cssText =
-        'position:fixed;top:52px;right:8px;width:178px;z-index:2147483646;' +
-        'padding:10px 12px;border:1px solid #2d2f3a;border-radius:10px;' +
-        'background:linear-gradient(135deg,#1a1040,#0f1117ee);backdrop-filter:blur(3px);' +
-        'box-shadow:0 4px 14px rgba(0,0,0,.45);' +
+        'position:fixed;bottom:44px;left:10px;right:10px;z-index:2147483646;' +
+        'padding:12px 14px;border:1px solid #2d2f3a;border-radius:10px;' +
+        'background:linear-gradient(135deg,#1a1040,#0f1117f5);backdrop-filter:blur(3px);' +
+        'box-shadow:0 4px 18px rgba(0,0,0,.5);' +
         'font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,sans-serif;' +
         'color:#e2e8f0;font-size:12px;';
       card.innerHTML =
         '<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px">' +
           '<div style="font-weight:600;color:#c4b5fd;font-size:13.5px">My Job Queue</div>' +
-          '<span id="oh-qc-indicator" style="display:none;font-size:10.5px;color:#38bdf8;' +
-            'background:rgba(56,189,248,.15);padding:2px 8px;border-radius:10px;font-weight:600">RUNNING</span>' +
+          '<div style="display:flex;align-items:center;gap:6px">' +
+            '<span id="oh-qc-indicator" style="display:none;font-size:10.5px;color:#38bdf8;' +
+              'background:rgba(56,189,248,.15);padding:2px 8px;border-radius:10px;font-weight:600">RUNNING</span>' +
+            '<span id="oh-qc-collapse" title="Hide" style="cursor:pointer;color:#6b7280;font-size:15px;' +
+              'line-height:1;padding:0 4px">×</span>' +
+          '</div>' +
         '</div>' +
         '<div id="oh-qc-stats" style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px">' +
           '<span style="background:#2d2f3a;padding:3px 8px;border-radius:6px;color:#94a3b8" id="oh-qc-pending">0 pending</span>' +
@@ -1305,6 +1309,32 @@
       document.getElementById('oh-qc-open').addEventListener('click', function () {
         try { chrome.tabs.create({ url: chrome.runtime.getURL('tabs/jobQueue.html'), active: true }); }
         catch (_) {}
+      });
+      /* × collapses the card to a small re-open pill in the corner. */
+      var collapse = document.getElementById('oh-qc-collapse');
+      if (collapse) collapse.addEventListener('click', function (e) {
+        e.stopPropagation();
+        card.style.display = 'none';
+        var pill = document.getElementById('oh-qc-pill');
+        if (!pill) {
+          pill = document.createElement('div');
+          pill.id = 'oh-qc-pill';
+          pill.title = 'Show Job Queue';
+          pill.textContent = 'Queue';
+          pill.style.cssText =
+            'position:fixed;bottom:44px;right:10px;z-index:2147483646;cursor:pointer;' +
+            'padding:6px 12px;border:1px solid #2d2f3a;border-radius:14px;' +
+            'background:linear-gradient(135deg,#6366f1,#8b5cf6);color:#fff;' +
+            'font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,sans-serif;' +
+            'font-size:11px;font-weight:600;box-shadow:0 3px 12px rgba(0,0,0,.4)';
+          pill.addEventListener('click', function () {
+            card.style.display = '';
+            pill.remove();
+          });
+          document.body.appendChild(pill);
+        } else {
+          pill.style.display = '';
+        }
       });
       return card;
     }
