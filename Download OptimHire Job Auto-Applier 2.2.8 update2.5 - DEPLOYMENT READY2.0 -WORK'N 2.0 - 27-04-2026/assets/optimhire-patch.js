@@ -4945,6 +4945,31 @@
     }
   }
 
+  /** Strong "this is a job application form" detector for pages on an
+      UNRECOGNISED ATS (CURRENT_ATS is null). Requires 3+ visible inputs
+      AND (a resume file-upload OR an apply/submit button) so we only
+      auto-fill genuine application forms, never random login/search forms. */
+  function genericApplicationFormPresent() {
+    try {
+      const inputs = document.querySelectorAll(
+        'input:not([type=hidden]):not([type=submit]):not([type=button]),textarea,select'
+      );
+      let vis = 0;
+      for (const el of inputs) {
+        const r = el.getBoundingClientRect();
+        if (r.width > 0 && r.height > 0) { vis++; if (vis >= 3) break; }
+      }
+      if (vis < 3) return false;
+      if (document.querySelector('input[type=file]')) return true;
+      const btns = document.querySelectorAll('button,[role="button"],input[type=submit]');
+      for (const b of btns) {
+        const t = ((b.innerText || b.value || b.textContent || '') + '').trim();
+        if (/\b(apply|submit)\b/i.test(t)) return true;
+      }
+      return false;
+    } catch (_) { return false; }
+  }
+
   /** Run the full auto-trigger flow */
   let _autoTriggered = false;
   let _autoTriggerRunning = false;
@@ -4953,7 +4978,12 @@
     /* Guards */
     if (_autoTriggerRunning) return;
     if (_autoTriggered)      return;
-    if (!CURRENT_ATS)        return;
+    /* On a RECOGNISED ATS we always proceed. On an UNRECOGNISED ATS
+       (CURRENT_ATS null) OptimHire often gives up and shows "fill out
+       manually" — but we still want zero manual work, so we proceed if
+       a genuine application form is present and let the generic
+       autoFillPage() handle it (then T43 auto-submits). */
+    if (!CURRENT_ATS && !genericApplicationFormPresent()) return;
 
     const { csvActiveJobId } = await ST.get('csvActiveJobId');
     if (csvActiveJobId) return; /* CSV bridge handles it */
@@ -5025,8 +5055,16 @@
     }
   }
 
-  /* ── Initial trigger after page load ── */
-  if (CURRENT_ATS) {
+  /* ── Initial trigger after page load ──
+     Run the trigger machinery on recognised ATSes AND on any page whose
+     URL looks like a job application (so unrecognised ATSes like relay /
+     careers-page that OptimHire can't handle still get auto-filled +
+     auto-submitted — zero manual work). autoTriggerAutofill() itself
+     still requires a genuine application form + active automation, so
+     this never fills random pages. */
+  const _APPLY_PATH_RE = /\/(apply|application|jobs?|careers?|join|positions?|openings?|vacanc)/i;
+  const _looksApplyPage = _APPLY_PATH_RE.test(location.pathname) || _APPLY_PATH_RE.test(location.href);
+  if (CURRENT_ATS || _looksApplyPage) {
     /* First attempt after 2.5 s (most SPAs have rendered by then) */
     sleep(2500).then(() => autoTriggerAutofill());
 
