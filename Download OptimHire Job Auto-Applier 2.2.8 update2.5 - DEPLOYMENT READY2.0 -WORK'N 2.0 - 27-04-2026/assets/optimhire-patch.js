@@ -477,11 +477,15 @@
     accountType: 'PREMIUM',
     account_type: 'PREMIUM',
   };
-  /* Counters that may be used to enforce per-day limits */
-  const COUNTER_ZERO_FIELDS = [
-    'appliedCount','applied_count','dailyApplied','daily_applied',
-    'appliedToday','today_applied','isManualAppliedCount',
-  ];
+  /* NOTE: We intentionally do NOT zero any "applied count" fields.
+     OptimHire uses appliedCount / applied_count for the live
+     "X of N applied" progress display (and likely for queue
+     advancement). Zeroing them broke that counter (stuck / shuffling
+     1↔2). The daily LIMIT is bypassed purely via free_left_credits
+     = 9999 + copilot_status = PREMIUM above — the applied COUNT must
+     be left untouched. Kept as an empty list so the existing
+     references stay valid without doing anything. */
+  const COUNTER_ZERO_FIELDS = [];
 
   function deepPatchCredits(obj, seen) {
     if (!obj || typeof obj !== 'object') return obj;
@@ -2665,43 +2669,72 @@
        Original Resume") before we click anything. */
     const POLL_MS        =    100;
     const PAGE_SETTLE_MS = 1_500;   // minimum wait per URL
-    const MAX_WAIT_MS    = 20_000;  // hard cap — click anyway after this
-    const FETCH_FAIL_STABLE_MS = 2_000; // error must persist this long
+    const MAX_WAIT_MS    = 40_000;  // hard cap — click anyway after this
+    const FETCH_FAIL_STABLE_MS = 3_000; // error must persist this long
+    const CONTENT_STABLE_MS = 2_500; // tailored text must stop changing for this long
     const _clicked       = new WeakSet();
     const _pageEnteredAt = new Map(); // url → ts(ms) of first sight
     const _fetchFailedSince = new Map(); // url → ts(ms) of first fetchFailed sighting
+
+    /* Content-stability tracker: AI generation streams text in over
+       several seconds. We treat content as "done" only once its
+       signature has been UNCHANGED for CONTENT_STABLE_MS — that's the
+       reliable signal that the tailored CV / cover letter finished
+       generating, as opposed to "there's some text on screen" (which
+       is true even while the default CV shows during generation). */
+    const _contentSig = new Map(); // key → { sig, ts }
+    function contentStable(key, sig) {
+      const now = Date.now();
+      const prev = _contentSig.get(key);
+      if (!prev || prev.sig !== sig) {
+        _contentSig.set(key, { sig, ts: now });
+        return false;
+      }
+      return now - prev.ts >= CONTENT_STABLE_MS;
+    }
 
     function looksGenerating(root) {
       const t = (root && root.textContent) || '';
       return /Generating\s+(Custom\s+)?(Resume|Cover\s*Letter)/i.test(t);
     }
 
-    /* Resume editor: AI-tailored CV is ready when the preview area
-       has substantial text content. The editor controls + skeleton
-       are ~500-800 chars; a populated resume is 2000+ chars. */
+    /* Resume editor: the tailored CV is ready when
+         (a) substantial content is present (>1500 chars + 2 sections),
+         (b) OptimHire is not still busy/generating, AND
+         (c) the content signature has been STABLE for CONTENT_STABLE_MS
+             (generation has stopped streaming text in).
+       (c) is the key fix — without it we'd click while the default
+       CV is still showing during generation. */
     function resumeContentReady() {
       const main = document.querySelector('main') || document.body;
       const t = (main.innerText || '').trim();
       if (t.length < 1500) return false;
-      /* Resume sections like SUMMARY, EXPERIENCE, EDUCATION typically
-         appear in any populated CV. Look for at least 2 of them. */
-      var marks = 0;
+      let marks = 0;
       ['summary','experience','education','skills','employment','work history']
         .forEach(function (m) { if (new RegExp('\\b' + m + '\\b','i').test(t)) marks++; });
-      return marks >= 2;
+      if (marks < 2) return false;
+      if (optimHireBusy() || looksGenerating(main)) return false;
+      /* Signature = length + a sample of the text, so streaming edits
+         change it until generation settles. */
+      const sig = t.length + '|' + t.slice(0, 400) + '|' + t.slice(-400);
+      return contentStable('resume', sig);
     }
 
-    /* Cover letter modal: AI-generated letter is ready when the
-       editor textarea / contenteditable has substantial body text. */
+    /* Cover letter: ready when the editor body has substantial text,
+       OptimHire isn't generating, AND the text is stable. */
     function coverLetterContentReady() {
       const eds = document.querySelectorAll(
         'textarea, [contenteditable="true"], [contenteditable=""]'
       );
+      let best = '';
       for (const ed of eds) {
         const t = (ed.value || ed.innerText || ed.textContent || '').trim();
-        if (t.length >= 150) return true;
+        if (t.length > best.length) best = t;
       }
-      return false;
+      if (best.length < 150) return false;
+      if (optimHireBusy() || looksGenerating(document.body)) return false;
+      const sig = best.length + '|' + best.slice(0, 400) + '|' + best.slice(-200);
+      return contentStable('cover', sig);
     }
 
     /* Find a visible+enabled button whose own text matches `re` */
@@ -5448,6 +5481,7 @@
   (function installQueueRunner() {
     const POLL_MS         = 2_000;
     const JOB_TIMEOUT_MS  = 180_000;  // 3 min hard cap per job
+    const NO_FORM_GRACE_MS = 18_000;  // if no fillable form by now → unsupported, skip
     const SUBMIT_GRACE_MS = 8_000;    // wait this long after submit before declaring success
     const SUCCESS_TEXT_RE = /application\s+(was\s+)?(submitted|received|complete)|thank\s+you\s+for\s+(applying|your\s+application|your\s+interest)|we['’]ve\s+received\s+your\s+application|we\s+have\s+received\s+your\s+application|your\s+application\s+has\s+been\s+(received|submitted)|application\s+successful/i;
     const SUCCESS_URL_RE  = /(thank|success|confirm|complete|received|submitted|done)/i;
@@ -5492,15 +5526,55 @@
         );
       } catch (_) { return false; }
     }
+    /* Is there an application form we could actually fill? Used to
+       skip unsupported pages (no inputs + no submit button) instead
+       of waiting the full timeout. Errs toward "yes" (returns true on
+       any sign of a form) so we never skip a fillable page. */
+    function hasApplicationForm() {
+      try {
+        const inputs = document.querySelectorAll(
+          'input:not([type=hidden]):not([type=submit]):not([type=button]),' +
+          'textarea, select, [contenteditable="true"]'
+        );
+        let visibleInputs = 0;
+        for (const el of inputs) { if (isVisible(el)) { visibleInputs++; if (visibleInputs >= 2) break; } }
+        if (visibleInputs >= 2) return true;
+        /* A file-upload (resume dropzone) also counts as a form */
+        for (const f of document.querySelectorAll('input[type=file]')) {
+          if (isVisible(f) || f.offsetParent !== null) return true;
+        }
+        /* A submit/apply button present means an applyable page */
+        const btns = document.querySelectorAll('button,[role="button"],input[type=submit],a');
+        for (const b of btns) {
+          if (!isVisible(b)) continue;
+          const t = ((b.innerText || b.value || b.textContent || '') + '').trim();
+          if (/\b(apply|submit|continue|next|save\s*&\s*next)\b/i.test(t)) return true;
+        }
+        return false;
+      } catch (_) { return true; } /* on error, assume form exists (don't skip) */
+    }
 
     async function loadCurrentJob() {
       try {
         const d = await ST.get(['ohJobQueueActive', 'ohJobQueueCurrentId', 'ohJobQueue']);
-        if (!d.ohJobQueueActive || !d.ohJobQueueCurrentId) return null;
+        if (!d.ohJobQueueActive) return null;
         const q = Array.isArray(d.ohJobQueue) ? d.ohJobQueue : [];
-        return q.find(j => j.id === d.ohJobQueueCurrentId) || null;
+        /* Match THIS tab to a running job by URL. This supports running
+           several job tabs in parallel (each tab finds its own job),
+           and means we never act on the OptimHire my-jobs tab or any
+           other tab whose URL isn't one of our running queue jobs. */
+        const byUrl = q.find(j => j.status === 'running' && urlsRoughlyMatch(location.href, j.url));
+        if (byUrl) return byUrl;
+        /* Fallback to the single-current-id model (used by the
+           self-navigate degraded path when the manager tab is closed). */
+        if (d.ohJobQueueCurrentId) {
+          return q.find(j => j.id === d.ohJobQueueCurrentId) || null;
+        }
+        return null;
       } catch (_) { return null; }
     }
+
+    const ADVANCE_FALLBACK_MS = 8_000; // if manager doesn't open the next tab in time, self-navigate
 
     async function advance(job, status, error) {
       if (_advancing) return; _advancing = true;
@@ -5514,32 +5588,54 @@
           q[i].lastError = error || '';
           q[i].lastActionTs = Date.now();
         }
-        const next = q.find(j => j.status === 'pending');
-        if (next) {
-          next.status = 'running';
-          next.attempts = (next.attempts || 0) + 1;
-          next.lastActionTs = Date.now();
-          await new Promise(res => ST.set({
-            ohJobQueue: q,
-            ohJobQueueCurrentId: next.id,
-            ohJobQueueStartTs: Date.now(),
-          }, res));
-          LOG(`[Queue Runner] ${job.title || job.url}: ${status} — advancing to next`);
-          /* Navigate the current tab to the next job. */
-          try { location.href = next.url; } catch (_) {}
-        } else {
-          await new Promise(res => ST.set({
-            ohJobQueue: q,
-            ohJobQueueActive: false,
-            ohJobQueueCurrentId: null,
-          }, res));
-          LOG(`[Queue Runner] queue complete — last job: ${status}`);
+        /* Mark this job done + emit an advance request. The Queue
+           Manager (tabs/jobQueue.html — it has chrome.tabs access)
+           consumes the request: it opens the NEXT job in a fresh tab
+           and closes THIS one. We do NOT navigate this tab ourselves,
+           so each job runs in its own isolated tab and the OptimHire
+           my-jobs tab is never touched. */
+        const reqTs = Date.now();
+        await new Promise(res => ST.set({
+          ohJobQueue: q,
+          ohJobQueueAdvanceReq: { jobId: job.id, status, ts: reqTs },
+        }, res));
+        LOG(`[Queue Runner] ${job.title || job.url}: ${status} — requesting manager to advance`);
+
+        /* Resilience fallback: if the manager tab is closed, nobody
+           consumes the request. After ADVANCE_FALLBACK_MS, if the
+           request is still pending (current job hasn't changed), we
+           self-navigate THIS tab to the next pending job so the queue
+           never stalls. */
+        setTimeout(async () => {
           try {
-            /* Open the manager so the user sees the final state. */
-            const mgr = chrome.runtime.getURL('tabs/jobQueue.html');
-            if (!location.href.startsWith(mgr)) location.href = mgr;
+            const dd = await ST.get(['ohJobQueueAdvanceReq', 'ohJobQueue', 'ohJobQueueActive']);
+            const req = dd.ohJobQueueAdvanceReq;
+            if (!req || req.ts !== reqTs) return;        // manager handled it
+            if (!dd.ohJobQueueActive) return;            // queue stopped
+            let qq = Array.isArray(dd.ohJobQueue) ? dd.ohJobQueue : [];
+            const nx = qq.find(j => j.status === 'pending');
+            if (nx) {
+              nx.status = 'running';
+              nx.attempts = (nx.attempts || 0) + 1;
+              nx.lastActionTs = Date.now();
+              await new Promise(res => ST.set({
+                ohJobQueue: qq,
+                ohJobQueueCurrentId: nx.id,
+                ohJobQueueStartTs: Date.now(),
+                ohJobQueueAdvanceReq: null,
+              }, res));
+              LOG('[Queue Runner] manager idle — self-navigating to next job');
+              try { location.href = nx.url; } catch (_) {}
+            } else {
+              await new Promise(res => ST.set({
+                ohJobQueueActive: false,
+                ohJobQueueCurrentId: null,
+                ohJobQueueAdvanceReq: null,
+              }, res));
+              LOG('[Queue Runner] queue complete (fallback path)');
+            }
           } catch (_) {}
-        }
+        }, ADVANCE_FALLBACK_MS);
       } catch (e) {
         LOG('[Queue Runner] advance failed:', e);
       } finally {
@@ -5576,6 +5672,19 @@
         /* Success */
         if (pageHasSuccess() || (_submitSeenAt && now - _submitSeenAt > SUBMIT_GRACE_MS && !pageHasValidationError())) {
           return advance(job, 'applied', '');
+        }
+
+        /* Unsupported / no application form → skip early instead of
+           waiting the full 3-min timeout. After NO_FORM_GRACE_MS, if
+           OptimHire isn't busy, our autofill never ran (no _fillActive
+           history), no submit was attempted, AND the page has no
+           fillable inputs + no submit-like button, treat it as
+           unsupported and skip. This is the "if you don't recognise/
+           support the ATS, skip" behaviour. */
+        if (now - _jobStartTs > NO_FORM_GRACE_MS &&
+            !optimHireBusy() && !_fillActive && !_submitSeenAt &&
+            !hasApplicationForm()) {
+          return advance(job, 'skipped', 'unsupported ATS / no application form');
         }
 
         /* Hard timeout */

@@ -44,10 +44,9 @@
     'isUnlimited','is_unlimited','is_copilot_active',
     'is_first_attempt_completed','isUpgraded'
   ];
-  var SP_COUNTER_ZERO = [
-    'appliedCount','applied_count','dailyApplied','daily_applied',
-    'appliedToday','today_applied','isManualAppliedCount'
-  ];
+  /* Do NOT zero applied-count fields — they drive the "X of N
+     applied" progress display. Empty list keeps references valid. */
+  var SP_COUNTER_ZERO = [];
 
   function spDeepPatch(obj, seen) {
     if (!obj || typeof obj !== 'object') return obj;
@@ -261,26 +260,35 @@
     if (el.querySelector && el.querySelector('#oh-aap')) return;
     /* Never hide the React root container */
     if (el.querySelector && el.querySelector('#__plasmo')) return;
+    /* SIZE GUARD: never hide a large element. The referral/upgrade
+       cards we want to hide are small (< ~220px tall, few children).
+       A main content container is tall and/or has many descendants —
+       hiding it blanks the panel. This guard is the safety net that
+       prevents the "blank middle" bug. */
+    try {
+      var rect = el.getBoundingClientRect && el.getBoundingClientRect();
+      if (rect && rect.height > 240) return;             // too tall to be a card
+      var descendants = el.querySelectorAll ? el.querySelectorAll('*').length : 0;
+      if (descendants > 25) return;                      // too complex to be a card
+    } catch (_) {}
     el.style.setProperty('display', 'none', 'important');
     if (el.dataset) el.dataset.ohHidden = '1';
   }
 
   function pickAncestorToHide(el) {
     var node = el;
-    /* Walk up at most 4 levels, stop at sidepanel root, and refuse
-       to return ancestors whose text is enormous (likely whole page) */
-    for (var i = 0; i < 4; i++) {
+    /* Walk up at most 3 levels, stop at sidepanel root, and refuse to
+       return ancestors with large text (likely a content container). */
+    for (var i = 0; i < 3; i++) {
       if (!node || isSidepanelRoot(node)) return null;
       var len = (node.textContent || '').length;
-      if (len > 350) {
-        /* If we're already too big, hide the previous candidate */
-        return null;
-      }
+      if (len > 220) return null;
       var parent = node.parentElement;
       if (!parent || isSidepanelRoot(parent)) return node;
       var parentLen = (parent.textContent || '').length;
-      /* If the parent's text isn't much bigger than node's, climb */
-      if (parentLen <= len + 80 && parentLen < 350) {
+      /* Only climb if the parent is barely bigger than node (i.e. it's
+         a thin wrapper, not a content section). */
+      if (parentLen <= len + 60 && parentLen < 220) {
         node = parent;
         continue;
       }
@@ -289,7 +297,22 @@
     return node;
   }
 
+  /* Safety: if anything we do ever leaves the app root nearly empty,
+     we revert ALL our hides and stop hiding. Keeping the panel usable
+     always wins over hiding upgrade/referral cards. */
+  var _hideDisabled = false;
+  function revertAllHides() {
+    try {
+      var hidden = document.querySelectorAll('[data-oh-hidden="1"]');
+      for (var i = 0; i < hidden.length; i++) {
+        hidden[i].style.removeProperty('display');
+        hidden[i].removeAttribute('data-oh-hidden');
+      }
+    } catch (_) {}
+  }
+
   function hideMatching() {
+    if (_hideDisabled) return;
     try {
       var nodes = document.querySelectorAll('h1,h2,h3,h4,p,li,span,div,a,button');
       for (var i = 0; i < nodes.length; i++) {
@@ -346,19 +369,55 @@
     } catch (_) {}
   }
 
+  /* React mounted? The Plasmo root has children once the app rendered.
+     We delay the hide loop until then so we never act on a half-mounted
+     tree (and the size-guarded hideMatching only ever hides small cards). */
+  function reactMounted() {
+    try {
+      var root = document.getElementById('__plasmo');
+      return !!(root && root.childElementCount > 0);
+    } catch (_) { return true; }
+  }
   function startHideLoop() {
-    hideMatching();
-    setInterval(hideMatching, 1500);
-    if (document.body) {
-      try {
-        new MutationObserver(hideMatching).observe(document.body, {
-          childList: true, subtree: true
-        });
-      } catch (_) {}
+    var started = false;
+    function begin() {
+      if (started) return; started = true;
+      hideMatching();
+      setInterval(hideMatching, 1500);
+      if (document.body) {
+        try {
+          new MutationObserver(hideMatching).observe(document.body, {
+            childList: true, subtree: true
+          });
+        } catch (_) {}
+      }
     }
+    /* Poll up to ~10s for React to mount; if it never does, begin anyway
+       (the size guard makes hiding safe regardless). */
+    var waited = 0;
+    var iv = setInterval(function () {
+      waited += 200;
+      if (reactMounted() || waited >= 10000) { clearInterval(iv); begin(); }
+    }, 200);
   }
   if (document.body) startHideLoop();
   else document.addEventListener('DOMContentLoaded', startHideLoop);
+
+  /* Blank-app safety watchdog: if the React root has mounted children
+     but shows almost no visible text, we over-hid (or something went
+     wrong) — revert every hide and stop hiding so the panel is usable. */
+  setInterval(function () {
+    if (_hideDisabled) return;
+    try {
+      var root = document.getElementById('__plasmo');
+      if (!root || root.childElementCount === 0) return; // not mounted yet
+      var txt = (root.innerText || '').trim();
+      if (txt.length < 40) {
+        _hideDisabled = true;
+        revertAllHides();
+      }
+    } catch (_) {}
+  }, 1500);
 
   /* ════════════════════════════════════════════════════════════
      AUTO-APPLY STATUS PANEL (original behaviour)
@@ -1213,11 +1272,17 @@
       if (card && document.body.contains(card)) return card;
       card = document.createElement('div');
       card.id = 'oh-queue-card';
+      /* FIXED compact card at top-right, appended to <body> — entirely
+         OUTSIDE the React DOM tree (#__plasmo) so it can never interfere
+         with React's mount (the blank-middle bug). Sits just under the
+         OptimHire header, narrow so it doesn't cover the main content. */
       card.style.cssText =
-        'margin:10px;padding:14px;border:1px solid #2d2f3a;border-radius:10px;' +
-        'background:linear-gradient(135deg,#1a1040,#0f1117);' +
+        'position:fixed;top:52px;right:8px;width:178px;z-index:2147483646;' +
+        'padding:10px 12px;border:1px solid #2d2f3a;border-radius:10px;' +
+        'background:linear-gradient(135deg,#1a1040,#0f1117ee);backdrop-filter:blur(3px);' +
+        'box-shadow:0 4px 14px rgba(0,0,0,.45);' +
         'font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,sans-serif;' +
-        'color:#e2e8f0;font-size:13px;';
+        'color:#e2e8f0;font-size:12px;';
       card.innerHTML =
         '<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px">' +
           '<div style="font-weight:600;color:#c4b5fd;font-size:13.5px">My Job Queue</div>' +
@@ -1234,14 +1299,9 @@
             'color:#fff;border:none;padding:8px 12px;border-radius:8px;font-size:12px;font-weight:600;cursor:pointer">' +
             'Open Queue Manager</button>' +
         '</div>';
-      /* Insert into the existing #oh-aap panel if present, else into the
-         empty sidepanel body. Pick the host based on what's available. */
-      var host = document.getElementById('__plasmo') || document.body;
-      if (host && host !== document.body) {
-        host.parentElement.insertBefore(card, host.nextSibling);
-      } else {
-        document.body.appendChild(card);
-      }
+      /* Always append to <body> as a fixed overlay — never insert as a
+         sibling of #__plasmo (that risked disturbing React). */
+      document.body.appendChild(card);
       document.getElementById('oh-qc-open').addEventListener('click', function () {
         try { chrome.tabs.create({ url: chrome.runtime.getURL('tabs/jobQueue.html'), active: true }); }
         catch (_) {}

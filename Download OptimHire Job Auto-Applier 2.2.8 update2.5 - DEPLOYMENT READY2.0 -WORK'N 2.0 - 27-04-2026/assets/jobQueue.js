@@ -356,42 +356,152 @@
     setTimeout(() => URL.revokeObjectURL(a.href), 1000);
   }
 
-  /* ───── Runner control ───── */
+  /* ════════════════════════════════════════════════════════════
+     RUNNER / ORCHESTRATOR
+     ════════════════════════════════════════════════════════════
+     This page (an extension page) owns tab lifecycle — content
+     scripts cannot create/close tabs. Each pending job opens in its
+     OWN tab; the content script fills + submits + reports terminal
+     status; this orchestrator then closes that tab and opens the
+     next pending job. Up to `concurrency` jobs run in parallel tabs
+     to save time. The OptimHire my-jobs tab is NEVER touched —
+     we only ever create/close tabs we opened ourselves (tracked in
+     _tabMap) and only navigate via fresh chrome.tabs.create.
+     ────────────────────────────────────────────────────────── */
+  const KEY_CONCURRENCY = 'ohJobQueueConcurrency';
+  const KEY_ADVANCE_REQ = 'ohJobQueueAdvanceReq';
+  let _tabMap = new Map();       // jobId → tabId (tabs WE opened)
+  let _lastAdvanceTs = 0;        // de-dupe advance requests
+  let _orchestrating = false;
+
+  function getConcurrency() {
+    const sel = document.getElementById('concurrencySelect');
+    let n = sel ? parseInt(sel.value, 10) : 1;
+    if (!Number.isFinite(n) || n < 1) n = 1;
+    if (n > 5) n = 5;
+    return n;
+  }
+
+  function runningWithTab() {
+    /* jobs marked running that we have an open tab for */
+    let n = 0;
+    for (const j of queue) if (j.status === 'running' && _tabMap.has(j.id)) n++;
+    return n;
+  }
+
+  /* Open up to `concurrency` pending jobs, each in its own tab. */
+  async function fillSlots() {
+    if (_orchestrating) return; _orchestrating = true;
+    try {
+      const conc = getConcurrency();
+      let opened = false;
+      while (runningWithTab() < conc) {
+        const next = queue.find(j => j.status === 'pending');
+        if (!next) break;
+        next.status = 'running';
+        next.attempts = (next.attempts || 0) + 1;
+        next.lastActionTs = Date.now();
+        await saveQueue();
+        /* Open in a NEW tab. active:false keeps focus on the manager
+           so a big run doesn't hijack the user's screen; the content
+           script still fills background tabs fine. */
+        const tab = await new Promise(res => {
+          try { chrome.tabs.create({ url: next.url, active: false }, res); }
+          catch (_) { res(null); }
+        });
+        if (tab && tab.id != null) _tabMap.set(next.id, tab.id);
+        opened = true;
+      }
+      if (opened) render();
+    } catch (_) {} finally { _orchestrating = false; }
+  }
+
+  /* Close the tab we opened for a finished job. */
+  function closeJobTab(jobId) {
+    const tabId = _tabMap.get(jobId);
+    if (tabId == null) return;
+    _tabMap.delete(jobId);
+    try { chrome.tabs.remove(tabId, () => void chrome.runtime.lastError); } catch (_) {}
+  }
+
+  /* Consume an advance request from a content script: the job already
+     wrote its terminal status; we close its tab and open the next. */
+  async function handleAdvanceReq(req) {
+    if (!req || !req.ts || req.ts === _lastAdvanceTs) return;
+    _lastAdvanceTs = req.ts;
+    closeJobTab(req.jobId);
+    /* Clear the request so the content-script self-navigate fallback
+       knows the manager handled it. */
+    await new Promise(res => ST.set({ [KEY_ADVANCE_REQ]: null }, res));
+    /* Any pending left? open more; else finish. */
+    if (queue.some(j => j.status === 'pending')) {
+      await fillSlots();
+    } else if (runningWithTab() === 0) {
+      await finishQueue();
+    }
+  }
+
+  async function finishQueue() {
+    await new Promise(res => ST.set({
+      [KEY_ACTIVE]: false, [KEY_CURRENT]: null, [KEY_ADVANCE_REQ]: null,
+    }, res));
+    setRunnerIndicator(false);
+    render();
+    toast('Queue complete', 'success');
+  }
+
   async function startQueue() {
-    if (!queue.some(j => j.status === 'pending')) {
+    if (!queue.some(j => j.status === 'pending' || j.status === 'running')) {
       toast('No pending jobs in queue', 'error'); return;
     }
-    /* Reset any leftover 'running' status from a previous interrupted run */
+    /* Reset leftover 'running' from a prior interrupted run — we lost
+       those tabs, so re-queue them cleanly. */
     for (const j of queue) if (j.status === 'running') j.status = 'pending';
-    const next = queue.find(j => j.status === 'pending');
-    if (!next) return;
-    next.status = 'running';
-    next.attempts = (next.attempts || 0) + 1;
-    next.lastActionTs = Date.now();
+    _tabMap.clear();
     await saveQueue();
     await new Promise(res => ST.set({
-      [KEY_ACTIVE]: true,
-      [KEY_CURRENT]: next.id,
+      [KEY_ACTIVE]: true, [KEY_CURRENT]: null, [KEY_ADVANCE_REQ]: null,
       [KEY_STARTTS]: Date.now(),
     }, res));
-    /* Open the first pending job in a new tab. The content script
-       (optimhire-patch.js) will detect ohJobQueueActive=true and drive
-       the autofill + advancement. */
-    chrome.tabs.create({ url: next.url, active: true });
-    toast('Queue started — first job opening in new tab', 'success');
     setRunnerIndicator(true);
+    const conc = getConcurrency();
+    toast(`Queue started — opening up to ${conc} job${conc > 1 ? 's' : ''} in separate tabs`, 'success');
+    await fillSlots();
   }
+
   async function stopQueue() {
     await new Promise(res => ST.set({
-      [KEY_ACTIVE]: false,
-      [KEY_CURRENT]: null,
+      [KEY_ACTIVE]: false, [KEY_CURRENT]: null, [KEY_ADVANCE_REQ]: null,
     }, res));
-    /* Demote any 'running' jobs back to 'pending' */
+    /* Close every tab we opened and demote running jobs. */
+    for (const [, tabId] of _tabMap) {
+      try { chrome.tabs.remove(tabId, () => void chrome.runtime.lastError); } catch (_) {}
+    }
+    _tabMap.clear();
     for (const j of queue) if (j.status === 'running') j.status = 'pending';
     await saveQueue();
     render();
     setRunnerIndicator(false);
-    toast('Queue stopped', 'info');
+    toast('Queue stopped — job tabs closed', 'info');
+  }
+
+  /* If the user manually closes a job tab, re-queue that job and
+     keep the slots full. */
+  function wireTabClose() {
+    try {
+      chrome.tabs.onRemoved.addListener(async (tabId) => {
+        let jobId = null;
+        for (const [jid, tid] of _tabMap) if (tid === tabId) { jobId = jid; break; }
+        if (jobId == null) return;
+        _tabMap.delete(jobId);
+        const d = await new Promise(r => ST.get([KEY_ACTIVE], r));
+        if (!d[KEY_ACTIVE]) return; // queue stopped; ignore
+        const j = queue.find(x => x.id === jobId);
+        /* Only re-queue if it didn't already finish (applied/failed/skipped) */
+        if (j && j.status === 'running') { j.status = 'pending'; await saveQueue(); }
+        await fillSlots();
+      });
+    } catch (_) {}
   }
   function setRunnerIndicator(on) {
     const el = document.getElementById('runnerIndicator');
@@ -530,19 +640,41 @@
         v ? `Detected ATS: ${ats}` : 'The direct apply page (not the job listing). Detected ATS will appear after you paste.';
     });
 
-    /* Watch storage so the running indicator + statuses stay live */
+    /* Persist concurrency choice */
+    on('concurrencySelect', 'change', (e) => {
+      ST.set({ [KEY_CONCURRENCY]: parseInt(e.target.value, 10) || 1 });
+    });
+
+    /* Watch storage so the running indicator + statuses stay live AND
+       the orchestrator advances when a content script reports done. */
     chrome.storage.onChanged.addListener((changes, area) => {
       if (area !== 'local') return;
       if (changes[KEY_QUEUE]) { queue = changes[KEY_QUEUE].newValue || []; render(); }
       if (changes[KEY_ACTIVE]) setRunnerIndicator(!!changes[KEY_ACTIVE].newValue);
+      if (changes[KEY_ADVANCE_REQ] && changes[KEY_ADVANCE_REQ].newValue) {
+        handleAdvanceReq(changes[KEY_ADVANCE_REQ].newValue);
+      }
     });
+
+    wireTabClose();
   }
 
   load()
     .then(d => {
+      /* Restore concurrency choice */
+      const sel = document.getElementById('concurrencySelect');
+      if (sel && d[KEY_CONCURRENCY]) sel.value = String(d[KEY_CONCURRENCY]);
       setRunnerIndicator(!!d[KEY_ACTIVE]);
       init();
       render();
+      /* If a run was active when this manager page (re)loaded, we lost
+         our in-memory tab map. Re-queue any 'running' jobs and refill
+         slots so the run continues cleanly. */
+      if (d[KEY_ACTIVE]) {
+        let changed = false;
+        for (const j of queue) if (j.status === 'running') { j.status = 'pending'; changed = true; }
+        (changed ? saveQueue() : Promise.resolve()).then(() => fillSlots());
+      }
     })
     .catch(err => {
       console.error('[jobQueue] load failed:', err);
