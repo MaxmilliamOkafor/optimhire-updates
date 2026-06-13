@@ -1778,27 +1778,67 @@
       'textarea'
     ).filter(isVisible);
 
-    /* ── Email + confirm-email correction ──
-       OptimHire's generic yes/no fill sometimes drops "Yes" into a
-       "Confirm your email" field (seen on SmartRecruiters), which
-       fails validation ("Please provide a valid email address") and
-       stalls the whole application. Force every email field — and any
-       confirm/verify/re-enter email field — to the real email. */
+    /* ── Email + confirm-email correction + empty-required force-fill ──
+       Forces every email field — and any confirm/verify/re-enter email
+       field — to the real email. Also fills empty visible email fields
+       (Workable's email field often had no value after the adapter ran).
+       Detection uses type=email, autocomplete=email, name/id/placeholder,
+       and label match — broadest possible. */
     if (p.email) {
       const EMAIL_RE = /^[^@\s]+@[^@\s]+\.[^@\s]+$/;
+      const emailCandidates = $$(
+        'input[type="email"],input[autocomplete*="email" i],' +
+        'input[name*="email" i],input[id*="email" i],' +
+        'input[placeholder*="email" i],input[aria-label*="email" i]'
+      ).filter(isVisible);
+      /* Also include any labelled "email" input that didn't match attrs */
       for (const inp of inputs) {
-        const itype = (inp.type || '').toLowerCase();
-        const lbl = (getLabel(inp) || inp.name || inp.id || '').toLowerCase();
-        const isEmailField = itype === 'email' || /\be?\s?mail\b/.test(lbl);
-        if (!isEmailField) continue;
+        if (emailCandidates.includes(inp)) continue;
+        const lbl = (getLabel(inp) || '').toLowerCase();
+        if (/\be?\s?mail\b/.test(lbl)) emailCandidates.push(inp);
+      }
+      for (const inp of emailCandidates) {
+        const lbl = (getLabel(inp) || inp.name || inp.id || inp.placeholder || '').toLowerCase();
         const v = (inp.value || '').trim();
         const isConfirm = /confirm|verify|re.?enter|repeat|again/.test(lbl);
-        if (isConfirm || !EMAIL_RE.test(v)) {
-          if (v !== p.email) {
-            LOG(`sanitize: email field "${lbl}" → ${p.email}`);
-            inp.focus(); nativeSet(inp, p.email); await sleep(40);
-          }
+        const shouldFill = !v || isConfirm || !EMAIL_RE.test(v);
+        if (shouldFill && v !== p.email) {
+          LOG(`sanitize: email field "${lbl}" → ${p.email}`);
+          inp.focus(); nativeSet(inp, p.email); await sleep(40);
         }
+      }
+    }
+
+    /* ── Phone force-fill (empty visible phone inputs) ──
+       Workable + similar split phone into [country-code] + [number].
+       The number input is often empty after the adapter because the
+       adapter's .find() filled only the first match (the country code).
+       Force-fill any visible phone input that's empty, EXCLUDING fields
+       that are clearly country-code/prefix-only (their label or value
+       starts with + and is short). */
+    if (p.phone) {
+      const phoneCandidates = $$(
+        'input[type="tel"],input[autocomplete*="tel" i],' +
+        'input[name*="phone" i],input[id*="phone" i],' +
+        'input[name*="mobile" i],input[id*="mobile" i],' +
+        'input[placeholder*="phone" i],input[aria-label*="phone" i]'
+      ).filter(isVisible);
+      for (const inp of inputs) {
+        if (phoneCandidates.includes(inp)) continue;
+        const lbl = (getLabel(inp) || '').toLowerCase();
+        if (/\bphone\b|\bmobile\b|\bcell\b|\btel\b|telephone|contact.*(?:number|\bno\b)/.test(lbl)) {
+          phoneCandidates.push(inp);
+        }
+      }
+      for (const inp of phoneCandidates) {
+        const v = (inp.value || '').trim();
+        if (v) continue; // already has something (likely the country code or user input)
+        const lbl = (getLabel(inp) || inp.name || inp.id || inp.placeholder || '').toLowerCase();
+        /* Skip clearly-country-code-only inputs */
+        if (/country.*code|dial.*code|\bprefix\b|code$/.test(lbl)) continue;
+        if (inp.maxLength > 0 && inp.maxLength <= 5) continue; // short field = code, not number
+        LOG(`sanitize: phone field "${lbl}" → ${p.phone}`);
+        inp.focus(); nativeSet(inp, p.phone); await sleep(40);
       }
     }
 
