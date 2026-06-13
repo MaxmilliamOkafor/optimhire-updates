@@ -2551,6 +2551,189 @@
   }
   watchMissingDetailsDialog();
 
+  /* ── T18-B: Robust "Add Missing Details" modal answerer ───────────────────
+   * OptimHire pops an "Add Missing Details" modal ("AI needs your details
+   * for a few questions") with dropdowns / radios it has no saved answer
+   * for (e.g. "Are you authorised to work in the country…"). If unanswered
+   * it stalls the apply flow. This handler:
+   *   1. Detects the modal by its heading text.
+   *   2. Answers every question control inside it — native <select>,
+   *      custom/React-Select comboboxes, radio groups, and text inputs —
+   *      using guessValue() with a strong Yes/authorized bias for
+   *      work-auth / agreement questions, falling back to the first real
+   *      (non-placeholder) option.
+   *   3. Clicks Submit.
+   *   4. Stall-breaker: if the modal is still up after several attempts,
+   *      clicks "I'll do it later" so the application never hangs.
+   * ─────────────────────────────────────────────────────────────────────── */
+  (function installAddMissingDetailsHandler() {
+    const _attempts = new WeakMap(); // modal element → attempt count
+    const MAX_ATTEMPTS = 4;          // ~ MAX_ATTEMPTS * 2s before "I'll do it later"
+    const HEADING_RE = /add\s+missing\s+details|ai\s+needs\s+your\s+details|needs\s+your\s+details\s+for\s+a\s+few\s+questions/i;
+
+    function findModal() {
+      const cands = $$('[role="dialog"],[class*="modal" i],[class*="Modal" i],[class*="dialog" i],[class*="drawer" i]')
+        .filter(isVisible);
+      for (const c of cands) {
+        const t = (c.textContent || '').slice(0, 600);
+        if (HEADING_RE.test(t)) return c;
+      }
+      /* Fallback: any visible container whose own heading matches */
+      const heads = $$('h1,h2,h3,h4,[role="heading"]').filter(isVisible);
+      for (const h of heads) {
+        if (HEADING_RE.test(h.textContent || '')) {
+          return h.closest('[role="dialog"],[class*="modal" i],[class*="Modal" i],section,div') || h.parentElement;
+        }
+      }
+      return null;
+    }
+
+    function realOptionsOf(sel) {
+      return [...sel.options].filter(o =>
+        o.value && o.value !== '' &&
+        !/^(please\s*select|select(\s*\.\.\.)?|choose|--|n\/?a)$/i.test((o.text || '').trim())
+      );
+    }
+    function selectIsAnswered(sel) {
+      if (!sel.value) return false;
+      const cur = (sel.options[sel.selectedIndex]?.text || '').trim();
+      return !/^(please\s*select|select|choose|--)/i.test(cur);
+    }
+
+    async function answerNativeSelects(modal, p) {
+      let answered = 0;
+      for (const sel of $$('select', modal).filter(isVisible)) {
+        if (selectIsAnswered(sel)) continue;
+        const lbl = getLabel(sel) || '';
+        let v = guessValue(lbl, p);
+        let opt = v ? bestSelectOption(sel, v, lbl) : null;
+        if (!opt && (/authoriz|authoris|eligible|work|visa|sponsor/i.test(lbl) || v === 'authorized'))
+          opt = bestSelectOption(sel, 'yes') || bestSelectOption(sel, 'authoriz') || bestSelectOption(sel, 'eligible');
+        if (!opt && /agree|consent|accept|confirm|acknowledge/i.test(lbl))
+          opt = bestSelectOption(sel, 'yes') || bestSelectOption(sel, 'agree');
+        if (!opt) {
+          /* Last resort: prefer a "Yes"-ish option, else first real option. */
+          const opts = realOptionsOf(sel);
+          opt = opts.find(o => /^yes\b/i.test((o.text || '').trim())) || opts[0];
+        }
+        if (opt) {
+          sel.value = opt.value;
+          sel.dispatchEvent(new Event('input', { bubbles: true }));
+          sel.dispatchEvent(new Event('change', { bubbles: true }));
+          answered++; await sleep(80);
+        }
+      }
+      return answered;
+    }
+
+    async function answerRadios(modal, p) {
+      const groups = {};
+      $$('input[type=radio]', modal).filter(isVisible).forEach(r => {
+        (groups[r.name || r.id || Math.random()] ||= []).push(r);
+      });
+      let answered = 0;
+      for (const key in groups) {
+        const radios = groups[key];
+        if (radios.some(r => r.checked)) continue;
+        const lbl = getLabel(radios[0]) || '';
+        const v = (guessValue(lbl, p) || 'yes').toLowerCase();
+        /* Pick the radio whose own label matches our value, else "Yes". */
+        let pick = radios.find(r => (getLabel(r) || '').toLowerCase().includes(v)) ||
+                   radios.find(r => /^yes\b/i.test((getLabel(r) || '').trim())) ||
+                   radios[0];
+        if (pick) { realClick(pick); answered++; await sleep(80); }
+      }
+      return answered;
+    }
+
+    async function answerCustomCombos(modal, p) {
+      const combos = $$(
+        '[role="combobox"],[class*="react-select__control"],[class*="select2-selection"],' +
+        '[class*="Select__control"],[class*="dropdown-trigger"]', modal
+      ).filter(isVisible);
+      let answered = 0;
+      for (const combo of combos) {
+        const valEl = combo.querySelector('[class*="singleValue"],[class*="single-value"],[class*="Select__single-value"]');
+        const phEl  = combo.querySelector('[class*="placeholder"],[class*="Select__placeholder"]');
+        const looksUnset = !valEl || (phEl && /select|choose|pick/i.test(phEl.textContent || ''));
+        if (!looksUnset) continue;
+        const lbl = getLabel(combo) || getLabel(combo.closest('[class*="field"],[class*="Field"],[class*="form-group"]') || combo) || '';
+        let v = guessValue(lbl, p) || 'Yes';
+        realClick(combo); await sleep(350);
+        const search = combo.querySelector('input') || (combo.tagName === 'INPUT' ? combo : null);
+        if (search) { nativeSet(search, v); await sleep(450); }
+        const listbox = document.querySelector(
+          '[role="listbox"],[class*="react-select__menu"],[class*="Select__menu"],[class*="select2-results"]'
+        );
+        if (listbox) {
+          const opts = $$('[role="option"],[class*="react-select__option"],[class*="Select__option"],[class*="select2-results__option"]', listbox).filter(isVisible);
+          const vl = v.toLowerCase();
+          const best = opts.find(o => o.textContent.toLowerCase().includes(vl)) ||
+                       opts.find(o => /^yes\b/i.test(o.textContent.trim())) ||
+                       opts[0];
+          if (best) { realClick(best); answered++; await sleep(250); }
+          else { document.body.click(); await sleep(150); }
+        }
+      }
+      return answered;
+    }
+
+    async function answerTextInputs(modal, p) {
+      let answered = 0;
+      for (const inp of $$('input:not([type=hidden]):not([type=checkbox]):not([type=radio]):not([type=submit]):not([type=button]),textarea', modal).filter(isVisible)) {
+        if (inp.value && inp.value.trim()) continue;
+        const lbl = getLabel(inp) || '';
+        const v = guessValue(lbl, (p), (inp.type || '').toLowerCase());
+        if (v) { inp.focus(); nativeSet(inp, v); answered++; await sleep(60); }
+      }
+      return answered;
+    }
+
+    function findBtn(modal, re) {
+      return $$('button,[role="button"],input[type=submit]', modal)
+        .find(b => isVisible(b) && !b.disabled &&
+          re.test(((b.innerText || b.value || b.textContent || '') + '').trim()));
+    }
+
+    async function tick() {
+      try {
+        if (!(await isAutomationActive())) return;
+        const modal = findModal();
+        if (!modal) return;
+
+        const n = (_attempts.get(modal) || 0) + 1;
+        _attempts.set(modal, n);
+
+        const p = await getProfile();
+        await answerNativeSelects(modal, p);
+        await answerCustomCombos(modal, p);
+        await answerRadios(modal, p);
+        await answerTextInputs(modal, p);
+        await sleep(300);
+
+        /* Try Submit */
+        const submit = findBtn(modal, /^(submit|save|continue|done|confirm|next)$/i);
+        if (submit) {
+          LOG('Add Missing Details: answered + clicking Submit');
+          realClick(submit);
+          await sleep(400);
+        }
+
+        /* Stall-breaker: still here after MAX_ATTEMPTS → defer it so the
+           application proceeds instead of hanging. */
+        if (n >= MAX_ATTEMPTS && findModal()) {
+          const later = findBtn(modal, /^(i'?ll do it later|do it later|later|skip( question)?)$/i);
+          if (later) {
+            LOG(`Add Missing Details: still stuck after ${n} tries — clicking "I'll do it later"`);
+            realClick(later);
+          }
+        }
+      } catch (_) {}
+    }
+
+    setInterval(tick, 2000);
+  })();
+
   /* ── T17-B: OptimHire "optimhire-missing-details" iframe stall prevention ──
    *
    * When OptimHire encounters custom job questions it doesn't have saved
