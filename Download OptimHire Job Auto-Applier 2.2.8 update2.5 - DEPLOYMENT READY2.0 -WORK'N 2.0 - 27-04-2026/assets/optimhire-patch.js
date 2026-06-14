@@ -1778,27 +1778,67 @@
       'textarea'
     ).filter(isVisible);
 
-    /* ── Email + confirm-email correction ──
-       OptimHire's generic yes/no fill sometimes drops "Yes" into a
-       "Confirm your email" field (seen on SmartRecruiters), which
-       fails validation ("Please provide a valid email address") and
-       stalls the whole application. Force every email field — and any
-       confirm/verify/re-enter email field — to the real email. */
+    /* ── Email + confirm-email correction + empty-required force-fill ──
+       Forces every email field — and any confirm/verify/re-enter email
+       field — to the real email. Also fills empty visible email fields
+       (Workable's email field often had no value after the adapter ran).
+       Detection uses type=email, autocomplete=email, name/id/placeholder,
+       and label match — broadest possible. */
     if (p.email) {
       const EMAIL_RE = /^[^@\s]+@[^@\s]+\.[^@\s]+$/;
+      const emailCandidates = $$(
+        'input[type="email"],input[autocomplete*="email" i],' +
+        'input[name*="email" i],input[id*="email" i],' +
+        'input[placeholder*="email" i],input[aria-label*="email" i]'
+      ).filter(isVisible);
+      /* Also include any labelled "email" input that didn't match attrs */
       for (const inp of inputs) {
-        const itype = (inp.type || '').toLowerCase();
-        const lbl = (getLabel(inp) || inp.name || inp.id || '').toLowerCase();
-        const isEmailField = itype === 'email' || /\be?\s?mail\b/.test(lbl);
-        if (!isEmailField) continue;
+        if (emailCandidates.includes(inp)) continue;
+        const lbl = (getLabel(inp) || '').toLowerCase();
+        if (/\be?\s?mail\b/.test(lbl)) emailCandidates.push(inp);
+      }
+      for (const inp of emailCandidates) {
+        const lbl = (getLabel(inp) || inp.name || inp.id || inp.placeholder || '').toLowerCase();
         const v = (inp.value || '').trim();
         const isConfirm = /confirm|verify|re.?enter|repeat|again/.test(lbl);
-        if (isConfirm || !EMAIL_RE.test(v)) {
-          if (v !== p.email) {
-            LOG(`sanitize: email field "${lbl}" → ${p.email}`);
-            inp.focus(); nativeSet(inp, p.email); await sleep(40);
-          }
+        const shouldFill = !v || isConfirm || !EMAIL_RE.test(v);
+        if (shouldFill && v !== p.email) {
+          LOG(`sanitize: email field "${lbl}" → ${p.email}`);
+          inp.focus(); nativeSet(inp, p.email); await sleep(40);
         }
+      }
+    }
+
+    /* ── Phone force-fill (empty visible phone inputs) ──
+       Workable + similar split phone into [country-code] + [number].
+       The number input is often empty after the adapter because the
+       adapter's .find() filled only the first match (the country code).
+       Force-fill any visible phone input that's empty, EXCLUDING fields
+       that are clearly country-code/prefix-only (their label or value
+       starts with + and is short). */
+    if (p.phone) {
+      const phoneCandidates = $$(
+        'input[type="tel"],input[autocomplete*="tel" i],' +
+        'input[name*="phone" i],input[id*="phone" i],' +
+        'input[name*="mobile" i],input[id*="mobile" i],' +
+        'input[placeholder*="phone" i],input[aria-label*="phone" i]'
+      ).filter(isVisible);
+      for (const inp of inputs) {
+        if (phoneCandidates.includes(inp)) continue;
+        const lbl = (getLabel(inp) || '').toLowerCase();
+        if (/\bphone\b|\bmobile\b|\bcell\b|\btel\b|telephone|contact.*(?:number|\bno\b)/.test(lbl)) {
+          phoneCandidates.push(inp);
+        }
+      }
+      for (const inp of phoneCandidates) {
+        const v = (inp.value || '').trim();
+        if (v) continue; // already has something (likely the country code or user input)
+        const lbl = (getLabel(inp) || inp.name || inp.id || inp.placeholder || '').toLowerCase();
+        /* Skip clearly-country-code-only inputs */
+        if (/country.*code|dial.*code|\bprefix\b|code$/.test(lbl)) continue;
+        if (inp.maxLength > 0 && inp.maxLength <= 5) continue; // short field = code, not number
+        LOG(`sanitize: phone field "${lbl}" → ${p.phone}`);
+        inp.focus(); nativeSet(inp, p.phone); await sleep(40);
       }
     }
 
@@ -2510,6 +2550,189 @@
     }).observe(document.body, { childList: true, subtree: true, attributes: false });
   }
   watchMissingDetailsDialog();
+
+  /* ── T18-B: Robust "Add Missing Details" modal answerer ───────────────────
+   * OptimHire pops an "Add Missing Details" modal ("AI needs your details
+   * for a few questions") with dropdowns / radios it has no saved answer
+   * for (e.g. "Are you authorised to work in the country…"). If unanswered
+   * it stalls the apply flow. This handler:
+   *   1. Detects the modal by its heading text.
+   *   2. Answers every question control inside it — native <select>,
+   *      custom/React-Select comboboxes, radio groups, and text inputs —
+   *      using guessValue() with a strong Yes/authorized bias for
+   *      work-auth / agreement questions, falling back to the first real
+   *      (non-placeholder) option.
+   *   3. Clicks Submit.
+   *   4. Stall-breaker: if the modal is still up after several attempts,
+   *      clicks "I'll do it later" so the application never hangs.
+   * ─────────────────────────────────────────────────────────────────────── */
+  (function installAddMissingDetailsHandler() {
+    const _attempts = new WeakMap(); // modal element → attempt count
+    const MAX_ATTEMPTS = 4;          // ~ MAX_ATTEMPTS * 2s before "I'll do it later"
+    const HEADING_RE = /add\s+missing\s+details|ai\s+needs\s+your\s+details|needs\s+your\s+details\s+for\s+a\s+few\s+questions/i;
+
+    function findModal() {
+      const cands = $$('[role="dialog"],[class*="modal" i],[class*="Modal" i],[class*="dialog" i],[class*="drawer" i]')
+        .filter(isVisible);
+      for (const c of cands) {
+        const t = (c.textContent || '').slice(0, 600);
+        if (HEADING_RE.test(t)) return c;
+      }
+      /* Fallback: any visible container whose own heading matches */
+      const heads = $$('h1,h2,h3,h4,[role="heading"]').filter(isVisible);
+      for (const h of heads) {
+        if (HEADING_RE.test(h.textContent || '')) {
+          return h.closest('[role="dialog"],[class*="modal" i],[class*="Modal" i],section,div') || h.parentElement;
+        }
+      }
+      return null;
+    }
+
+    function realOptionsOf(sel) {
+      return [...sel.options].filter(o =>
+        o.value && o.value !== '' &&
+        !/^(please\s*select|select(\s*\.\.\.)?|choose|--|n\/?a)$/i.test((o.text || '').trim())
+      );
+    }
+    function selectIsAnswered(sel) {
+      if (!sel.value) return false;
+      const cur = (sel.options[sel.selectedIndex]?.text || '').trim();
+      return !/^(please\s*select|select|choose|--)/i.test(cur);
+    }
+
+    async function answerNativeSelects(modal, p) {
+      let answered = 0;
+      for (const sel of $$('select', modal).filter(isVisible)) {
+        if (selectIsAnswered(sel)) continue;
+        const lbl = getLabel(sel) || '';
+        let v = guessValue(lbl, p);
+        let opt = v ? bestSelectOption(sel, v, lbl) : null;
+        if (!opt && (/authoriz|authoris|eligible|work|visa|sponsor/i.test(lbl) || v === 'authorized'))
+          opt = bestSelectOption(sel, 'yes') || bestSelectOption(sel, 'authoriz') || bestSelectOption(sel, 'eligible');
+        if (!opt && /agree|consent|accept|confirm|acknowledge/i.test(lbl))
+          opt = bestSelectOption(sel, 'yes') || bestSelectOption(sel, 'agree');
+        if (!opt) {
+          /* Last resort: prefer a "Yes"-ish option, else first real option. */
+          const opts = realOptionsOf(sel);
+          opt = opts.find(o => /^yes\b/i.test((o.text || '').trim())) || opts[0];
+        }
+        if (opt) {
+          sel.value = opt.value;
+          sel.dispatchEvent(new Event('input', { bubbles: true }));
+          sel.dispatchEvent(new Event('change', { bubbles: true }));
+          answered++; await sleep(80);
+        }
+      }
+      return answered;
+    }
+
+    async function answerRadios(modal, p) {
+      const groups = {};
+      $$('input[type=radio]', modal).filter(isVisible).forEach(r => {
+        (groups[r.name || r.id || Math.random()] ||= []).push(r);
+      });
+      let answered = 0;
+      for (const key in groups) {
+        const radios = groups[key];
+        if (radios.some(r => r.checked)) continue;
+        const lbl = getLabel(radios[0]) || '';
+        const v = (guessValue(lbl, p) || 'yes').toLowerCase();
+        /* Pick the radio whose own label matches our value, else "Yes". */
+        let pick = radios.find(r => (getLabel(r) || '').toLowerCase().includes(v)) ||
+                   radios.find(r => /^yes\b/i.test((getLabel(r) || '').trim())) ||
+                   radios[0];
+        if (pick) { realClick(pick); answered++; await sleep(80); }
+      }
+      return answered;
+    }
+
+    async function answerCustomCombos(modal, p) {
+      const combos = $$(
+        '[role="combobox"],[class*="react-select__control"],[class*="select2-selection"],' +
+        '[class*="Select__control"],[class*="dropdown-trigger"]', modal
+      ).filter(isVisible);
+      let answered = 0;
+      for (const combo of combos) {
+        const valEl = combo.querySelector('[class*="singleValue"],[class*="single-value"],[class*="Select__single-value"]');
+        const phEl  = combo.querySelector('[class*="placeholder"],[class*="Select__placeholder"]');
+        const looksUnset = !valEl || (phEl && /select|choose|pick/i.test(phEl.textContent || ''));
+        if (!looksUnset) continue;
+        const lbl = getLabel(combo) || getLabel(combo.closest('[class*="field"],[class*="Field"],[class*="form-group"]') || combo) || '';
+        let v = guessValue(lbl, p) || 'Yes';
+        realClick(combo); await sleep(350);
+        const search = combo.querySelector('input') || (combo.tagName === 'INPUT' ? combo : null);
+        if (search) { nativeSet(search, v); await sleep(450); }
+        const listbox = document.querySelector(
+          '[role="listbox"],[class*="react-select__menu"],[class*="Select__menu"],[class*="select2-results"]'
+        );
+        if (listbox) {
+          const opts = $$('[role="option"],[class*="react-select__option"],[class*="Select__option"],[class*="select2-results__option"]', listbox).filter(isVisible);
+          const vl = v.toLowerCase();
+          const best = opts.find(o => o.textContent.toLowerCase().includes(vl)) ||
+                       opts.find(o => /^yes\b/i.test(o.textContent.trim())) ||
+                       opts[0];
+          if (best) { realClick(best); answered++; await sleep(250); }
+          else { document.body.click(); await sleep(150); }
+        }
+      }
+      return answered;
+    }
+
+    async function answerTextInputs(modal, p) {
+      let answered = 0;
+      for (const inp of $$('input:not([type=hidden]):not([type=checkbox]):not([type=radio]):not([type=submit]):not([type=button]),textarea', modal).filter(isVisible)) {
+        if (inp.value && inp.value.trim()) continue;
+        const lbl = getLabel(inp) || '';
+        const v = guessValue(lbl, (p), (inp.type || '').toLowerCase());
+        if (v) { inp.focus(); nativeSet(inp, v); answered++; await sleep(60); }
+      }
+      return answered;
+    }
+
+    function findBtn(modal, re) {
+      return $$('button,[role="button"],input[type=submit]', modal)
+        .find(b => isVisible(b) && !b.disabled &&
+          re.test(((b.innerText || b.value || b.textContent || '') + '').trim()));
+    }
+
+    async function tick() {
+      try {
+        if (!(await isAutomationActive())) return;
+        const modal = findModal();
+        if (!modal) return;
+
+        const n = (_attempts.get(modal) || 0) + 1;
+        _attempts.set(modal, n);
+
+        const p = await getProfile();
+        await answerNativeSelects(modal, p);
+        await answerCustomCombos(modal, p);
+        await answerRadios(modal, p);
+        await answerTextInputs(modal, p);
+        await sleep(300);
+
+        /* Try Submit */
+        const submit = findBtn(modal, /^(submit|save|continue|done|confirm|next)$/i);
+        if (submit) {
+          LOG('Add Missing Details: answered + clicking Submit');
+          realClick(submit);
+          await sleep(400);
+        }
+
+        /* Stall-breaker: still here after MAX_ATTEMPTS → defer it so the
+           application proceeds instead of hanging. */
+        if (n >= MAX_ATTEMPTS && findModal()) {
+          const later = findBtn(modal, /^(i'?ll do it later|do it later|later|skip( question)?)$/i);
+          if (later) {
+            LOG(`Add Missing Details: still stuck after ${n} tries — clicking "I'll do it later"`);
+            realClick(later);
+          }
+        }
+      } catch (_) {}
+    }
+
+    setInterval(tick, 2000);
+  })();
 
   /* ── T17-B: OptimHire "optimhire-missing-details" iframe stall prevention ──
    *
@@ -4945,6 +5168,31 @@
     }
   }
 
+  /** Strong "this is a job application form" detector for pages on an
+      UNRECOGNISED ATS (CURRENT_ATS is null). Requires 3+ visible inputs
+      AND (a resume file-upload OR an apply/submit button) so we only
+      auto-fill genuine application forms, never random login/search forms. */
+  function genericApplicationFormPresent() {
+    try {
+      const inputs = document.querySelectorAll(
+        'input:not([type=hidden]):not([type=submit]):not([type=button]),textarea,select'
+      );
+      let vis = 0;
+      for (const el of inputs) {
+        const r = el.getBoundingClientRect();
+        if (r.width > 0 && r.height > 0) { vis++; if (vis >= 3) break; }
+      }
+      if (vis < 3) return false;
+      if (document.querySelector('input[type=file]')) return true;
+      const btns = document.querySelectorAll('button,[role="button"],input[type=submit]');
+      for (const b of btns) {
+        const t = ((b.innerText || b.value || b.textContent || '') + '').trim();
+        if (/\b(apply|submit)\b/i.test(t)) return true;
+      }
+      return false;
+    } catch (_) { return false; }
+  }
+
   /** Run the full auto-trigger flow */
   let _autoTriggered = false;
   let _autoTriggerRunning = false;
@@ -4953,7 +5201,12 @@
     /* Guards */
     if (_autoTriggerRunning) return;
     if (_autoTriggered)      return;
-    if (!CURRENT_ATS)        return;
+    /* On a RECOGNISED ATS we always proceed. On an UNRECOGNISED ATS
+       (CURRENT_ATS null) OptimHire often gives up and shows "fill out
+       manually" — but we still want zero manual work, so we proceed if
+       a genuine application form is present and let the generic
+       autoFillPage() handle it (then T43 auto-submits). */
+    if (!CURRENT_ATS && !genericApplicationFormPresent()) return;
 
     const { csvActiveJobId } = await ST.get('csvActiveJobId');
     if (csvActiveJobId) return; /* CSV bridge handles it */
@@ -5025,8 +5278,24 @@
     }
   }
 
-  /* ── Initial trigger after page load ── */
-  if (CURRENT_ATS) {
+  /* ── Initial trigger after page load ──
+     Run the trigger machinery on recognised ATSes AND on any page whose
+     URL looks like a job application (so unrecognised ATSes like relay /
+     careers-page that OptimHire can't handle still get auto-filled +
+     auto-submitted — zero manual work). autoTriggerAutofill() itself
+     still requires a genuine application form + active automation, so
+     this never fills random pages. */
+  const _APPLY_PATH_RE = /\/(apply|application|jobs?|careers?|join|positions?|openings?|vacanc)/i;
+  /* NEVER run the generic trigger on optimhire.com itself — its own
+     pages (/d/my-jobs, /d/membership, resume/cover-letter editors)
+     contain "jobs" in the path and would otherwise be auto-filled,
+     disturbing OptimHire's own flow. optimhire.com is handled by
+     OptimHire + our T39/T40 clickers, never by the generic autofill. */
+  const _isOptimhire = /optimhire\.com$/i.test(location.hostname) ||
+                       /\.optimhire\.com$/i.test(location.hostname);
+  const _looksApplyPage = !_isOptimhire &&
+    (_APPLY_PATH_RE.test(location.pathname) || _APPLY_PATH_RE.test(location.href));
+  if (CURRENT_ATS || _looksApplyPage) {
     /* First attempt after 2.5 s (most SPAs have rendered by then) */
     sleep(2500).then(() => autoTriggerAutofill());
 
