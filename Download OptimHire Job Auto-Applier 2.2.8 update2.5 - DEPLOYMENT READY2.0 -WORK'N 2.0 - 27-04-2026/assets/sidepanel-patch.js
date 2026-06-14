@@ -706,16 +706,19 @@
   var _mdStartAt = 0;
   var _mdTimerId = null;
   var _mdCountdownEl = null;
+  var _lastMdSkipTs = 0;             // cooldown so we never spam-skip
+  var MD_SKIP_COOLDOWN_MS = 12_000;  // min gap between auto-skips
 
+  /* Specific OptimHire stall phrases ONLY. These are the exact
+     messages OptimHire shows when a job genuinely can't proceed.
+     Kept tight on purpose — an over-generic phrase (e.g. "you have
+     to fill out") matches normal helper text on every job and makes
+     the queue skip everything. */
   var MD_WARNING_PATTERNS = [
     'please fill the missing details',
     'fill the missing details and submit',
     'fill out the form manually',
-    'fill out this form manually',
-    'fill the form manually',
-    'apply to this job manually',
-    'manually to apply to this job',
-    'you have to fill out'
+    'fill the form manually'
   ];
 
   function findWarningContainer() {
@@ -809,6 +812,7 @@
     renderCountdown(remaining);
     if (remaining <= 0) {
       clearMdCountdown();
+      _lastMdSkipTs = Date.now();   // start cooldown so we don't spam-skip
       var btn = findVisibleSkipButton();
       if (btn) {
         try {
@@ -834,6 +838,9 @@
     }
     if (_mdStartAt) return; // already counting
     if (isSubmitSuppressed()) return;
+    /* Cooldown: don't immediately re-arm a new countdown right after a
+       skip — prevents back-to-back spam-skipping across jobs. */
+    if (Date.now() - _lastMdSkipTs < MD_SKIP_COOLDOWN_MS) return;
     _mdStartAt = Date.now();
     renderCountdown(Math.round(MD_TIMEOUT_MS / 1000));
     _mdTimerId = setInterval(tickMdCountdown, 1000);
