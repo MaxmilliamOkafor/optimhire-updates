@@ -887,6 +887,42 @@
     }, 25_000);
   }
 
+  /* ── "All applications completed" auto-resume ─────────────────────────
+   * After a single applied job, OptimHire's server sometimes returns
+   * applicationState === "no-jobs" and the sidepanel shows
+   * "All applications completed! No more matching jobs available at
+   * this time." with a "Back to Main" button. The job pool refreshes
+   * throughout the day, so we auto-click "Back to Main" to resume the
+   * search instead of stalling. Debounced so it can't loop.
+   * ─────────────────────────────────────────────────────────────────── */
+  (function autoResumeOnNoJobs() {
+    var _lastClickTs = 0;
+    var COOLDOWN_MS = 30_000;
+    function tick() {
+      try {
+        var bodyText = (document.body && document.body.innerText || '').toLowerCase();
+        if (bodyText.indexOf('all applications completed') === -1 &&
+            bodyText.indexOf('no more matching jobs') === -1) return;
+        if (Date.now() - _lastClickTs < COOLDOWN_MS) return;
+        var btns = document.querySelectorAll('button,[role="button"]');
+        for (var i = 0; i < btns.length; i++) {
+          var b = btns[i];
+          if (!b || b.disabled) continue;
+          var r = b.getBoundingClientRect();
+          if (r.width === 0 || r.height === 0) continue;
+          var t = ((b.innerText || b.textContent || '') + '').replace(/\s+/g, ' ').trim();
+          if (/^back\s+to\s+main$/i.test(t)) {
+            _lastClickTs = Date.now();
+            try { b.click(); } catch (_) {}
+            addLog('All-applications-completed: clicked Back to Main to resume', '');
+            return;
+          }
+        }
+      } catch (_) {}
+    }
+    setInterval(tick, 3000);
+  })();
+
   /* ── "Please fill the missing details" DOM-driven skip ───────────────────
    * The sidepanel-bundle's own onMessage listener was registered BEFORE
    * our wrap, so the autoSkipSeconds interception doesn't always fire
