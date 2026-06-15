@@ -923,6 +923,91 @@
     setInterval(tick, 3000);
   })();
 
+  /* ── Auto-resume "Start Auto-Applying" when the session stops ─────────
+   * After a few applies, OptimHire's auto-apply session ends on its own
+   * (server-side rate-limit / a 404'd job / transient errors) and the
+   * sidepanel reverts to "We found N matching jobs. Let's start applying."
+   * — forcing manual restart every time. This watcher detects that screen
+   * and clicks Start Auto-Applying to resume.
+   *
+   * Safety gates so we never override the user's intent:
+   *   - Only resume if OH was actually RUNNING in the last 5 minutes
+   *     (via OH's own isAutoProcessStartJob / autoApplyStateUpdate flags).
+   *   - 60s cooldown between resume attempts (no spam).
+   *   - If the user clicked Stop in the last 10 minutes, skip — they
+   *     explicitly halted the session and don't want auto-resume.
+   * ─────────────────────────────────────────────────────────────────── */
+  (function installAutoApplyResume() {
+    var KEY_LAST_RUN = 'ohAutoApplyLastRunTs';
+    var COOLDOWN_MS = 60_000;
+    var RESUME_WINDOW_MS = 5 * 60 * 1000;
+    var USER_STOP_SUPPRESS_MS = 10 * 60 * 1000;
+    var _lastResumeTs = 0;
+    var _lastUserStopTs = 0;
+
+    function btnText(b) {
+      return ((b && (b.innerText || b.textContent) || '') + '').replace(/\s+/g, ' ').trim();
+    }
+    function isStartButton(b) { return /^start\s+auto[-\s]?applying$/i.test(btnText(b)); }
+    function isStopButton(b)  { return /^stop$/i.test(btnText(b)); }
+
+    /* Track user-initiated Stop clicks so we never override an
+       intentional halt. Capture-phase so we see it before React. */
+    document.addEventListener('click', function (e) {
+      try {
+        var b = e.target && (e.target.closest && e.target.closest('button,[role="button"]'));
+        if (b && isStopButton(b)) _lastUserStopTs = Date.now();
+      } catch (_) {}
+    }, true);
+
+    function findStartButton() {
+      var btns = document.querySelectorAll('button,[role="button"]');
+      for (var i = 0; i < btns.length; i++) {
+        var b = btns[i];
+        if (!b || b.disabled) continue;
+        var r = b.getBoundingClientRect();
+        if (r.width === 0 || r.height === 0) continue;
+        if (isStartButton(b)) return b;
+      }
+      return null;
+    }
+
+    function tick() {
+      try {
+        /* User stopped recently → respect that, don't auto-resume. */
+        if (Date.now() - _lastUserStopTs < USER_STOP_SUPPRESS_MS) return;
+
+        chrome.storage.local.get(
+          ['isAutoProcessStartJob', 'autoApplyStateUpdate', KEY_LAST_RUN],
+          function (d) {
+            try {
+              var running = !!d.isAutoProcessStartJob ||
+                            (d.autoApplyStateUpdate && d.autoApplyStateUpdate.isRunning);
+              if (running) {
+                /* Currently running — bump the last-run marker; no resume needed. */
+                chrome.storage.local.set({ [KEY_LAST_RUN]: Date.now() });
+                return;
+              }
+              var lastRun = d[KEY_LAST_RUN] || 0;
+              /* Only resume if we WERE running recently — otherwise the user
+                 just opened the panel and never started, leave it alone. */
+              if (Date.now() - lastRun > RESUME_WINDOW_MS) return;
+              if (Date.now() - _lastResumeTs < COOLDOWN_MS) return;
+              var btn = findStartButton();
+              if (!btn) return;
+              _lastResumeTs = Date.now();
+              try { btn.click(); } catch (_) {}
+              if (typeof addLog === 'function') {
+                addLog('Auto-resumed: clicked Start Auto-Applying', '');
+              }
+            } catch (_) {}
+          }
+        );
+      } catch (_) {}
+    }
+    setInterval(tick, 5000);
+  })();
+
   /* ── "Please fill the missing details" DOM-driven skip ───────────────────
    * The sidepanel-bundle's own onMessage listener was registered BEFORE
    * our wrap, so the autoSkipSeconds interception doesn't always fire
