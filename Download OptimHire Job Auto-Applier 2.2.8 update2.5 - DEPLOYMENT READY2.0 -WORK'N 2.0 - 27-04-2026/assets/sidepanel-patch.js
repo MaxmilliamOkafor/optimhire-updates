@@ -923,27 +923,39 @@
     setInterval(tick, 3000);
   })();
 
-  /* ── Auto-resume "Start Auto-Applying" when the session stops ─────────
-   * After a few applies, OptimHire's auto-apply session ends on its own
-   * (server-side rate-limit / a 404'd job / transient errors) and the
-   * sidepanel reverts to "We found N matching jobs. Let's start applying."
-   * — forcing manual restart every time. This watcher detects that screen
-   * and clicks Start Auto-Applying to resume.
+  /* ── Keep Auto-Apply running until genuinely complete ────────────────
+   * OptimHire's session ends on its own after a few applies (a 404'd
+   * job, a transient backend error, etc.) and reverts to the start
+   * screen "We found N matching jobs. Let's start applying." The user
+   * wants it to KEEP GOING until everything is actually applied — not
+   * end early. So we hold a persistent "engaged" flag and re-click
+   * Start Auto-Applying whenever the session has stopped but isn't truly
+   * complete.
    *
-   * Safety gates so we never override the user's intent:
-   *   - Only resume if OH was actually RUNNING in the last 5 minutes
-   *     (via OH's own isAutoProcessStartJob / autoApplyStateUpdate flags).
-   *   - 60s cooldown between resume attempts (no spam).
-   *   - If the user clicked Stop in the last 10 minutes, skip — they
-   *     explicitly halted the session and don't want auto-resume.
+   * Engaged is set TRUE when the user starts (or whenever OH reports it
+   * running) and only cleared when the user clicks Stop. While engaged:
+   *   - if OH is running → do nothing (let it work),
+   *   - if OH stopped but the start screen is showing (jobs remain) →
+   *     click Start Auto-Applying to resume,
+   *   - genuine completion ("All applications completed", no jobs) shows
+   *     a different screen with no Start button, so we naturally idle
+   *     there while the Back-to-Main watcher re-searches for new jobs.
+   * No time window — it persists until the user explicitly Stops.
    * ─────────────────────────────────────────────────────────────────── */
   (function installAutoApplyResume() {
-    var KEY_LAST_RUN = 'ohAutoApplyLastRunTs';
+    var KEY_ENGAGED = 'ohAutoApplyEngaged';
     var COOLDOWN_MS = 60_000;
-    var RESUME_WINDOW_MS = 5 * 60 * 1000;
-    var USER_STOP_SUPPRESS_MS = 10 * 60 * 1000;
     var _lastResumeTs = 0;
-    var _lastUserStopTs = 0;
+    var _engaged = false;
+
+    chrome.storage.local.get([KEY_ENGAGED], function (d) {
+      _engaged = !!(d && d[KEY_ENGAGED]);
+    });
+    function setEngaged(v) {
+      if (_engaged === v) return;
+      _engaged = v;
+      try { chrome.storage.local.set({ [KEY_ENGAGED]: v }); } catch (_) {}
+    }
 
     function btnText(b) {
       return ((b && (b.innerText || b.textContent) || '') + '').replace(/\s+/g, ' ').trim();
@@ -951,12 +963,13 @@
     function isStartButton(b) { return /^start\s+auto[-\s]?applying$/i.test(btnText(b)); }
     function isStopButton(b)  { return /^stop$/i.test(btnText(b)); }
 
-    /* Track user-initiated Stop clicks so we never override an
-       intentional halt. Capture-phase so we see it before React. */
+    /* Capture-phase so we record intent before React acts. */
     document.addEventListener('click', function (e) {
       try {
         var b = e.target && (e.target.closest && e.target.closest('button,[role="button"]'));
-        if (b && isStopButton(b)) _lastUserStopTs = Date.now();
+        if (!b) return;
+        if (isStartButton(b)) setEngaged(true);   // user started → stay engaged
+        else if (isStopButton(b)) setEngaged(false); // user stopped → disengage
       } catch (_) {}
     }, true);
 
@@ -974,31 +987,21 @@
 
     function tick() {
       try {
-        /* User stopped recently → respect that, don't auto-resume. */
-        if (Date.now() - _lastUserStopTs < USER_STOP_SUPPRESS_MS) return;
-
         chrome.storage.local.get(
-          ['isAutoProcessStartJob', 'autoApplyStateUpdate', KEY_LAST_RUN],
+          ['isAutoProcessStartJob', 'autoApplyStateUpdate'],
           function (d) {
             try {
               var running = !!d.isAutoProcessStartJob ||
                             (d.autoApplyStateUpdate && d.autoApplyStateUpdate.isRunning);
-              if (running) {
-                /* Currently running — bump the last-run marker; no resume needed. */
-                chrome.storage.local.set({ [KEY_LAST_RUN]: Date.now() });
-                return;
-              }
-              var lastRun = d[KEY_LAST_RUN] || 0;
-              /* Only resume if we WERE running recently — otherwise the user
-                 just opened the panel and never started, leave it alone. */
-              if (Date.now() - lastRun > RESUME_WINDOW_MS) return;
+              if (running) { setEngaged(true); return; } // running → engaged, let it work
+              if (!_engaged) return;                     // never started / user stopped
               if (Date.now() - _lastResumeTs < COOLDOWN_MS) return;
               var btn = findStartButton();
-              if (!btn) return;
+              if (!btn) return;                          // not on the start screen → idle
               _lastResumeTs = Date.now();
               try { btn.click(); } catch (_) {}
               if (typeof addLog === 'function') {
-                addLog('Auto-resumed: clicked Start Auto-Applying', '');
+                addLog('Auto-resume: session stopped early — clicked Start Auto-Applying', '');
               }
             } catch (_) {}
           }
@@ -1419,7 +1422,7 @@
         'color:#e2e8f0;font-size:12px;';
       card.innerHTML =
         '<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px">' +
-          '<div style="font-weight:600;color:#c4b5fd;font-size:13.5px">My Job Queue</div>' +
+          '<div style="font-weight:600;color:#c4b5fd;font-size:13.5px">Job Queue Manager</div>' +
           '<div style="display:flex;align-items:center;gap:6px">' +
             '<span id="oh-qc-indicator" style="display:none;font-size:10.5px;color:#38bdf8;' +
               'background:rgba(56,189,248,.15);padding:2px 8px;border-radius:10px;font-weight:600">RUNNING</span>' +
