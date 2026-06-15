@@ -209,21 +209,13 @@
     }
   }
 
-  /** Real pointer + mouse click sequence. Modern React/Radix/Headless
-   *  components listen on pointerdown/pointerup (not just mouse events),
-   *  so we fire both — makes custom dropdowns, comboboxes and toggle
-   *  buttons respond reliably. */
+  /** Real pointer-events click sequence (unchanged proven behaviour). */
   function realClick(el) {
     if (!el) return;
-    const o = { bubbles: true, cancelable: true, composed: true };
-    try { el.dispatchEvent(new MouseEvent('mouseover', o)); } catch (_) {}
-    try { el.dispatchEvent(new PointerEvent('pointerover', o)); } catch (_) {}
-    try { el.dispatchEvent(new PointerEvent('pointerdown', o)); } catch (_) {}
-    try { el.dispatchEvent(new MouseEvent('mousedown', o)); } catch (_) {}
-    try { el.focus && el.focus(); } catch (_) {}
-    try { el.dispatchEvent(new PointerEvent('pointerup', o)); } catch (_) {}
-    try { el.dispatchEvent(new MouseEvent('mouseup', o)); } catch (_) {}
-    try { el.click(); } catch (_) {}
+    el.dispatchEvent(new MouseEvent('mouseover', { bubbles: true }));
+    el.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+    el.dispatchEvent(new MouseEvent('mouseup',   { bubbles: true }));
+    el.click();
   }
 
   function isVisible(el) {
