@@ -149,21 +149,67 @@
   const $$  = (s, c = document) => [...c.querySelectorAll(s)];
   const sleep = ms => new Promise(r => setTimeout(r, ms));
 
-  /** React-compatible value setter */
-  function nativeSet(el, val) {
+  /** React/Angular/Vue-compatible value setter.
+   *
+   * Technique adapted from Simplify Copilot's autofill: the most reliable
+   * way to set a value that a framework actually registers is
+   * document.execCommand("insertText") — it produces a REAL text-insertion
+   * the framework's own input listeners receive (React's value tracker sees
+   * a genuine input event, so controlled inputs keep the value instead of
+   * reverting it). Plain `.value = x` is silently reverted by React on many
+   * forms — which is exactly why phone/email/typeahead fields were failing.
+   *
+   * Order: focus → select existing → execCommand insertText → if that
+   * didn't take, fall back to the native prototype value setter → then
+   * dispatch the full keyboard/input/change event sequence either way. */
+  function _protoValueSet(el, val) {
     try {
       const proto = el.tagName === 'TEXTAREA'
         ? window.HTMLTextAreaElement.prototype
         : window.HTMLInputElement.prototype;
       const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
       if (setter) setter.call(el, val); else el.value = val;
-    } catch (_) { el.value = val; }
-    el.dispatchEvent(new Event('input',  { bubbles: true }));
-    el.dispatchEvent(new Event('change', { bubbles: true }));
-    el.dispatchEvent(new Event('blur',   { bubbles: true }));
+    } catch (_) { try { el.value = val; } catch (__) {} }
+  }
+  function nativeSet(el, val) {
+    if (!el) return;
+    val = (val == null) ? '' : String(val);
+    let ok = false;
+    try {
+      el.focus();
+      /* execCommand insertText works on <input>/<textarea>/contenteditable
+         and fires the framework's listeners naturally. Select existing
+         content first so the insert REPLACES rather than appends. */
+      if (typeof el.select === 'function') { try { el.select(); } catch (_) {} }
+      if (document.activeElement === el && typeof document.execCommand === 'function') {
+        ok = document.execCommand('insertText', false, val);
+        /* execCommand reports true but some inputs still need an explicit
+           value (e.g. when selection was empty) — verify and fix. */
+        if (ok && el.value !== val && 'value' in el) ok = (el.value === val);
+      }
+    } catch (_) { ok = false; }
+
+    if (!ok) {
+      _protoValueSet(el, val);
+      try { el.setAttribute && el.setAttribute('value', val); } catch (_) {}
+    }
+
+    /* Full event sequence so every framework + native validation reacts. */
+    try {
+      const opts = { bubbles: true, cancelable: true };
+      el.dispatchEvent(new KeyboardEvent('keydown', opts));
+      el.dispatchEvent(new KeyboardEvent('keypress', opts));
+      el.dispatchEvent(new InputEvent('input', { bubbles: true, cancelable: true, inputType: 'insertText', data: val }));
+      el.dispatchEvent(new KeyboardEvent('keyup', opts));
+      el.dispatchEvent(new Event('change', { bubbles: true }));
+    } catch (_) {
+      /* Older event-constructor fallback */
+      try { el.dispatchEvent(new Event('input',  { bubbles: true })); } catch (__) {}
+      try { el.dispatchEvent(new Event('change', { bubbles: true })); } catch (__) {}
+    }
   }
 
-  /** Real pointer-events click sequence */
+  /** Real pointer-events click sequence (unchanged proven behaviour). */
   function realClick(el) {
     if (!el) return;
     el.dispatchEvent(new MouseEvent('mouseover', { bubbles: true }));
@@ -745,22 +791,6 @@
         return node;
       }
       return node;
-    }
-
-    /* Auto-click "Continue with Free" so the upgrade pricing modal
-       dismisses itself when daily credits trigger it. */
-    function tryClickContinueWithFree() {
-      const btns = document.querySelectorAll('button, [role="button"], a');
-      for (const b of btns) {
-        if (!b || b.disabled) continue;
-        const r = b.getBoundingClientRect();
-        if (r.width === 0 || r.height === 0) continue;
-        const t = ((b.innerText || b.textContent || '') + '').replace(/\s+/g,' ').trim();
-        if (/^continue\s+with\s+free$/i.test(t)) {
-          try { b.click(); return true; } catch (_) {}
-        }
-      }
-      return false;
     }
 
     function tick() {
@@ -5835,12 +5865,26 @@
       try {
         const ua = new URL(a), ub = new URL(b);
         if (ua.hostname.toLowerCase() !== ub.hostname.toLowerCase()) return false;
-        /* Match on hostname + first path segment so post-submit
-           redirects (/jobs/123/apply → /jobs/123/thanks) still match. */
+        /* Compare the full path segment-by-segment so two DIFFERENT jobs
+           on the same board (…/acme/jobs/111 vs …/acme/jobs/222) are NOT
+           treated as the same job — that previously let a parallel tab
+           attach to the wrong job and write its status. We still tolerate
+           a post-submit redirect where only the LAST step changes
+           (…/jobs/123/apply → …/jobs/123/thanks) by allowing the final
+           compared segment to differ when it's an action/step word. */
         const pa = ua.pathname.split('/').filter(Boolean);
         const pb = ub.pathname.split('/').filter(Boolean);
         if (!pa.length || !pb.length) return true;
-        return pa[0] === pb[0];
+        const ACTION = /^(apply|application|apply-now|start|step\d*|thanks|thank-you|thankyou|success|confirm|confirmation|complete|completed|received|submitted|submit|done|review|finish)$/i;
+        const n = Math.min(pa.length, pb.length);
+        for (let i = 0; i < n; i++) {
+          if (pa[i] === pb[i]) continue;
+          /* Only the final compared segment may differ, and only if it
+             looks like an apply/confirmation step — never a job id. */
+          if (i === n - 1 && (ACTION.test(pa[i]) || ACTION.test(pb[i]))) continue;
+          return false;
+        }
+        return true;
       } catch (_) { return false; }
     }
 
