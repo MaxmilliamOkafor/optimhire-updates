@@ -793,22 +793,6 @@
       return node;
     }
 
-    /* Auto-click "Continue with Free" so the upgrade pricing modal
-       dismisses itself when daily credits trigger it. */
-    function tryClickContinueWithFree() {
-      const btns = document.querySelectorAll('button, [role="button"], a');
-      for (const b of btns) {
-        if (!b || b.disabled) continue;
-        const r = b.getBoundingClientRect();
-        if (r.width === 0 || r.height === 0) continue;
-        const t = ((b.innerText || b.textContent || '') + '').replace(/\s+/g,' ').trim();
-        if (/^continue\s+with\s+free$/i.test(t)) {
-          try { b.click(); return true; } catch (_) {}
-        }
-      }
-      return false;
-    }
-
     function tick() {
       try {
         const nodes = document.querySelectorAll('h1,h2,h3,h4,p,li,span,div,a,button');
@@ -5881,12 +5865,26 @@
       try {
         const ua = new URL(a), ub = new URL(b);
         if (ua.hostname.toLowerCase() !== ub.hostname.toLowerCase()) return false;
-        /* Match on hostname + first path segment so post-submit
-           redirects (/jobs/123/apply → /jobs/123/thanks) still match. */
+        /* Compare the full path segment-by-segment so two DIFFERENT jobs
+           on the same board (…/acme/jobs/111 vs …/acme/jobs/222) are NOT
+           treated as the same job — that previously let a parallel tab
+           attach to the wrong job and write its status. We still tolerate
+           a post-submit redirect where only the LAST step changes
+           (…/jobs/123/apply → …/jobs/123/thanks) by allowing the final
+           compared segment to differ when it's an action/step word. */
         const pa = ua.pathname.split('/').filter(Boolean);
         const pb = ub.pathname.split('/').filter(Boolean);
         if (!pa.length || !pb.length) return true;
-        return pa[0] === pb[0];
+        const ACTION = /^(apply|application|apply-now|start|step\d*|thanks|thank-you|thankyou|success|confirm|confirmation|complete|completed|received|submitted|submit|done|review|finish)$/i;
+        const n = Math.min(pa.length, pb.length);
+        for (let i = 0; i < n; i++) {
+          if (pa[i] === pb[i]) continue;
+          /* Only the final compared segment may differ, and only if it
+             looks like an apply/confirmation step — never a job id. */
+          if (i === n - 1 && (ACTION.test(pa[i]) || ACTION.test(pb[i]))) continue;
+          return false;
+        }
+        return true;
       } catch (_) { return false; }
     }
 
