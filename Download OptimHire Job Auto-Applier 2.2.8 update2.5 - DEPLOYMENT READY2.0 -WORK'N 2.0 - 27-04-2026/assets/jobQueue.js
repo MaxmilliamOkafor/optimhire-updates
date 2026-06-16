@@ -217,9 +217,37 @@
       .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
       .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
   }
+  /* Keep the bulk-action bar in sync with the selection in EVERY render
+     path (selecting, filtering to an empty view, deleting, etc.). */
+  function updateBulkBar() {
+    const bulk = document.getElementById('bulkActions');
+    if (!bulk) return;
+    /* Drop selections for jobs that no longer exist (deleted/cleared). */
+    if (selectedIds.size) {
+      const live = new Set(queue.map(j => j.id));
+      for (const id of [...selectedIds]) if (!live.has(id)) selectedIds.delete(id);
+    }
+    if (selectedIds.size) {
+      bulk.classList.add('visible');
+      const cnt = document.getElementById('bulkCount');
+      if (cnt) cnt.textContent = selectedIds.size + ' selected';
+    } else {
+      bulk.classList.remove('visible');
+    }
+  }
+  /* Reflect selection on the header "select all" checkbox: checked when
+     every visible job is selected, indeterminate on a partial selection. */
+  function syncSelectAll(visible) {
+    const all = document.getElementById('selectAll');
+    if (!all) return;
+    const sel = visible.filter(j => selectedIds.has(j.id)).length;
+    all.checked = visible.length > 0 && sel === visible.length;
+    all.indeterminate = sel > 0 && sel < visible.length;
+  }
   function render() {
     renderStats();
     renderAtsFilter();
+    updateBulkBar();
     const tbody = document.getElementById('jobsTbody');
     const empty = document.getElementById('emptyState');
     const visible = visibleJobs();
@@ -227,12 +255,14 @@
       tbody.innerHTML = '';
       empty.classList.remove('hidden');
       document.getElementById('jobsTable').style.display = 'none';
+      syncSelectAll(visible);
       return;
     }
     empty.classList.add('hidden');
     document.getElementById('jobsTable').style.display = '';
     if (!visible.length) {
       tbody.innerHTML = `<tr><td colspan="10" class="empty" style="padding:30px">No jobs match the current filter.</td></tr>`;
+      syncSelectAll(visible);
       return;
     }
     const rows = visible.map((j, idx) => {
@@ -258,13 +288,8 @@
       </tr>`;
     });
     tbody.innerHTML = rows.join('');
-    const bulk = document.getElementById('bulkActions');
-    if (selectedIds.size) {
-      bulk.classList.add('visible');
-      document.getElementById('bulkCount').textContent = selectedIds.size + ' selected';
-    } else {
-      bulk.classList.remove('visible');
-    }
+    updateBulkBar();
+    syncSelectAll(visible);
   }
   function truncate(s, n) { return s.length > n ? s.slice(0, n - 1) + '…' : s; }
 
