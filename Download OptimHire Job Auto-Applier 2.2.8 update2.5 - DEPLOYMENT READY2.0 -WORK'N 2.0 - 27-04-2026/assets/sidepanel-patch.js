@@ -709,6 +709,33 @@
   var _lastMdSkipTs = 0;             // cooldown so we never spam-skip
   var MD_SKIP_COOLDOWN_MS = 12_000;  // min gap between auto-skips
 
+  /* ── Stuck-job circuit breaker ──────────────────────────────────────────
+   * When OptimHire is broken on a particular job (e.g. a Lever 404 / the
+   * same job served over and over), the missing-details warning never
+   * clears, so we'd auto-skip it again every cooldown — driving the
+   * "X of Y applied" counter up (185→186→187…) while the page never
+   * actually changes. Detect that runaway loop: if we auto-skip more than
+   * MD_BURST_MAX times inside MD_BURST_WINDOW_MS, we're clearly stuck →
+   * stop auto-skipping for MD_BREAKER_COOLDOWN_MS and attempt ONE real
+   * recovery (Back to Main → re-start) so OptimHire fetches a fresh batch
+   * instead of thrashing the same broken job. */
+  var _mdSkipTimes = [];                  // recent auto-skip timestamps
+  var MD_BURST_WINDOW_MS = 60_000;        // look-back window
+  var MD_BURST_MAX = 3;                   // > this many skips in window = stuck loop
+  var _mdBreakerUntil = 0;                // suppress auto-skip until this ts
+  var MD_BREAKER_COOLDOWN_MS = 120_000;   // how long to back off when stuck
+  var _mdLastEscalateTs = 0;
+  /* Consecutive auto-skips where the warning never sustainedly cleared.
+     This catches a SLOW stuck-loop: now that the 12s cooldown actually
+     holds, a broken job is only re-skipped ~once per ~27s — too slow to
+     trip the 60s rate window, but it would still climb the counter
+     forever. If we skip the same unchanged warning MD_MAX_CONSECUTIVE
+     times in a row without it ever going away, we're stuck. */
+  var _mdConsecutiveSkips = 0;
+  var MD_MAX_CONSECUTIVE = 3;
+  var _mdWarningGoneSince = 0;            // when the warning first went absent
+  var MD_CLEAR_GRACE_MS = 4_000;          // absent this long ⇒ genuinely advanced
+
   /* Specific OptimHire stall phrases ONLY. These are the exact
      messages OptimHire shows when a job genuinely can't proceed.
      Kept tight on purpose — an over-generic phrase (e.g. "you have
@@ -718,8 +745,64 @@
     'please fill the missing details',
     'fill the missing details and submit',
     'fill out the form manually',
-    'fill the form manually'
+    'fill the form manually',
+    'job auto-applier needs your preferences'
   ];
+
+  /* Count an auto-skip and report whether we've tripped the stuck-loop
+     breaker. Called right before each real skip fires. Trips on EITHER a
+     fast burst (rate window) OR a slow loop (too many consecutive skips
+     without the warning ever clearing). */
+  function noteAutoSkipAndCheckBreaker() {
+    var now = Date.now();
+    _mdSkipTimes.push(now);
+    _mdSkipTimes = _mdSkipTimes.filter(function (t) { return now - t < MD_BURST_WINDOW_MS; });
+    _mdConsecutiveSkips++;
+    var stuck = (_mdSkipTimes.length > MD_BURST_MAX) ||
+                (_mdConsecutiveSkips > MD_MAX_CONSECUTIVE);
+    if (stuck) {
+      _mdBreakerUntil = now + MD_BREAKER_COOLDOWN_MS;
+      _mdSkipTimes = [];
+      _mdConsecutiveSkips = 0;
+      try { addLog('Stuck on a job that can’t auto-complete — pausing auto-skip ' +
+                   Math.round(MD_BREAKER_COOLDOWN_MS / 1000) + 's and recovering', ''); } catch (_) {}
+      escalateStuckJob();
+      return true;  // breaker tripped — caller should NOT skip again now
+    }
+    return false;
+  }
+
+  /* Called when the warning has been absent for MD_CLEAR_GRACE_MS — i.e.
+     a skip genuinely advanced us to a different job. Reset the consecutive
+     counter so legitimately-consecutive different jobs never trip the
+     breaker; only an unchanging, never-clearing warning does. */
+  function noteWarningGenuinelyCleared() {
+    _mdConsecutiveSkips = 0;
+  }
+
+  /* One real recovery attempt when stuck in a skip-loop: click a visible
+     "Back to Main" button if present (OptimHire then lets us re-start the
+     search on a fresh batch via installAutoApplyResume). Rate-limited so
+     it can't itself loop. */
+  function escalateStuckJob() {
+    var now = Date.now();
+    if (now - _mdLastEscalateTs < MD_BREAKER_COOLDOWN_MS) return;
+    _mdLastEscalateTs = now;
+    try {
+      var btns = document.querySelectorAll('button, [role="button"], a');
+      for (var i = 0; i < btns.length; i++) {
+        var b = btns[i];
+        if (!b) continue;
+        var r = b.getBoundingClientRect();
+        if (r.width === 0 || r.height === 0) continue;
+        var t = ((b.innerText || b.textContent || '') + '').replace(/\s+/g, ' ').trim().toLowerCase();
+        if (t === 'back to main' || t === 'back to home' || t === 'go to dashboard') {
+          try { b.click(); addLog('Stuck-recovery: clicked "Back to Main" for a fresh batch', ''); } catch (_) {}
+          return;
+        }
+      }
+    } catch (_) {}
+  }
 
   function findWarningContainer() {
     var nodes = document.querySelectorAll('h1,h2,h3,h4,p,span,div');
@@ -813,6 +896,10 @@
     if (remaining <= 0) {
       clearMdCountdown();
       _lastMdSkipTs = Date.now();   // start cooldown so we don't spam-skip
+      /* If we're in a runaway skip-loop on a stuck/broken job, trip the
+         breaker and run ONE recovery instead of skipping (which would
+         just inflate the counter on the same page again). */
+      if (noteAutoSkipAndCheckBreaker()) return;
       var btn = findVisibleSkipButton();
       if (btn) {
         try {
@@ -834,10 +921,20 @@
     var visible = !!findWarningContainer();
     if (!visible) {
       if (_mdStartAt || _mdCountdownEl) clearMdCountdown();
+      /* Warning gone. If it stays gone for MD_CLEAR_GRACE_MS we genuinely
+         advanced to a new job → reset the consecutive-skip counter so the
+         next stuck job is judged on its own. A brief flicker between the
+         skip click and the re-render does NOT reset it. */
+      if (!_mdWarningGoneSince) _mdWarningGoneSince = Date.now();
+      else if (Date.now() - _mdWarningGoneSince >= MD_CLEAR_GRACE_MS) noteWarningGenuinelyCleared();
       return;
     }
+    _mdWarningGoneSince = 0; // warning present again → not cleared
     if (_mdStartAt) return; // already counting
     if (isSubmitSuppressed()) return;
+    /* Stuck-loop breaker tripped → stop auto-skipping this broken job for
+       a while so the counter can't keep climbing on an unchanged page. */
+    if (Date.now() < _mdBreakerUntil) return;
     /* Cooldown: don't immediately re-arm a new countdown right after a
        skip — prevents back-to-back spam-skipping across jobs. */
     if (Date.now() - _lastMdSkipTs < MD_SKIP_COOLDOWN_MS) return;
@@ -1069,56 +1166,19 @@
     return false;
   }
 
-  function checkMissingDetails() {
-    var visible = isMissingDetailsVisible();
-    if (!visible) {
-      /* Warning gone — clear the pending timer */
-      if (_missingTimer) { clearTimeout(_missingTimer); _missingTimer = null; }
-      _missingShownAt = 0;
-      return;
-    }
-    if (_missingTimer || _missingShownAt) return; // already armed
-    if (isSubmitSuppressed()) return;
-    _missingShownAt = Date.now();
-    _missingTimer = setTimeout(function () {
-      _missingTimer = null;
-      if (isSubmitSuppressed()) { _missingShownAt = 0; return; }
-      if (!isMissingDetailsVisible()) { _missingShownAt = 0; return; }
-      var btn = findSkipButton();
-      if (btn) {
-        try {
-          btn.dispatchEvent(new MouseEvent('mouseover', { bubbles: true }));
-          btn.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
-          btn.dispatchEvent(new MouseEvent('mouseup',   { bubbles: true }));
-          btn.click();
-        } catch (_) { try { btn.click(); } catch (__) {} }
-        addLog('Missing-details: clicked Skip', '');
-      } else {
-        try { chrome.runtime.sendMessage({ action: 'skipCurrent' }).catch(function () {}); }
-        catch (_) {}
-        addLog('Missing-details: sent skipCurrent (no Skip button)', '');
-      }
-      _missingShownAt = 0;
-    }, MISSING_DETAILS_TIMEOUT_MS);
-  }
-
-  /* Run on a tight poll + on every DOM mutation */
-  setInterval(checkMissingDetails, 600);
-  if (document.body) {
-    try {
-      new MutationObserver(checkMissingDetails).observe(document.body, {
-        childList: true, subtree: true, characterData: true
-      });
-    } catch (_) {}
-  } else {
-    document.addEventListener('DOMContentLoaded', function () {
-      try {
-        new MutationObserver(checkMissingDetails).observe(document.body, {
-          childList: true, subtree: true, characterData: true
-        });
-      } catch (_) {}
-    });
-  }
+  /* ── NOTE: the duplicate `checkMissingDetails` handler that used to live
+   * here has been removed. It was a SECOND function with the same name as
+   * the countdown-based handler above; because function declarations hoist,
+   * this one silently overrode the good one — and it had NO per-skip
+   * cooldown, so it re-armed immediately every tick. When OptimHire got
+   * stuck on a broken job, that caused back-to-back skips that inflated the
+   * "X of Y applied" counter (185→186→187…) while the page never changed.
+   * The single surviving handler above keeps the countdown UI, the 12s
+   * cooldown, and the stuck-loop circuit breaker. Its unique phrase
+   * ("job auto-applier needs your preferences") was merged into
+   * MD_WARNING_PATTERNS so no coverage was lost. The helper functions
+   * findSkipButton / isMissingDetailsVisible / MISSING_PATTERNS remain
+   * defined above but are now unused. */
 
   chrome.runtime.onMessage.addListener(function (msg) {
     if (!msg) return;
