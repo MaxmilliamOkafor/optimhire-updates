@@ -41,6 +41,17 @@
     "content_scripts": [
         {
             "matches": [
+                "<all_urls>"
+            ],
+            "js": [
+                "assets/debug-logger.js"
+            ],
+            "all_frames": false,
+            "run_at": "document_start",
+            "css": []
+        },
+        {
+            "matches": [
                 "https://*.optimhire.com/*"
             ],
             "js": [

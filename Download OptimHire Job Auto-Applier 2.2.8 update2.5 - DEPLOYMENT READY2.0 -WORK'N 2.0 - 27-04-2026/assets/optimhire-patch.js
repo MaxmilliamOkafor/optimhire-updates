@@ -143,7 +143,20 @@
   } catch (_) {}
 
   /* ── Helpers ───────────────────────────────────────────── */
-  const LOG = (...a) => console.log('[OH-Patch]', ...a);
+  const LOG = (...a) => {
+    /* Console first (preserves the existing dev-tools workflow). */
+    console.log('[OH-Patch]', ...a);
+    /* Mirror to the debug ring buffer so the viewer in tabs/debug.html
+       sees every patch event without us scattering OH_DEBUG calls
+       throughout this file. */
+    try {
+      if (window.OH_DEBUG) {
+        const first = a[0];
+        const rest  = a.slice(1);
+        window.OH_DEBUG.log('patch', typeof first === 'string' ? first : String(first), rest.length ? rest : undefined);
+      }
+    } catch (_) {}
+  };
   const ST  = chrome.storage.local;
   const $   = (s, c = document) => c.querySelector(s);
   const $$  = (s, c = document) => [...c.querySelectorAll(s)];
