@@ -652,7 +652,7 @@
         _forceSkipJobKey = '';
         return;
       }
-      chrome.runtime.sendMessage({ action: 'skipCurrent' }).catch(function () {});
+      forceAdvanceSkip('Auto-skip timer elapsed');
       _forceSkipJobKey = '';
     }, (AUTO_SKIP_MAX + 1) * 1000);
   }
@@ -841,6 +841,30 @@
     return null;
   }
 
+  /* Force OptimHire to advance to the next job. The debug logs proved
+     that chrome.runtime.sendMessage({action:'skipCurrent'}) does NOT
+     reliably advance OptimHire when it's stuck in the 'missing-questions'
+     blocked state — it just sits on OptimHire's own ~120s auto-skip
+     timer (the freeze the user kept hitting). Clicking the REAL Skip
+     button in the sidepanel DOES advance it. So we click the button
+     first and only fall back to the message if no button is present. */
+  function forceAdvanceSkip(reason) {
+    var btn = findVisibleSkipButton();
+    if (btn) {
+      try {
+        btn.dispatchEvent(new MouseEvent('mouseover', { bubbles: true }));
+        btn.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+        btn.dispatchEvent(new MouseEvent('mouseup',   { bubbles: true }));
+        btn.click();
+      } catch (_) { try { btn.click(); } catch (__) {} }
+      addLog((reason ? reason + ' — ' : '') + 'clicked Skip to advance', '');
+      return true;
+    }
+    try { chrome.runtime.sendMessage({ action: 'skipCurrent' }).catch(function () {}); } catch (_) {}
+    addLog((reason ? reason + ' — ' : '') + 'sent skipCurrent (no Skip button found)', '');
+    return false;
+  }
+
   function renderCountdown(remaining) {
     /* Find the actual Skip button container so we can insert the
        countdown text right below it where it belongs. */
@@ -988,10 +1012,89 @@
         resetWatchdog(key + '_retry');
         return;
       }
-      chrome.runtime.sendMessage({ action: 'skipCurrent' }).catch(function () {});
+      forceAdvanceSkip('Stuck 25s with no progress');
       _watchdogJobKey = '';
     }, 25_000);
   }
+
+  /* ── Blocked-state FAST skip ──────────────────────────────────────────
+   * Root cause of the long freezes (confirmed from the debug export):
+   * OptimHire enters applicationState 'missing-questions' with
+   * "Required fields are missing or invalid - submission blocked" and
+   * then sits on its OWN ~120-second auto-skip timer (autoSkipSeconds:126
+   * in the snapshot). Our skipCurrent message doesn't move it, so the
+   * user had to skip by hand. Here we watch OptimHire's own state object
+   * (autoApplyState) and, once the blocked state is STABLE for a few
+   * seconds (so we never skip a job that's still being answered/filled),
+   * click the real Skip button to advance immediately. Feeds the same
+   * stuck-loop breaker so an unrecoverable job can't loop. */
+  (function installBlockedStateFastSkip() {
+    var BLOCKED_STABLE_MS  = 6_000;   // confirm the block is real, not transient
+    var SKIP_COOLDOWN_MS   = 8_000;   // min gap between blocked-state skips
+    var _blockedSince      = 0;
+    var _blockedKey        = '';
+    var _lastBlockedSkipTs = 0;
+
+    var BLOCK_MSG_RE = /required fields are missing or invalid|submission blocked|missing or invalid/i;
+
+    function isBlocked(st) {
+      if (!st || typeof st !== 'object') return false;
+      var state = st.applicationState || '';
+      var err   = st.errorType || '';
+      var msg   = String(st.statusMessage || '');
+      /* Still actively fetching AI answers → NOT a terminal block; wait. */
+      if (/fetching answers|analy[sz]ing|generating|loading|filling/i.test(msg)) return false;
+      if (state === 'missing-questions' && (BLOCK_MSG_RE.test(msg) || st.progress === 0)) return true;
+      if (err === 'missing-questions' && BLOCK_MSG_RE.test(msg)) return true;
+      return false;
+    }
+
+    function jobKeyOf(st) {
+      try {
+        var ad = st.applicationDetails || {};
+        return String(ad.jobId || ad.job_id || ad.url || '') + '|' +
+               String(st.appliedCount != null ? st.appliedCount : '') + '|' +
+               String(st.statusMessage || '');
+      } catch (_) { return String(st && st.statusMessage || ''); }
+    }
+
+    function evaluate(st) {
+      var now = Date.now();
+      if (!isBlocked(st)) { _blockedSince = 0; _blockedKey = ''; return; }
+      if (isSubmitSuppressed()) { _blockedSince = 0; return; }
+      var key = jobKeyOf(st);
+      if (key !== _blockedKey) { _blockedKey = key; _blockedSince = now; return; }
+      if (now - _blockedSince < BLOCKED_STABLE_MS) return;     // wait for stability
+      if (now - _lastBlockedSkipTs < SKIP_COOLDOWN_MS) return; // cooldown
+      _lastBlockedSkipTs = now;
+      _blockedSince = 0;
+      _blockedKey = '';
+      /* NOTE: deliberately NOT routed through the stuck-loop breaker —
+         many DIFFERENT jobs are each legitimately blocked, and feeding
+         the breaker would falsely trip its consecutive-skip pause. Our
+         own 6s-stability + 8s-cooldown + per-job-key gating already
+         prevents spamming a single job. */
+      forceAdvanceSkip('Required fields missing (OptimHire blocked submission)');
+    }
+
+    try {
+      chrome.storage.onChanged.addListener(function (changes, area) {
+        if (area !== 'local') return;
+        if (changes.autoApplyState && changes.autoApplyState.newValue) {
+          evaluate(changes.autoApplyState.newValue);
+        }
+      });
+    } catch (_) {}
+    /* Poll too, in case a storage-change event is missed or the state
+       lingers without re-writing. */
+    setInterval(function () {
+      try {
+        chrome.storage.local.get(['autoApplyState'], function (d) {
+          if (d && d.autoApplyState) evaluate(d.autoApplyState);
+        });
+      } catch (_) {}
+    }, 2_000);
+  })();
 
   /* ── "All applications completed" auto-resume ─────────────────────────
    * After a single applied job, OptimHire's server sometimes returns

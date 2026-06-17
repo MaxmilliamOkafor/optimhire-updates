@@ -3032,6 +3032,21 @@
       return /Generating\s+(Custom\s+)?(Resume|Cover\s*Letter)/i.test(t);
     }
 
+    /* Log resume/cover-letter tailoring phase transitions ONCE each per
+       page so the debug viewer clearly shows whether OptimHire actually
+       generated and we waited for the tailored doc (answers "is the
+       tailored CV/cover letter working?"). */
+    const _genPhase = new Map(); // url+kind → last phase logged
+    function logTailorPhase(kind, phase, extra) {
+      try {
+        const key = location.href + '|' + kind;
+        if (_genPhase.get(key) === phase) return;
+        _genPhase.set(key, phase);
+        if (_genPhase.size > 60) _genPhase.delete(_genPhase.keys().next().value);
+        LOG(`Tailoring [${kind}]: ${phase}${extra ? ' — ' + extra : ''}`);
+      } catch (_) {}
+    }
+
     /* Resume editor: the tailored CV is ready when
          (a) substantial content is present (>1500 chars + 2 sections),
          (b) OptimHire is not still busy/generating, AND
@@ -3047,11 +3062,14 @@
       ['summary','experience','education','skills','employment','work history']
         .forEach(function (m) { if (new RegExp('\\b' + m + '\\b','i').test(t)) marks++; });
       if (marks < 2) return false;
-      if (optimHireBusy() || looksGenerating(main)) return false;
+      if (looksGenerating(main)) { logTailorPhase('resume', 'generating tailored CV — waiting'); return false; }
+      if (optimHireBusy()) return false;
       /* Signature = length + a sample of the text, so streaming edits
          change it until generation settles. */
       const sig = t.length + '|' + t.slice(0, 400) + '|' + t.slice(-400);
-      return contentStable('resume', sig);
+      const ready = contentStable('resume', sig);
+      if (ready) logTailorPhase('resume', 'tailored CV ready', t.length + ' chars');
+      return ready;
     }
 
     /* Cover letter: ready when the editor body has substantial text,
@@ -3066,9 +3084,12 @@
         if (t.length > best.length) best = t;
       }
       if (best.length < 150) return false;
-      if (optimHireBusy() || looksGenerating(document.body)) return false;
+      if (looksGenerating(document.body)) { logTailorPhase('cover', 'generating cover letter — waiting'); return false; }
+      if (optimHireBusy()) return false;
       const sig = best.length + '|' + best.slice(0, 400) + '|' + best.slice(-200);
-      return contentStable('cover', sig);
+      const ready = contentStable('cover', sig);
+      if (ready) logTailorPhase('cover', 'cover letter ready', best.length + ' chars');
+      return ready;
     }
 
     /* Find a visible+enabled button whose own text matches `re` */
