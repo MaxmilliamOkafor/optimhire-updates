@@ -1107,8 +1107,16 @@
   (function autoResumeOnNoJobs() {
     var _lastClickTs = 0;
     var COOLDOWN_MS = 30_000;
+    var _queueActive = false;
+    try {
+      chrome.storage.local.get(['ohJobQueueActive'], function (d) { _queueActive = !!(d && d.ohJobQueueActive); });
+      chrome.storage.onChanged.addListener(function (c, a) {
+        if (a === 'local' && c.ohJobQueueActive) _queueActive = !!c.ohJobQueueActive.newValue;
+      });
+    } catch (_) {}
     function tick() {
       try {
+        if (_queueActive) return; // CSV queue owns automation — don't resume native search
         var bodyText = (document.body && document.body.innerText || '').toLowerCase();
         if (bodyText.indexOf('all applications completed') === -1 &&
             bodyText.indexOf('no more matching jobs') === -1) return;
@@ -1197,9 +1205,15 @@
     function tick() {
       try {
         chrome.storage.local.get(
-          ['isAutoProcessStartJob', 'autoApplyStateUpdate'],
+          ['isAutoProcessStartJob', 'autoApplyStateUpdate', 'ohJobQueueActive'],
           function (d) {
             try {
+              /* MUTUAL EXCLUSION: while the CSV Job Queue is running, do
+                 NOT re-engage OptimHire's native auto-apply. Running both
+                 at once made the native flow navigate/reload the queue's
+                 job tab in a loop and stopped the queue's autofill from
+                 ever firing. The queue owns the tabs while it's active. */
+              if (d.ohJobQueueActive) return;
               var running = !!d.isAutoProcessStartJob ||
                             (d.autoApplyStateUpdate && d.autoApplyStateUpdate.isRunning);
               if (running) { setEngaged(true); return; } // running → engaged, let it work

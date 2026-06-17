@@ -434,11 +434,15 @@
         next.attempts = (next.attempts || 0) + 1;
         next.lastActionTs = Date.now();
         await saveQueue();
-        /* Open in a NEW tab. active:false keeps focus on the manager
-           so a big run doesn't hijack the user's screen; the content
-           script still fills background tabs fine. */
+        /* Open in a NEW tab, ACTIVE. A background (active:false) tab is
+           throttled by Chrome and often never lays out, so the content
+           script couldn't detect the form and autofill never ran — the
+           exact "automation doesn't start" the user hit. Opening active
+           guarantees the page renders so autofill fires. At concurrency 1
+           (default) only one job tab is focused at a time; it's a
+           separate tab so the OptimHire my-jobs page is untouched. */
         const tab = await new Promise(res => {
-          try { chrome.tabs.create({ url: next.url, active: false }, res); }
+          try { chrome.tabs.create({ url: next.url, active: true }, res); }
           catch (_) { res(null); }
         });
         if (tab && tab.id != null) _tabMap.set(next.id, tab.id);
@@ -497,6 +501,10 @@
     await new Promise(res => ST.set({
       [KEY_ACTIVE]: true, [KEY_CURRENT]: null, [KEY_ADVANCE_REQ]: null,
       [KEY_STARTTS]: Date.now(),
+      /* MUTUAL EXCLUSION: stand down OptimHire's native auto-apply while
+         the CSV queue runs. Running both made the native flow reload the
+         queue's job tab in a loop and blocked the queue's autofill. */
+      ohAutoApplyEngaged: false,
     }, res));
     setRunnerIndicator(true);
     const conc = getConcurrency();

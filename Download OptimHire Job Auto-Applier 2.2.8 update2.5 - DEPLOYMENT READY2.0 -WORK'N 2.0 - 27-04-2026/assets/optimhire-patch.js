@@ -6060,6 +6060,38 @@
       }
     }
 
+    /* Fill the current queue job's form ONCE, reusing the same pipeline
+       as the normal auto-trigger. Guarded by _autoTriggered so we never
+       double-fill if the normal trigger also fired on a recognised ATS. */
+    let _queueFilledFor = '';
+    async function ensureQueueAutofill(job) {
+      if (_queueFilledFor === job.id) return;
+      /* If the normal auto-trigger already handled / is handling this
+         page, defer to it. */
+      if (_autoTriggered || _autoTriggerRunning) { _queueFilledFor = job.id; return; }
+      /* Wait until there's actually a fillable form on the page. */
+      if (!hasApplicationForm()) return;
+      _queueFilledFor = job.id;
+      _autoTriggered = true;          // block the normal trigger from doubling up
+      _autoTriggerRunning = true;
+      LOG(`[Queue Runner] autofilling: ${job.title || job.url}`);
+      try {
+        _fillActive = true;
+        await runAtsAutofill();
+        try { await solveCaptcha(); } catch (_) {}
+        await sleep(500);
+        try { await detectAndFixValidationErrors(); } catch (_) {}
+        await sleep(700);  try { await sanitizeBadFills(); } catch (_) {}
+        await sleep(1000); try { await sanitizeBadFills(); } catch (_) {}
+        LOG('[Queue Runner] autofill pass complete');
+      } catch (e) {
+        LOG('[Queue Runner] autofill error', e);
+      } finally {
+        _fillActive = false;
+        _autoTriggerRunning = false;
+      }
+    }
+
     async function tick() {
       try {
         /* Iframe gate already bailed for non-ATS frames; only run this
@@ -6077,7 +6109,23 @@
           LOG(`[Queue Runner] on job: ${job.title || job.url}`);
         }
 
+        /* Proactively drive the autofill on this queue tab. The normal
+           auto-trigger skips unrecognised ATS pages (no CURRENT_ATS +
+           no generic form match), so queued jobs on unknown sites were
+           opened but never filled. Since the queue KNOWS this tab is a
+           job to apply to, kick the fill ourselves once a form appears. */
+        ensureQueueAutofill(job);
+
         const now = Date.now();
+
+        /* Reload-proof timeout. _jobStartTs resets on every page (re)load,
+           so a page stuck in a reload loop never hit the per-instance
+           timeout below. job.lastActionTs is the manager's open time and
+           PERSISTS in storage across reloads, so this fails a runaway /
+           reload-looping job instead of letting it spin forever. */
+        if (job.lastActionTs && (now - job.lastActionTs) > JOB_TIMEOUT_MS) {
+          return advance(job, 'failed', 'timeout / reload loop (no progress)');
+        }
 
         /* Failure signals first */
         if (pageHasFailure()) {
