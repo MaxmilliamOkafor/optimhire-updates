@@ -21,6 +21,13 @@
   const KEY_CURRENT = 'ohJobQueueCurrentId';
   const KEY_STARTTS = 'ohJobQueueStartTs';
 
+  /* Tiny shim so we can log queue lifecycle events into the debug
+     ring buffer regardless of whether debug-logger.js has finished
+     installing OH_DEBUG yet. */
+  function dbg(msg, data, lvl) {
+    try { if (window.OH_DEBUG) window.OH_DEBUG.log('queue-mgr', msg, data, lvl); } catch (_) {}
+  }
+
   let queue = [];
   let view  = { filter: 'all', ats: 'all', search: '' };
   let selectedIds = new Set();
@@ -454,6 +461,7 @@
   async function handleAdvanceReq(req) {
     if (!req || !req.ts || req.ts === _lastAdvanceTs) return;
     _lastAdvanceTs = req.ts;
+    dbg('advance request', { jobId: req.jobId, status: req.status });
     closeJobTab(req.jobId);
     /* Clear the request so the content-script self-navigate fallback
        knows the manager handled it. */
@@ -477,7 +485,9 @@
 
   async function startQueue() {
     if (!queue.some(j => j.status === 'pending' || j.status === 'running')) {
-      toast('No pending jobs in queue', 'error'); return;
+      toast('No pending jobs in queue', 'error');
+      dbg('startQueue rejected — no pending/running jobs', { queueLen: queue.length }, 'warn');
+      return;
     }
     /* Reset leftover 'running' from a prior interrupted run — we lost
        those tabs, so re-queue them cleanly. */
@@ -491,10 +501,12 @@
     setRunnerIndicator(true);
     const conc = getConcurrency();
     toast(`Queue started — opening up to ${conc} job${conc > 1 ? 's' : ''} in separate tabs`, 'success');
+    dbg('startQueue', { concurrency: conc, total: queue.length, pending: queue.filter(j => j.status === 'pending').length });
     await fillSlots();
   }
 
   async function stopQueue() {
+    const openTabs = _tabMap.size;
     await new Promise(res => ST.set({
       [KEY_ACTIVE]: false, [KEY_CURRENT]: null, [KEY_ADVANCE_REQ]: null,
     }, res));
@@ -508,6 +520,7 @@
     render();
     setRunnerIndicator(false);
     toast('Queue stopped — job tabs closed', 'info');
+    dbg('stopQueue', { closedTabs: openTabs });
   }
 
   /* If the user manually closes a job tab, re-queue that job and
@@ -556,6 +569,10 @@
     });
     on('btnStart', 'click', startQueue);
     on('btnStop',  'click', stopQueue);
+    on('btnDebug', 'click', () => {
+      try { chrome.tabs.create({ url: chrome.runtime.getURL('tabs/debug.html'), active: true }); }
+      catch (_) {}
+    });
     on('btnRetryFailed', 'click', async () => {
       let n = 0;
       for (const j of queue) if (j.status === 'failed') { j.status = 'pending'; j.lastError = ''; n++; }

@@ -1,0 +1,156 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>OptimHire Debug Log</title>
+<style>
+  :root {
+    --bg:  #0f1117;  --bg2: #1a1d27; --bg3: #2d2f3a;
+    --text:#e2e8f0;  --muted:#94a3b8; --border:#2d2f3a;
+    --accent:#6366f1; --success:#4ade80; --warn:#fbbf24;
+    --danger:#ef4444; --info:#38bdf8;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: var(--bg); color: var(--text); font-size: 13px; line-height: 1.4;
+  }
+  header {
+    position: sticky; top: 0; z-index: 10;
+    background: linear-gradient(180deg, #1a1040, #0f1117f8);
+    border-bottom: 1px solid var(--border);
+    padding: 14px 18px;
+  }
+  .title-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 10px; }
+  h1 { font-size: 18px; font-weight: 600; margin: 0; color: #c4b5fd; }
+  h1 small { font-size: 12px; color: var(--muted); font-weight: 400; margin-left: 8px; }
+  .actions { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+  button {
+    background: var(--bg3); color: var(--text); border: 1px solid var(--border);
+    padding: 6px 12px; border-radius: 6px; font-size: 12px; cursor: pointer;
+    font-family: inherit;
+  }
+  button:hover { background: #3a3d4a; }
+  .btn-primary { background: linear-gradient(135deg, #6366f1, #8b5cf6); border: none; color: #fff; font-weight: 600; }
+  .btn-danger { background: var(--danger); border: none; color: #fff; }
+  .btn-warn { background: var(--warn); border: none; color: #0f1117; }
+  input[type=text], select {
+    background: var(--bg2); color: var(--text); border: 1px solid var(--border);
+    padding: 6px 10px; border-radius: 6px; font-size: 12px; font-family: inherit;
+    outline: none;
+  }
+  input[type=text]:focus, select:focus { border-color: var(--accent); }
+  input[type=text] { min-width: 240px; }
+  label { font-size: 12px; color: var(--muted); display: inline-flex; align-items: center; gap: 5px; cursor: pointer; }
+  label input[type=checkbox] { cursor: pointer; }
+  .filters { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+  .stats { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 8px; }
+  .stat {
+    background: var(--bg3); padding: 4px 10px; border-radius: 6px;
+    color: var(--muted); font-size: 11px;
+  }
+  .stat b { color: var(--text); margin-right: 4px; }
+  .stat.s-info b { color: var(--info); }
+  .stat.s-warn b { color: var(--warn); }
+  .stat.s-error b { color: var(--danger); }
+  main { padding: 12px 18px 60px; }
+  table { width: 100%; border-collapse: collapse; font-size: 12px; font-family: ui-monospace, "SF Mono", Consolas, monospace; }
+  thead th {
+    position: sticky; top: 138px; background: var(--bg2);
+    text-align: left; padding: 8px 8px; border-bottom: 1px solid var(--border);
+    font-weight: 600; color: var(--muted); font-size: 11px; text-transform: uppercase;
+  }
+  tbody td { padding: 6px 8px; border-bottom: 1px solid #1f2230; vertical-align: top; word-break: break-word; }
+  tr.lvl-warn td  { background: rgba(251, 191, 36, 0.06); }
+  tr.lvl-error td { background: rgba(239, 68, 68, 0.08); }
+  td.ts  { white-space: nowrap; color: var(--muted); width: 110px; }
+  td.src { color: #c4b5fd; max-width: 160px; }
+  td.cat { color: var(--info); font-weight: 600; width: 110px; }
+  td.lvl { width: 50px; text-transform: uppercase; font-weight: 700; font-size: 10px; }
+  tr.lvl-info  td.lvl { color: var(--muted); }
+  tr.lvl-warn  td.lvl { color: var(--warn); }
+  tr.lvl-error td.lvl { color: var(--danger); }
+  td.msg { max-width: 600px; }
+  td.msg .url-pill {
+    display: inline-block; font-size: 10px; color: var(--muted);
+    background: var(--bg3); padding: 1px 6px; border-radius: 4px; margin-left: 6px;
+  }
+  .data-cell {
+    margin: 4px 0 0; padding: 6px 8px; background: var(--bg2);
+    border: 1px solid var(--border); border-radius: 4px;
+    font-size: 11px; white-space: pre-wrap; max-height: 240px; overflow: auto;
+    color: #cbd5e1;
+  }
+  .empty {
+    text-align: center; padding: 80px 20px; color: var(--muted); font-size: 14px;
+  }
+  .empty h2 { color: var(--text); margin-bottom: 8px; }
+  .hidden { display: none !important; }
+  .footer-bar {
+    position: fixed; bottom: 0; left: 0; right: 0;
+    background: var(--bg2); border-top: 1px solid var(--border);
+    padding: 8px 18px; font-size: 11px; color: var(--muted);
+    display: flex; justify-content: space-between; align-items: center;
+  }
+  .toast {
+    position: fixed; bottom: 50px; right: 18px;
+    background: var(--bg3); border-left: 3px solid var(--success); color: var(--text);
+    padding: 10px 16px; border-radius: 6px; font-size: 12px;
+    box-shadow: 0 4px 14px rgba(0, 0, 0, 0.4);
+  }
+</style>
+</head>
+<body>
+  <header>
+    <div class="title-row">
+      <h1>OptimHire Debug Log <small>Every event from every tab, ring-buffered.</small></h1>
+      <div class="actions">
+        <label><input type="checkbox" id="toggleEnabled"> Capture</label>
+        <label><input type="checkbox" id="togglePaused"> Pause</label>
+        <label><input type="checkbox" id="tail" checked> Live tail</label>
+        <button id="btnCopy">Copy visible</button>
+        <button id="btnExport" class="btn-primary">Export JSON</button>
+        <button id="btnExportText">Export text</button>
+        <button id="btnSnapshot" class="btn-warn">Diagnostic snapshot</button>
+        <button id="btnClear" class="btn-danger">Clear all</button>
+      </div>
+    </div>
+    <div class="filters">
+      <input type="text" id="search" placeholder="Search messages, URLs, data…">
+      <select id="srcFilter"><option value="all">All sources</option></select>
+      <select id="catFilter"><option value="all">All categories</option></select>
+      <select id="lvlFilter">
+        <option value="all">All levels</option>
+        <option value="info">Info</option>
+        <option value="warn">Warn</option>
+        <option value="error">Error</option>
+      </select>
+    </div>
+    <div class="stats" id="stats"></div>
+  </header>
+  <main>
+    <table id="logTable">
+      <thead>
+        <tr>
+          <th>Time</th>
+          <th>Source</th>
+          <th>Category</th>
+          <th>Lvl</th>
+          <th>Message / data</th>
+        </tr>
+      </thead>
+      <tbody id="logBody"></tbody>
+    </table>
+    <div id="emptyState" class="empty hidden">
+      <h2>No debug entries yet</h2>
+      <p>Use the extension — autofill a job, run the queue, or hit any error.<br>
+         Every event will stream in here. Make sure <b>Capture</b> is checked above.</p>
+    </div>
+  </main>
+  <div class="footer-bar">
+    <span id="visCount">0 shown</span>
+    <span id="storeInfo">Ring buffer: max 5000 entries</span>
+  </div>
+  <script src="../assets/debug.js"></script>
+</body>
+</html>

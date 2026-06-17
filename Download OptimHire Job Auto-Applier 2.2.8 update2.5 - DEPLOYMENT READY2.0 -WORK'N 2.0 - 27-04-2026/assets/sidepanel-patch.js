@@ -465,6 +465,15 @@
 
   /* ── Log helpers ── */
   function addLog(text, cls) {
+    /* Mirror EVERY sidepanel log entry into the debug ring buffer. We do
+       this even when logEl is missing (panel collapsed / not yet built)
+       so the viewer still captures the event. */
+    try {
+      if (window.OH_DEBUG) {
+        var lvl = cls === 'error' ? 'error' : 'info';
+        window.OH_DEBUG.log('sidepanel', String(text || ''), cls ? { cls: cls } : undefined, lvl);
+      }
+    } catch (_) {}
     if (!logEl) return;
     var entry = document.createElement('div');
     entry.className = 'aap-log-entry' + (cls ? ' ' + cls : '');
@@ -1499,12 +1508,20 @@
           '<button id="oh-qc-open" style="flex:1;background:linear-gradient(135deg,#6366f1,#8b5cf6);' +
             'color:#fff;border:none;padding:8px 12px;border-radius:8px;font-size:12px;font-weight:600;cursor:pointer">' +
             'Open Queue Manager</button>' +
+          '<button id="oh-qc-debug" title="Open the debug log viewer" style="background:#2d2f3a;' +
+            'color:#e2e8f0;border:1px solid #3a3d4a;padding:8px 10px;border-radius:8px;font-size:12px;cursor:pointer">' +
+            '🐞</button>' +
         '</div>';
       /* Always append to <body> as a fixed overlay — never insert as a
          sibling of #__plasmo (that risked disturbing React). */
       document.body.appendChild(card);
       document.getElementById('oh-qc-open').addEventListener('click', function () {
         try { chrome.tabs.create({ url: chrome.runtime.getURL('tabs/jobQueue.html'), active: true }); }
+        catch (_) {}
+      });
+      var dbgBtn = document.getElementById('oh-qc-debug');
+      if (dbgBtn) dbgBtn.addEventListener('click', function () {
+        try { chrome.tabs.create({ url: chrome.runtime.getURL('tabs/debug.html'), active: true }); }
         catch (_) {}
       });
       /* × collapses the card to a small re-open pill in the corner. */

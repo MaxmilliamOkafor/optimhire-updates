@@ -152,6 +152,7 @@
         </label>
         <button id="btnStart" class="btn-primary">▶ Start Queue</button>
         <button id="btnStop" class="btn-danger" disabled>■ Stop</button>
+        <button id="btnDebug" title="Open the debug log viewer in a new tab">🐞 Debug log</button>
       </div>
     </div>
     <div class="stats" id="stats"></div>
@@ -229,6 +230,7 @@
 
   <input type="file" id="csvInput" accept=".csv,text/csv" style="display:none">
   <div id="toastContainer"></div>
+  <script src="../assets/debug-logger.js"></script>
   <script src="../assets/jobQueue.js"></script>
 </body>
 </html>
