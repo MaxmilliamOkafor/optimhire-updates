@@ -1603,6 +1603,72 @@
     var OH_JOB_BASE = 'https://optimhire.com/d/jv/';
     var MAX = 6000;
     var _lastSig = '';   // skip redundant whole-map rewrites for the same job
+    var _currentJobId = '';   // last job whose details we saw
+    var _currentKey = '';
+
+    /* Classify a job's TERMINAL outcome from OptimHire's own state.
+       This is the honest answer to "was it actually submitted?":
+         submitted → OptimHire reported a real confirmation
+                     (applicationState 'completed' / 'Application submitted
+                     successfully' / a confirmation phrase).
+         skipped   → NOT submitted: required fields missing / submission
+                     blocked / skipped.
+         closed    → job posting closed / already applied / no form.
+         error     → errored out.
+       Returns {outcome, reason} or null when the job is still processing. */
+    function classifyOutcome(st) {
+      if (!st || typeof st !== 'object') return null;
+      var state = String(st.applicationState || '').toLowerCase();
+      var msg   = String(st.statusMessage || '');
+      var err   = String(st.errorType || '');
+      var lmsg  = msg.toLowerCase();
+      if (state === 'completed' ||
+          /application submitted successfully|your application (has been|was) (received|submitted)|thank you for applying|we('| ?ha)ve received your application|application (has been )?received|application successful/i.test(msg)) {
+        return { outcome: 'submitted', reason: msg || 'confirmed' };
+      }
+      if (state === 'skipped' || err === 'missing-questions' ||
+          /required fields are missing|submission blocked|missing or invalid/i.test(lmsg)) {
+        return { outcome: 'skipped', reason: msg || err || 'skipped' };
+      }
+      if (/no longer (open|available)|posting is closed|already applied|page not found|404|job closed/i.test(lmsg) ||
+          state === 'job-closed') {
+        return { outcome: 'closed', reason: msg || 'closed' };
+      }
+      if (state === 'error') return { outcome: 'error', reason: msg || err || 'error' };
+      return null; // still in-progress / loading / fetching
+    }
+
+    function recordOutcome(st) {
+      try {
+        var cls = classifyOutcome(st);
+        if (!cls || !_currentKey) return;
+        chrome.storage.local.get([HK], function (store) {
+          try {
+            var map = (store && store[HK]) || {};
+            var rec = map[_currentKey];
+            if (!rec) return;
+            /* Once a job is 'submitted' or 'closed', don't downgrade it to
+               'skipped' from a later stray state for the same current job. */
+            if (rec.outcome === 'submitted') return;
+            if (rec.outcome === cls.outcome && rec.reason === cls.reason) return;
+            var firstTime = rec.outcome !== cls.outcome;
+            rec.outcome = cls.outcome;
+            rec.reason = String(cls.reason).slice(0, 160);
+            rec.outcomeTs = Date.now();
+            map[_currentKey] = rec;
+            var obj = {}; obj[HK] = map;
+            chrome.storage.local.set(obj);
+            if (firstTime && typeof addLog === 'function') {
+              var label = (rec.title || rec.id || _currentKey);
+              if (cls.outcome === 'submitted') addLog('✅ SUBMITTED (confirmed): ' + label, 'success');
+              else if (cls.outcome === 'skipped') addLog('⏭️ SKIPPED — NOT submitted: ' + label + ' (' + rec.reason + ')', '');
+              else if (cls.outcome === 'closed') addLog('🚫 CLOSED/already-applied — not submitted: ' + label, '');
+              else if (cls.outcome === 'error') addLog('⚠️ ERROR — not submitted: ' + label, 'error');
+            }
+          } catch (_) {}
+        });
+      } catch (_) {}
+    }
 
     function upsert(ad) {
       try {
@@ -1612,6 +1678,8 @@
         var applyUrl = src.apply_now_url || '';
         if (!jid && !applyUrl) return;            // nothing identifiable yet
         var key = String(jid || applyUrl);
+        _currentJobId = String(jid || '');
+        _currentKey = key;
         /* Only write when the identifying job actually changes, so we
            don't rewrite the full map every poll for the current job. */
         var sig = key + '|' + applyUrl + '|' + (src.job_title || '');
@@ -1620,7 +1688,7 @@
         chrome.storage.local.get([HK], function (store) {
           try {
             var map = (store && store[HK]) || {};
-            var rec = map[key] || { id: String(jid || ''), firstSeen: Date.now() };
+            var rec = map[key] || { id: String(jid || ''), firstSeen: Date.now(), outcome: 'pending' };
             if (applyUrl) rec.applyUrl = applyUrl;
             if (jid) rec.ohUrl = OH_JOB_BASE + jid + '/?q=copilot-jobs';
             if (src.job_title) rec.title = src.job_title;
@@ -1643,10 +1711,16 @@
       } catch (_) {}
     }
 
+    function onState(st) {
+      if (!st) return;
+      upsert(st.applicationDetails);
+      recordOutcome(st);
+    }
+
     try {
       chrome.storage.onChanged.addListener(function (c, a) {
         if (a === 'local' && c.autoApplyState && c.autoApplyState.newValue) {
-          upsert(c.autoApplyState.newValue.applicationDetails);
+          onState(c.autoApplyState.newValue);
         }
       });
     } catch (_) {}
@@ -1654,7 +1728,7 @@
     setInterval(function () {
       try {
         chrome.storage.local.get(['autoApplyState'], function (d) {
-          if (d && d.autoApplyState) upsert(d.autoApplyState.applicationDetails);
+          if (d && d.autoApplyState) onState(d.autoApplyState);
         });
       } catch (_) {}
     }, 3000);
@@ -1695,26 +1769,37 @@
         rows.sort(function (a, b) { return (a.firstSeen || 0) - (b.firstSeen || 0); });
         var stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-');
 
-        /* CSV — importable into the CSV Queue Manager (url,title,company,notes) */
-        var cols = ['url', 'title', 'company', 'notes'];
+        /* CSV — importable into the CSV Queue Manager (url,title,company,notes)
+           plus honest outcome columns so you can SEE which were actually
+           submitted vs merely skipped (OptimHire's counter counts skips). */
+        var cols = ['url', 'title', 'company', 'notes', 'outcome', 'outcome_detail'];
         var lines = [cols.join(',')];
         var urlList = [];
+        var tally = { submitted: 0, skipped: 0, closed: 0, error: 0, pending: 0 };
         for (var i = 0; i < rows.length; i++) {
           var r = rows[i];
           var url = r.applyUrl || r.ohUrl || '';
           if (!url) continue;
           urlList.push(url);
+          var oc = r.outcome || 'pending';
+          if (tally[oc] == null) tally[oc] = 0;
+          tally[oc]++;
           var noteParts = [];
           if (r.location) noteParts.push(r.location);
           if (r.ats) noteParts.push('ATS: ' + r.ats);
           if (r.ohUrl && r.applyUrl) noteParts.push('OptimHire: ' + r.ohUrl);
           lines.push([
-            _csvCell(url), _csvCell(r.title), _csvCell(r.company), _csvCell(noteParts.join(' | '))
+            _csvCell(url), _csvCell(r.title), _csvCell(r.company), _csvCell(noteParts.join(' | ')),
+            _csvCell(oc), _csvCell(r.reason || '')
           ].join(','));
         }
         _download('optimhire-queue-urls-' + stamp + '.csv', lines.join('\n'), 'text/csv');
         _download('optimhire-queue-urls-' + stamp + '.txt', urlList.join('\n'), 'text/plain');
-        try { addLog('Exported ' + urlList.length + ' queue job URLs (CSV + TXT)', 'success'); } catch (_) {}
+        var summary = 'Exported ' + urlList.length + ' job URLs — ✅ ' + tally.submitted +
+          ' submitted (confirmed), ⏭️ ' + tally.skipped + ' skipped, 🚫 ' + tally.closed +
+          ' closed, ⚠️ ' + tally.error + ' error, … ' + tally.pending + ' pending';
+        try { addLog(summary, tally.submitted ? 'success' : ''); } catch (_) {}
+        try { alert(summary + '\n\nTwo files downloaded:\n• CSV (with an "outcome" column — re-importable into the Queue Manager)\n• TXT (plain URL list)\n\n"submitted" = OptimHire reported a real confirmation. "skipped" = NOT submitted (usually required fields it could not fill).'); } catch (_) {}
       });
     } catch (_) {}
   }
@@ -1771,7 +1856,10 @@
         '<button id="oh-qc-export" title="Export every job URL OptimHire auto-apply has gone through this session — CSV (re-importable into the Queue Manager) or a plain URL list" ' +
           'style="width:100%;background:#0f1117;color:#c4b5fd;border:1px solid #3a3d4a;' +
           'padding:7px 10px;border-radius:8px;font-size:11.5px;cursor:pointer">' +
-          '⬇ Export queue job URLs (0)</button>';
+          '⬇ Export queue job URLs (0)</button>' +
+        '<div id="oh-qc-truth" title="OptimHire’s ‘X applied’ counter also counts SKIPS. This shows how many actually got a real submission confirmation." ' +
+          'style="margin-top:7px;font-size:10.5px;color:#94a3b8;line-height:1.5;text-align:center">' +
+          'Real outcome: — submitted · — skipped</div>';
       /* Always append to <body> as a fixed overlay — never insert as a
          sibling of #__plasmo (that risked disturbing React). */
       document.body.appendChild(card);
@@ -1837,9 +1925,24 @@
         });
         chrome.storage.local.get(['ohHarvestedJobs'], function (d) {
           var map = (d && d.ohHarvestedJobs) || {};
-          var n = 0; for (var k in map) if (Object.prototype.hasOwnProperty.call(map, k)) n++;
+          var n = 0, sub = 0, skip = 0, other = 0;
+          for (var k in map) {
+            if (!Object.prototype.hasOwnProperty.call(map, k)) continue;
+            n++;
+            var oc = map[k].outcome;
+            if (oc === 'submitted') sub++;
+            else if (oc === 'skipped') skip++;
+            else if (oc === 'closed' || oc === 'error') other++;
+          }
           var btn = document.getElementById('oh-qc-export');
           if (btn) btn.textContent = '⬇ Export queue job URLs (' + n + ')';
+          var truth = document.getElementById('oh-qc-truth');
+          if (truth) {
+            truth.innerHTML = 'Real outcome: ' +
+              '<b style="color:#4ade80">' + sub + ' submitted</b> · ' +
+              '<b style="color:#fbbf24">' + skip + ' skipped</b>' +
+              (other ? ' · <span style="color:#f87171">' + other + ' closed/err</span>' : '');
+          }
         });
       } catch (_) {}
     }
