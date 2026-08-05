@@ -99,7 +99,10 @@
     return rows.filter(r => r.length && r.some(c => c.trim()));
   }
   function toCsv(jobs) {
-    const cols = ['url', 'title', 'company', 'ats', 'status', 'notes', 'attempts', 'addedAt', 'appliedAt'];
+    /* confirmed / confirmedBy / lastError are exported too so the CSV
+       shows which "applied" rows were actually confirmed. */
+    const cols = ['url', 'title', 'company', 'ats', 'status', 'confirmed', 'confirmedBy',
+                  'lastError', 'notes', 'attempts', 'addedAt', 'appliedAt'];
     const esc = (s) => {
       const v = String(s == null ? '' : s);
       if (/[",\n]/.test(v)) return '"' + v.replace(/"/g, '""') + '"';
@@ -199,13 +202,21 @@
   }
   function renderStats() {
     const c = { all: queue.length, pending: 0, running: 0, applied: 0, failed: 0, skipped: 0 };
-    for (const j of queue) c[j.status] = (c[j.status] || 0) + 1;
+    /* Split "applied" into CONFIRMED (we saw a real confirmation page)
+       vs UNCONFIRMED (we clicked submit but nothing confirmed it). Only
+       the confirmed number should be trusted as a real application. */
+    let confirmed = 0, unconfirmed = 0;
+    for (const j of queue) {
+      c[j.status] = (c[j.status] || 0) + 1;
+      if (j.status === 'applied') { if (j.confirmed) confirmed++; else unconfirmed++; }
+    }
     const el = document.getElementById('stats');
     el.innerHTML = '' +
       `<div class="stat"><b>${c.all}</b>Total</div>` +
       `<div class="stat s-pending"><b>${c.pending}</b>Pending</div>` +
       `<div class="stat s-running"><b>${c.running}</b>Running</div>` +
-      `<div class="stat s-applied"><b>${c.applied}</b>Applied</div>` +
+      `<div class="stat s-applied" title="Applications with a real on-page confirmation — these are the ones that genuinely went through"><b>${confirmed}</b>✅ Confirmed</div>` +
+      `<div class="stat s-skipped" title="Submit was clicked but no confirmation appeared — NOT proof it was received. Verify these manually."><b>${unconfirmed}</b>⚠ Unconfirmed</div>` +
       `<div class="stat s-failed"><b>${c.failed}</b>Failed</div>` +
       `<div class="stat s-skipped"><b>${c.skipped}</b>Skipped</div>`;
   }
@@ -280,7 +291,7 @@
       return `<tr class="${rowCls}" data-id="${j.id}">
         <td class="checkbox-cell"><input type="checkbox" class="row-check" data-id="${j.id}" ${checked}></td>
         <td>${idx + 1}</td>
-        <td><span class="badge b-${j.status}">${j.status}</span></td>
+        <td><span class="badge b-${j.status}" title="${j.status === 'applied' ? (j.confirmed ? esc(j.confirmedBy || 'confirmation page detected') : 'No confirmation was detected — verify manually') : ''}">${j.status}${j.status === 'applied' ? (j.confirmed ? ' ✅' : ' ⚠') : ''}</span></td>
         <td class="url-col"><a href="${esc(j.url)}" target="_blank" rel="noopener" title="${esc(j.url)}">${esc(truncate(j.url, 60))}</a></td>
         <td>${esc(j.title || '—')}</td>
         <td>${esc(j.company || '—')}</td>

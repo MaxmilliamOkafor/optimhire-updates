@@ -1120,6 +1120,12 @@
     valueAdd: 'I bring the right combination of experience, technical skill, and work ethic to make an immediate positive impact. I move fast, communicate clearly, and consistently deliver quality work.',
     reasonLeaving: 'I\'m seeking new challenges and an opportunity for greater impact and growth, which this role represents.',
     howHeard: 'LinkedIn',
+    /* Fields OptimHire explicitly reports as blocking submission when
+       empty/invalid ("Country Phone Code is required", "Phone Device
+       Type is required", "Discipline is required"). */
+    phoneCountryCode: '+353',      // Ireland — matches the profile's locale
+    phoneDeviceType:  'Mobile',
+    fieldOfStudy:     'Computer Science',
     pronouns: 'they/them',
     hoursPerWeek: '40',
     weekendsAvail: 'Yes',
@@ -1588,6 +1594,20 @@
        Note: label is pre-processed so non-alphanumerics become spaces, so
        "E-mail" becomes "e mail" — \se?mail covers both forms. */
     if (/\be\s?mail\b/.test(l))                           return p.email         || '';
+    /* ── Phone sub-fields MUST be matched before the generic phone and
+       country rules below, otherwise "Country Phone Code" fell through to
+       /^country/ and got filled with "Ireland", and "Phone Device Type"
+       fell through to /phone/ and got filled with the phone NUMBER.
+       Both produced invalid values, so the ATS kept the field marked
+       required and OptimHire blocked submission ("Error: The field
+       Country Phone Code is required…" / "Phone Device Type is
+       required…") — the job was then skipped, never applied. */
+    if (/(phone|dial|country).*(code)|country.?code/.test(l)) {
+      return p.phone_country_code || p.country_code || DEFAULTS.phoneCountryCode;
+    }
+    if (/(phone|device).*(device|type)\b/.test(l) && !/number/.test(l)) {
+      return DEFAULTS.phoneDeviceType;
+    }
     /* Phone: handle "Phone", "Mobile", "Cell", "Tel", "Telephone",
        "Cell Phone", "Mobile Number", "Contact Number", "Contact No", etc. */
     if (/phone|mobile|cell|\btel\b|telephone|contact.*(?:number|\bno\b|num\b)/.test(l))
@@ -1605,8 +1625,14 @@
     if (/twitter|x\.com|x.?handle/.test(l))              return p.twitter_url   || '';
     if (/website|portfolio|personal.?site/.test(l))       return p.website_url   || '';
     if (/university|school|college|education/.test(l))    return p.school        || p.university || '';
-    if (/\bdegree\b/.test(l))                             return p.degree        || "Bachelor's";
-    if (/major|field.?of.?study/.test(l))                 return p.major         || '';
+    if (/\bdegree\b|qualification.*level|level.*qualification/.test(l))
+                                                          return p.degree        || "Bachelor's";
+    /* "Field of Study" / "Major" / "Discipline" are REQUIRED on many ATSes
+       (OptimHire reports "Discipline is required." / "Degree is
+       required."). Returning '' left them blank and blocked submission,
+       so fall back to a sane default instead of an empty string. */
+    if (/major|field.?of.?study|discipline|course.*study|study.*area|area.*study|specialisation|specialization|subject/.test(l))
+                                                          return p.major || p.field_of_study || p.discipline || DEFAULTS.fieldOfStudy;
     if (/\bgpa\b/.test(l))                                return p.gpa           || '';
     if (/summary|bio|about yourself|profile.*summary|introduce/.test(l))
                                                           return p.summary       || DEFAULTS.cover;
@@ -5884,6 +5910,7 @@
     const JOB_TIMEOUT_MS  = 180_000;  // 3 min hard cap per job
     const NO_FORM_GRACE_MS = 18_000;  // if no fillable form by now → unsupported, skip
     const SUBMIT_GRACE_MS = 8_000;    // wait this long after submit before declaring success
+    const CONFIRM_WAIT_MS = 30_000;   // keep looking for a REAL confirmation this long after submit
     const VALIDATION_STUCK_MS = 50_000; // validation errors persisting this long → fail fast
     const SUCCESS_TEXT_RE = /application\s+(was\s+)?(submitted|received|complete)|thank\s+you\s+for\s+(applying|your\s+application|your\s+interest)|we['’]ve\s+received\s+your\s+application|we\s+have\s+received\s+your\s+application|your\s+application\s+has\s+been\s+(received|submitted)|application\s+successful/i;
     const SUCCESS_URL_RE  = /(thank|success|confirm|complete|received|submitted|done)/i;
@@ -5993,7 +6020,7 @@
 
     const ADVANCE_FALLBACK_MS = 8_000; // if manager doesn't open the next tab in time, self-navigate
 
-    async function advance(job, status, error) {
+    async function advance(job, status, error, extra) {
       if (_advancing) return; _advancing = true;
       try {
         const d = await ST.get(['ohJobQueue']);
@@ -6004,6 +6031,14 @@
           q[i].appliedAt = status === 'applied' ? Date.now() : (q[i].appliedAt || 0);
           q[i].lastError = error || '';
           q[i].lastActionTs = Date.now();
+          /* Honesty flag: 'applied' only means CONFIRMED when we actually
+             saw a success page/confirmation. A submit-click with no error
+             is NOT proof the application went through — that assumption is
+             exactly why OptimHire's own counter overstates results. */
+          if (extra && typeof extra === 'object') {
+            if (extra.confirmed !== undefined) q[i].confirmed = !!extra.confirmed;
+            if (extra.confirmedBy) q[i].confirmedBy = String(extra.confirmedBy).slice(0, 120);
+          }
         }
         /* Mark this job done + emit an advance request. The Queue
            Manager (tabs/jobQueue.html — it has chrome.tabs access)
@@ -6149,9 +6184,28 @@
         /* Submit fired by our flow → start grace timer */
         if (_submitAttempted && !_submitSeenAt) _submitSeenAt = _submitAttemptTs || now;
 
-        /* Success */
-        if (pageHasSuccess() || (_submitSeenAt && now - _submitSeenAt > SUBMIT_GRACE_MS && !pageHasValidationError())) {
-          return advance(job, 'applied', '');
+        /* ── Success, honestly classified ──────────────────────────────
+           CONFIRMED: the page itself shows a real confirmation (success
+           text or a thank-you/confirmation URL). This is the only case
+           we can truthfully call "applied".
+           UNCONFIRMED: we clicked submit and no validation error appeared.
+           That is NOT proof of submission — it is the same unverified
+           assumption that makes OptimHire's counter overstate results
+           (and why confirmation emails don't arrive). We now keep
+           watching for a real confirmation for CONFIRM_WAIT_MS before
+           settling, and when it never comes we still advance but record
+           confirmed:false so the Queue Manager can show the truth. */
+        if (pageHasSuccess()) {
+          return advance(job, 'applied', '', { confirmed: true, confirmedBy: 'confirmation page detected' });
+        }
+        if (_submitSeenAt && !pageHasValidationError()) {
+          const waited = now - _submitSeenAt;
+          if (waited > CONFIRM_WAIT_MS) {
+            return advance(job, 'applied',
+              'submitted but NO confirmation detected — verify manually',
+              { confirmed: false, confirmedBy: '' });
+          }
+          /* else: keep polling — a confirmation may still render. */
         }
 
         /* Unsupported / no application form → skip early instead of

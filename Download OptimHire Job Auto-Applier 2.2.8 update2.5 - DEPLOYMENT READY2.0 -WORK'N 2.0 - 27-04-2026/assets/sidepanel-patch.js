@@ -1581,6 +1581,230 @@
   })();
 
   /* ════════════════════════════════════════════════════════════
+     NATIVE AUTO-APPLY JOB-URL HARVESTER + EXPORT
+     ════════════════════════════════════════════════════════════
+     OptimHire's own auto-apply ("3 of 1984 applied") streams jobs one
+     at a time from the server — there is no bulk "list all matching
+     jobs" endpoint. So as each job loads, we record its URL from
+     autoApplyState.applicationDetails into ohHarvestedJobs (keyed by
+     copilot_job_id, deduped). The user can then export every job URL
+     the queue has gone through — as a CSV that re-imports into the CSV
+     Queue Manager, or a plain URL list.
+
+     Each record: { id, applyUrl, ohUrl, title, company, location, ats,
+                    firstSeen, lastSeen }
+       applyUrl = source.apply_now_url — the REAL ATS application URL
+                  OptimHire opens ("Opening job page: …").
+       ohUrl    = https://optimhire.com/d/jv/{id}/?q=copilot-jobs — the
+                  OptimHire job-view page.
+     ────────────────────────────────────────────────────────── */
+  (function installNativeQueueHarvester() {
+    var HK = 'ohHarvestedJobs';
+    var OH_JOB_BASE = 'https://optimhire.com/d/jv/';
+    var MAX = 6000;
+    var _lastSig = '';   // skip redundant whole-map rewrites for the same job
+    var _currentJobId = '';   // last job whose details we saw
+    var _currentKey = '';
+
+    /* Classify a job's TERMINAL outcome from OptimHire's own state.
+       This is the honest answer to "was it actually submitted?":
+         submitted → OptimHire reported a real confirmation
+                     (applicationState 'completed' / 'Application submitted
+                     successfully' / a confirmation phrase).
+         skipped   → NOT submitted: required fields missing / submission
+                     blocked / skipped.
+         closed    → job posting closed / already applied / no form.
+         error     → errored out.
+       Returns {outcome, reason} or null when the job is still processing. */
+    function classifyOutcome(st) {
+      if (!st || typeof st !== 'object') return null;
+      var state = String(st.applicationState || '').toLowerCase();
+      var msg   = String(st.statusMessage || '');
+      var err   = String(st.errorType || '');
+      var lmsg  = msg.toLowerCase();
+      if (state === 'completed' ||
+          /application submitted successfully|your application (has been|was) (received|submitted)|thank you for applying|we('| ?ha)ve received your application|application (has been )?received|application successful/i.test(msg)) {
+        return { outcome: 'submitted', reason: msg || 'confirmed' };
+      }
+      if (state === 'skipped' || err === 'missing-questions' ||
+          /required fields are missing|submission blocked|missing or invalid/i.test(lmsg)) {
+        return { outcome: 'skipped', reason: msg || err || 'skipped' };
+      }
+      if (/no longer (open|available)|posting is closed|already applied|page not found|404|job closed/i.test(lmsg) ||
+          state === 'job-closed') {
+        return { outcome: 'closed', reason: msg || 'closed' };
+      }
+      if (state === 'error') return { outcome: 'error', reason: msg || err || 'error' };
+      return null; // still in-progress / loading / fetching
+    }
+
+    function recordOutcome(st) {
+      try {
+        var cls = classifyOutcome(st);
+        if (!cls || !_currentKey) return;
+        chrome.storage.local.get([HK], function (store) {
+          try {
+            var map = (store && store[HK]) || {};
+            var rec = map[_currentKey];
+            if (!rec) return;
+            /* Once a job is 'submitted' or 'closed', don't downgrade it to
+               'skipped' from a later stray state for the same current job. */
+            if (rec.outcome === 'submitted') return;
+            if (rec.outcome === cls.outcome && rec.reason === cls.reason) return;
+            var firstTime = rec.outcome !== cls.outcome;
+            rec.outcome = cls.outcome;
+            rec.reason = String(cls.reason).slice(0, 160);
+            rec.outcomeTs = Date.now();
+            map[_currentKey] = rec;
+            var obj = {}; obj[HK] = map;
+            chrome.storage.local.set(obj);
+            if (firstTime && typeof addLog === 'function') {
+              var label = (rec.title || rec.id || _currentKey);
+              if (cls.outcome === 'submitted') addLog('✅ SUBMITTED (confirmed): ' + label, 'success');
+              else if (cls.outcome === 'skipped') addLog('⏭️ SKIPPED — NOT submitted: ' + label + ' (' + rec.reason + ')', '');
+              else if (cls.outcome === 'closed') addLog('🚫 CLOSED/already-applied — not submitted: ' + label, '');
+              else if (cls.outcome === 'error') addLog('⚠️ ERROR — not submitted: ' + label, 'error');
+            }
+          } catch (_) {}
+        });
+      } catch (_) {}
+    }
+
+    function upsert(ad) {
+      try {
+        if (!ad || typeof ad !== 'object') return;
+        var src = ad.source || {};
+        var jid = ad.copilot_job_id || src.copilot_job_id;
+        var applyUrl = src.apply_now_url || '';
+        if (!jid && !applyUrl) return;            // nothing identifiable yet
+        var key = String(jid || applyUrl);
+        _currentJobId = String(jid || '');
+        _currentKey = key;
+        /* Only write when the identifying job actually changes, so we
+           don't rewrite the full map every poll for the current job. */
+        var sig = key + '|' + applyUrl + '|' + (src.job_title || '');
+        if (sig === _lastSig) return;
+        _lastSig = sig;
+        chrome.storage.local.get([HK], function (store) {
+          try {
+            var map = (store && store[HK]) || {};
+            var rec = map[key] || { id: String(jid || ''), firstSeen: Date.now(), outcome: 'pending' };
+            if (applyUrl) rec.applyUrl = applyUrl;
+            if (jid) rec.ohUrl = OH_JOB_BASE + jid + '/?q=copilot-jobs';
+            if (src.job_title) rec.title = src.job_title;
+            if (src.company_name) rec.company = src.company_name;
+            var loc = [src.job_location, src.country].filter(Boolean).join(', ');
+            if (loc) rec.location = loc;
+            if (ad.ats_name) rec.ats = ad.ats_name;
+            rec.lastSeen = Date.now();
+            map[key] = rec;
+            /* Cap: drop oldest by firstSeen if we somehow exceed MAX. */
+            var keys = Object.keys(map);
+            if (keys.length > MAX) {
+              keys.sort(function (a, b) { return (map[a].firstSeen || 0) - (map[b].firstSeen || 0); });
+              delete map[keys[0]];
+            }
+            var obj = {}; obj[HK] = map;
+            chrome.storage.local.set(obj);
+          } catch (_) {}
+        });
+      } catch (_) {}
+    }
+
+    function onState(st) {
+      if (!st) return;
+      upsert(st.applicationDetails);
+      recordOutcome(st);
+    }
+
+    try {
+      chrome.storage.onChanged.addListener(function (c, a) {
+        if (a === 'local' && c.autoApplyState && c.autoApplyState.newValue) {
+          onState(c.autoApplyState.newValue);
+        }
+      });
+    } catch (_) {}
+    /* Poll too — covers a missed change event or a lingering state. */
+    setInterval(function () {
+      try {
+        chrome.storage.local.get(['autoApplyState'], function (d) {
+          if (d && d.autoApplyState) onState(d.autoApplyState);
+        });
+      } catch (_) {}
+    }, 3000);
+  })();
+
+  /* CSV-escape a single field. */
+  function _csvCell(s) {
+    var v = String(s == null ? '' : s);
+    if (/[",\n]/.test(v)) return '"' + v.replace(/"/g, '""') + '"';
+    return v;
+  }
+  function _download(name, text, mime) {
+    try {
+      var blob = new Blob([text], { type: (mime || 'text/plain') + ';charset=utf-8' });
+      var a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = name;
+      document.body.appendChild(a); a.click(); a.remove();
+      setTimeout(function () { try { URL.revokeObjectURL(a.href); } catch (_) {} }, 1500);
+    } catch (_) {}
+  }
+
+  /* Export every harvested native-queue job. Downloads BOTH a CSV
+     (url,title,company,notes — re-importable into the Queue Manager)
+     and a plain .txt URL list. Prefers the real ATS apply URL, falling
+     back to the OptimHire job-view URL. */
+  function exportHarvestedJobs() {
+    try {
+      chrome.storage.local.get(['ohHarvestedJobs'], function (d) {
+        var map = (d && d.ohHarvestedJobs) || {};
+        var rows = [];
+        for (var k in map) if (Object.prototype.hasOwnProperty.call(map, k)) rows.push(map[k]);
+        if (!rows.length) {
+          try { addLog('No queue job URLs captured yet — start Auto-Apply first, then export', ''); } catch (_) {}
+          try { alert('No queue job URLs captured yet.\n\nStart Auto-Applying (or run the CSV queue); each job that loads is recorded, then Export.'); } catch (_) {}
+          return;
+        }
+        rows.sort(function (a, b) { return (a.firstSeen || 0) - (b.firstSeen || 0); });
+        var stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-');
+
+        /* CSV — importable into the CSV Queue Manager (url,title,company,notes)
+           plus honest outcome columns so you can SEE which were actually
+           submitted vs merely skipped (OptimHire's counter counts skips). */
+        var cols = ['url', 'title', 'company', 'notes', 'outcome', 'outcome_detail'];
+        var lines = [cols.join(',')];
+        var urlList = [];
+        var tally = { submitted: 0, skipped: 0, closed: 0, error: 0, pending: 0 };
+        for (var i = 0; i < rows.length; i++) {
+          var r = rows[i];
+          var url = r.applyUrl || r.ohUrl || '';
+          if (!url) continue;
+          urlList.push(url);
+          var oc = r.outcome || 'pending';
+          if (tally[oc] == null) tally[oc] = 0;
+          tally[oc]++;
+          var noteParts = [];
+          if (r.location) noteParts.push(r.location);
+          if (r.ats) noteParts.push('ATS: ' + r.ats);
+          if (r.ohUrl && r.applyUrl) noteParts.push('OptimHire: ' + r.ohUrl);
+          lines.push([
+            _csvCell(url), _csvCell(r.title), _csvCell(r.company), _csvCell(noteParts.join(' | ')),
+            _csvCell(oc), _csvCell(r.reason || '')
+          ].join(','));
+        }
+        _download('optimhire-queue-urls-' + stamp + '.csv', lines.join('\n'), 'text/csv');
+        _download('optimhire-queue-urls-' + stamp + '.txt', urlList.join('\n'), 'text/plain');
+        var summary = 'Exported ' + urlList.length + ' job URLs — ✅ ' + tally.submitted +
+          ' submitted (confirmed), ⏭️ ' + tally.skipped + ' skipped, 🚫 ' + tally.closed +
+          ' closed, ⚠️ ' + tally.error + ' error, … ' + tally.pending + ' pending';
+        try { addLog(summary, tally.submitted ? 'success' : ''); } catch (_) {}
+        try { alert(summary + '\n\nTwo files downloaded:\n• CSV (with an "outcome" column — re-importable into the Queue Manager)\n• TXT (plain URL list)\n\n"submitted" = OptimHire reported a real confirmation. "skipped" = NOT submitted (usually required fields it could not fill).'); } catch (_) {}
+      });
+    } catch (_) {}
+  }
+
+  /* ════════════════════════════════════════════════════════════
      CSV JOB QUEUE — sidepanel card
      ════════════════════════════════════════════════════════════
      Lives in the otherwise-empty sidepanel space and surfaces the
@@ -1621,14 +1845,21 @@
           '<span style="background:rgba(74,222,128,.15);padding:3px 8px;border-radius:6px;color:#4ade80" id="oh-qc-applied">0 applied</span>' +
           '<span style="background:rgba(239,68,68,.15);padding:3px 8px;border-radius:6px;color:#f87171" id="oh-qc-failed">0 failed</span>' +
         '</div>' +
-        '<div style="display:flex;gap:6px;flex-wrap:wrap">' +
+        '<div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:6px">' +
           '<button id="oh-qc-open" style="flex:1;background:linear-gradient(135deg,#6366f1,#8b5cf6);' +
             'color:#fff;border:none;padding:8px 12px;border-radius:8px;font-size:12px;font-weight:600;cursor:pointer">' +
             'Open Queue Manager</button>' +
           '<button id="oh-qc-debug" title="Open the debug log viewer" style="background:#2d2f3a;' +
             'color:#e2e8f0;border:1px solid #3a3d4a;padding:8px 10px;border-radius:8px;font-size:12px;cursor:pointer">' +
             '🐞</button>' +
-        '</div>';
+        '</div>' +
+        '<button id="oh-qc-export" title="Export every job URL OptimHire auto-apply has gone through this session — CSV (re-importable into the Queue Manager) or a plain URL list" ' +
+          'style="width:100%;background:#0f1117;color:#c4b5fd;border:1px solid #3a3d4a;' +
+          'padding:7px 10px;border-radius:8px;font-size:11.5px;cursor:pointer">' +
+          '⬇ Export queue job URLs (0)</button>' +
+        '<div id="oh-qc-truth" title="OptimHire’s ‘X applied’ counter also counts SKIPS. This shows how many actually got a real submission confirmation." ' +
+          'style="margin-top:7px;font-size:10.5px;color:#94a3b8;line-height:1.5;text-align:center">' +
+          'Real outcome: — submitted · — skipped</div>';
       /* Always append to <body> as a fixed overlay — never insert as a
          sibling of #__plasmo (that risked disturbing React). */
       document.body.appendChild(card);
@@ -1640,6 +1871,10 @@
       if (dbgBtn) dbgBtn.addEventListener('click', function () {
         try { chrome.tabs.create({ url: chrome.runtime.getURL('tabs/debug.html'), active: true }); }
         catch (_) {}
+      });
+      var exportBtn = document.getElementById('oh-qc-export');
+      if (exportBtn) exportBtn.addEventListener('click', function () {
+        exportHarvestedJobs();
       });
       /* × collapses the card to a small re-open pill in the corner. */
       var collapse = document.getElementById('oh-qc-collapse');
@@ -1688,6 +1923,27 @@
           var ind = document.getElementById('oh-qc-indicator');
           if (ind) ind.style.display = d[KEY_ACTIVE] ? '' : 'none';
         });
+        chrome.storage.local.get(['ohHarvestedJobs'], function (d) {
+          var map = (d && d.ohHarvestedJobs) || {};
+          var n = 0, sub = 0, skip = 0, other = 0;
+          for (var k in map) {
+            if (!Object.prototype.hasOwnProperty.call(map, k)) continue;
+            n++;
+            var oc = map[k].outcome;
+            if (oc === 'submitted') sub++;
+            else if (oc === 'skipped') skip++;
+            else if (oc === 'closed' || oc === 'error') other++;
+          }
+          var btn = document.getElementById('oh-qc-export');
+          if (btn) btn.textContent = '⬇ Export queue job URLs (' + n + ')';
+          var truth = document.getElementById('oh-qc-truth');
+          if (truth) {
+            truth.innerHTML = 'Real outcome: ' +
+              '<b style="color:#4ade80">' + sub + ' submitted</b> · ' +
+              '<b style="color:#fbbf24">' + skip + ' skipped</b>' +
+              (other ? ' · <span style="color:#f87171">' + other + ' closed/err</span>' : '');
+          }
+        });
       } catch (_) {}
     }
 
@@ -1696,7 +1952,7 @@
       setInterval(refresh, 5000);
       try {
         chrome.storage.onChanged.addListener(function (changes, area) {
-          if (area === 'local' && (changes[KEY_QUEUE] || changes[KEY_ACTIVE])) refresh();
+          if (area === 'local' && (changes[KEY_QUEUE] || changes[KEY_ACTIVE] || changes.ohHarvestedJobs)) refresh();
         });
       } catch (_) {}
     }
