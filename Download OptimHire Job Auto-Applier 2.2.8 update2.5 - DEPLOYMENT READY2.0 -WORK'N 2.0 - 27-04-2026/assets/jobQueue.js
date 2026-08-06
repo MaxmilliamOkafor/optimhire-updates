@@ -122,8 +122,44 @@
       });
     });
   }
+  /* Merge-on-write. ohJobQueue has three independent read-modify-write
+     writers (here, plus the content script's advance() and its
+     self-navigate fallback). Blindly writing our cached array clobbered
+     whatever the content script had just recorded — a job it had marked
+     applied/failed could be reset to 'pending' and then reopened, which
+     is how one job ended up in dozens of tabs. Re-read immediately before
+     writing and never regress a job that has already reached a terminal
+     state, nor lower its attempts counter. */
+  const TERMINAL = new Set(['applied', 'failed', 'skipped']);
   function saveQueue() {
-    return new Promise(res => { ST.set({ [KEY_QUEUE]: queue }, res); });
+    return new Promise(res => {
+      ST.get([KEY_QUEUE], (d) => {
+        const stored = Array.isArray(d[KEY_QUEUE]) ? d[KEY_QUEUE] : [];
+        const byId = new Map(stored.map(j => [j.id, j]));
+        const merged = queue.map(mine => {
+          const theirs = byId.get(mine.id);
+          if (!theirs) return mine;
+          const out = Object.assign({}, mine);
+          /* Terminal status recorded elsewhere always wins over our
+             possibly-stale in-memory copy. */
+          if (TERMINAL.has(theirs.status) && !TERMINAL.has(mine.status)) {
+            out.status = theirs.status;
+            out.lastError = theirs.lastError || out.lastError;
+            out.appliedAt = theirs.appliedAt || out.appliedAt;
+            if (theirs.confirmed !== undefined) out.confirmed = theirs.confirmed;
+            if (theirs.confirmedBy !== undefined) out.confirmedBy = theirs.confirmedBy;
+          }
+          /* attempts only ever moves forward */
+          out.attempts = Math.max(mine.attempts || 0, theirs.attempts || 0);
+          return out;
+        });
+        /* Keep any job that exists in storage but not in our cache. */
+        const mineIds = new Set(queue.map(j => j.id));
+        for (const j of stored) if (!mineIds.has(j.id)) merged.push(j);
+        queue = merged;
+        ST.set({ [KEY_QUEUE]: merged }, res);
+      });
+    });
   }
   function getRunnerState() {
     return new Promise(res => {
@@ -411,6 +447,9 @@
      we only ever create/close tabs we opened ourselves (tracked in
      _tabMap) and only navigate via fresh chrome.tabs.create.
      ────────────────────────────────────────────────────────── */
+  /* A job may be opened at most this many times, ever. Hard backstop
+     against any race that returns an already-opened job to 'pending'. */
+  const MAX_OPEN_ATTEMPTS = 3;
   const KEY_CONCURRENCY = 'ohJobQueueConcurrency';
   const KEY_ADVANCE_REQ = 'ohJobQueueAdvanceReq';
   let _tabMap = new Map();       // jobId → tabId (tabs WE opened)
@@ -514,8 +553,39 @@
         const live = await liveJobTabCount();
         if (live >= conc) break;
         /* Pick the next pending job from the LIVE queue, and capture only
-           its id — never an object reference that an await could stale. */
-        const candidate = queue.find(j => j.status === 'pending' && !_tabMap.has(j.id));
+           its id — never an object reference that an await could stale.
+           Two extra guards make repeat-opening structurally impossible:
+             • attempts cap — ohJobQueue has THREE independent
+               read-modify-write writers (this saveQueue(), and the content
+               script's advance() and self-navigate fallback). A stale
+               write can clobber a job back to 'pending' after we already
+               opened it, so without a cap the same job is reopened
+               forever (this is what produced dozens of tabs for one job).
+             • URL dedupe — never open a URL we already have a tab for,
+               even if it appears under a different job id. */
+        const openUrls = new Set();
+        for (const [jid] of _tabMap) {
+          const t = queue.find(j => j.id === jid);
+          if (t && t.url) openUrls.add(normaliseUrl(t.url));
+        }
+        const candidate = queue.find(j =>
+          j.status === 'pending' &&
+          !_tabMap.has(j.id) &&
+          (j.attempts || 0) < MAX_OPEN_ATTEMPTS &&
+          !(j.url && openUrls.has(normaliseUrl(j.url)))
+        );
+        /* Retire anything that blew the attempts cap so it can't be
+           re-selected on the next pass either. */
+        let retired = false;
+        for (const j of queue) {
+          if (j.status === 'pending' && (j.attempts || 0) >= MAX_OPEN_ATTEMPTS) {
+            j.status = 'failed';
+            j.lastError = `gave up after ${MAX_OPEN_ATTEMPTS} open attempts`;
+            j.lastActionTs = Date.now();
+            retired = true;
+          }
+        }
+        if (retired) await saveQueue();
         if (!candidate) break;
         const jobId = candidate.id;
         const jobUrl = candidate.url;
