@@ -1060,6 +1060,10 @@
 
     function evaluate(st) {
       var now = Date.now();
+      /* Only act while an auto-apply session is genuinely running. A stale
+         autoApplyState left in storage would otherwise keep firing Skip,
+         and every Skip makes OptimHire open the next job in a NEW TAB. */
+      if (!st || st.isActive !== true) { _blockedSince = 0; _blockedKey = ''; return; }
       if (!isBlocked(st)) { _blockedSince = 0; _blockedKey = ''; return; }
       if (isSubmitSuppressed()) { _blockedSince = 0; return; }
       var key = jobKeyOf(st);

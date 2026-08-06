@@ -366,6 +366,61 @@
     }
   }
 
+  /* ── Active-job-tab gate (CRITICAL: prevents runaway tab spawning) ───
+   * This content script runs in EVERY tab. Several independent watchdogs
+   * send { action:'skipCurrent' }, and OptimHire answers a skipCurrent by
+   * OPENING THE NEXT JOB IN A NEW TAB. Because those watchdogs were not
+   * scoped to the tab actually being automated, any unrelated tab the
+   * user had open (Indeed, Ashby, a job board…) would eventually report
+   * "no progress" and fire a skip — spawning a job tab, whose content
+   * script then ran the same watchdogs and skipped again. That feedback
+   * loop is what buried the browser in tabs.
+   *
+   * A queue-advancing message may now only be sent from the tab that is
+   * genuinely the current job: the URL matches OptimHire's active job
+   * (autoApplyState.applicationDetails.source.apply_now_url), or a
+   * 'running' CSV-queue job, or the user just triggered autofill here.
+   * ────────────────────────────────────────────────────────────────── */
+  function _urlsMatchLoose(a, b) {
+    try {
+      const ua = new URL(a), ub = new URL(b);
+      if (ua.hostname.toLowerCase() !== ub.hostname.toLowerCase()) return false;
+      const pa = ua.pathname.split('/').filter(Boolean);
+      const pb = ub.pathname.split('/').filter(Boolean);
+      if (!pa.length || !pb.length) return true;
+      return pa[0] === pb[0];
+    } catch (_) { return false; }
+  }
+
+  async function isActiveJobTab() {
+    try {
+      if (window.top !== window.self) return false;   // never from sub-frames
+      if (Date.now() - _manualTriggerTs < 30_000) return true;  // user acted here
+      const d = await ST.get(['autoApplyState', 'ohJobQueue', 'ohJobQueueActive']);
+      const here = location.href;
+      const ad = d.autoApplyState && d.autoApplyState.applicationDetails;
+      const applyUrl = ad && ad.source && ad.source.apply_now_url;
+      if (applyUrl && _urlsMatchLoose(here, applyUrl)) return true;
+      if (d.ohJobQueueActive && Array.isArray(d.ohJobQueue)) {
+        if (d.ohJobQueue.some(j => j && j.status === 'running' &&
+                                   j.url && _urlsMatchLoose(here, j.url))) return true;
+      }
+      return false;
+    } catch (_) { return false; }
+  }
+
+  /* The ONLY way this file may ask the queue to advance. Silently drops
+     the request unless this tab is the active job. */
+  async function requestSkipCurrent(reason) {
+    if (!(await isActiveJobTab())) {
+      LOG(`skipCurrent suppressed (not the active job tab): ${reason || ''}`);
+      return false;
+    }
+    try { chrome.runtime.sendMessage({ action: 'skipCurrent' }).catch(() => {}); } catch (_) {}
+    LOG(`skipCurrent sent: ${reason || ''}`);
+    return true;
+  }
+
   /* User explicitly clicked Autofill on this tab → arm manual mode for 30s */
   chrome.runtime.onMessage.addListener((msg) => {
     if (!msg) return;
@@ -2881,7 +2936,7 @@
           return;
         }
         LOG('Missing-details iframe still present after 8s — force-skipping');
-        chrome.runtime.sendMessage({ action: 'skipCurrent' }).catch(() => {});
+        await requestSkipCurrent('missing-details iframe stuck');
         // Also remove the iframe so the page is unblocked
         try {
           still.remove();
@@ -2999,7 +3054,7 @@
       /* No progress signal at all — has it been long enough? */
       if (now - _lastProgressTs >= STUCK_TIMEOUT_MS) {
         LOG(`Stuck watchdog: no progress for ${STUCK_TIMEOUT_MS/1000}s on ${cur} — force-skipping`);
-        chrome.runtime.sendMessage({ action: 'skipCurrent' }).catch(() => {});
+        requestSkipCurrent('stuck watchdog');
         _lastProgressTs = now; // cooldown so we don't spam skips
       }
     }
@@ -3456,17 +3511,13 @@
         try { realClick(btn); } catch (_) { try { btn.click(); } catch (__) {} }
         /* Also tell the queue to advance — even if the dismiss closes the
            modal, the underlying page might not navigate. */
-        setTimeout(() => {
-          try { chrome.runtime.sendMessage({ action: 'skipCurrent' }).catch(() => {}); }
-          catch (_) {}
-        }, 600);
+        setTimeout(() => { requestSkipCurrent('already-applied dismissed'); }, 600);
         return;
       }
       /* No dismiss button found — just skip */
       _dismissedFingerprints.add(fp);
       LOG('Flow: already-applied detected, no dismiss button — skipping');
-      try { chrome.runtime.sendMessage({ action: 'skipCurrent' }).catch(() => {}); }
-      catch (_) {}
+      requestSkipCurrent('already-applied, no dismiss button');
     }
 
     /* ── T43: Generic terminal-submit fallback ──
@@ -3538,8 +3589,7 @@
       if (requiredFieldsSatisfied()) return;
       _missingSkipFiredForUrl = location.href;
       LOG(`Flow: missing required fields ${MISSING_SKIP_MS/1000}s after fill — skipCurrent`);
-      try { chrome.runtime.sendMessage({ action: 'skipCurrent' }).catch(() => {}); }
-      catch (_) {}
+      requestSkipCurrent('required fields unsatisfied after fill');
     }
 
     /* URL-change resets the fingerprint cache, the per-URL fill flag,
