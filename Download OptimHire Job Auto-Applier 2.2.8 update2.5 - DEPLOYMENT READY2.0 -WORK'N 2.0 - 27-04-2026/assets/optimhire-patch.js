@@ -707,6 +707,13 @@
 
   /* ── T16: Hide referral / upgrade / credit-count UI ───────── */
   (function hideReferral() {
+    /* SCOPE GUARD: this only ever needs to hide OptimHire's own referral
+       and upgrade UI, but the stylesheet below was previously injected
+       into EVERY site. Substring selectors like [class*="referral"] and
+       [class*="affiliate"] are common class fragments on job boards, so
+       on third-party sites this silently hid legitimate content. Bail out
+       entirely unless we are on optimhire.com. */
+    if (!/(^|\.)optimhire\.com$/i.test(location.hostname)) return;
     /* CSS-only rules first: safe selectors that cannot match the
        page root. */
     const style = document.createElement('style');
@@ -4537,22 +4544,53 @@
     const badge = document.createElement('span');
     badge.className = 'oh-fresh';
     badge.textContent = text;
-    badge.style.cssText = `display:inline-block;background:${color};color:#fff;
+    /* Layout-safe styling. A plain inline-block span becomes a FLEX ITEM
+       when the host card is a flex/grid container and stretches to the
+       full row width — that is what smeared giant green/red bars across
+       third-party job boards. Pinning flex/grid sizing and max-width
+       keeps the badge inert inside any layout. */
+    badge.style.cssText = `display:inline-block!important;background:${color};color:#fff;
       font-size:10px;font-weight:700;padding:2px 7px;border-radius:20px;
-      margin-left:6px;vertical-align:middle;`;
+      margin-left:6px;vertical-align:middle;
+      flex:0 0 auto!important;align-self:center!important;grid-area:auto!important;
+      width:auto!important;max-width:max-content!important;height:auto!important;
+      position:static!important;float:none!important;box-sizing:border-box!important;
+      line-height:1.4!important;white-space:nowrap!important;pointer-events:none;`;
     const heading = el.querySelector('h1,h2,h3,h4,a');
     if (heading) heading.after(badge); else el.prepend(badge);
   }
 
+  /* Freshness badges are cosmetic and inject into OTHER sites' markup, so
+     they are OFF unless explicitly enabled (ohFreshBadges === true).
+     They previously ran on every page every 4s with very broad selectors
+     ([class*="result-"], [class*="listing"]) that matched large layout
+     containers rather than job cards, visibly breaking sites such as
+     jobright.ai. Nothing in the auto-apply flow depends on them. */
+  let _freshBadgesEnabled = false;
   function processFreshness() {
+    if (!_freshBadgesEnabled) return;
     $$(
-      '.jobsearch-SerpJobCard,.job_seen_beacon,[class*="result-"],' + /* Indeed */
+      '.jobsearch-SerpJobCard,.job_seen_beacon,' +                     /* Indeed */
       '.jobs-search-results__list-item,.job-card-container,' +         /* LinkedIn */
-      '[class*="job-card"],[class*="jobCard"],[class*="listing"]'      /* Generic */
+      '[class*="job-card"],[class*="jobCard"]'                         /* Generic */
     ).forEach(addFreshBadge);
   }
+  /* Remove any badges we already injected when the feature is disabled. */
+  function clearFreshBadges() {
+    try { $$('.oh-fresh').forEach(b => b.remove()); } catch (_) {}
+  }
+  try {
+    ST.get(['ohFreshBadges'], (d) => {
+      _freshBadgesEnabled = !!(d && d.ohFreshBadges === true);
+      if (_freshBadgesEnabled) processFreshness(); else clearFreshBadges();
+    });
+    chrome.storage.onChanged.addListener((c, a) => {
+      if (a !== 'local' || !c.ohFreshBadges) return;
+      _freshBadgesEnabled = c.ohFreshBadges.newValue === true;
+      if (_freshBadgesEnabled) processFreshness(); else clearFreshBadges();
+    });
+  } catch (_) {}
   setInterval(processFreshness, 4000);
-  processFreshness();
 
   /* ── T30a: Recruitee autofill ───────────────────────────── */
   async function recruiteeAutofill() {
