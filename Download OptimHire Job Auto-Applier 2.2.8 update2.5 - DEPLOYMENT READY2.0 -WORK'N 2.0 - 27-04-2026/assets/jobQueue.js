@@ -122,8 +122,44 @@
       });
     });
   }
+  /* Merge-on-write. ohJobQueue has three independent read-modify-write
+     writers (here, plus the content script's advance() and its
+     self-navigate fallback). Blindly writing our cached array clobbered
+     whatever the content script had just recorded — a job it had marked
+     applied/failed could be reset to 'pending' and then reopened, which
+     is how one job ended up in dozens of tabs. Re-read immediately before
+     writing and never regress a job that has already reached a terminal
+     state, nor lower its attempts counter. */
+  const TERMINAL = new Set(['applied', 'failed', 'skipped']);
   function saveQueue() {
-    return new Promise(res => { ST.set({ [KEY_QUEUE]: queue }, res); });
+    return new Promise(res => {
+      ST.get([KEY_QUEUE], (d) => {
+        const stored = Array.isArray(d[KEY_QUEUE]) ? d[KEY_QUEUE] : [];
+        const byId = new Map(stored.map(j => [j.id, j]));
+        const merged = queue.map(mine => {
+          const theirs = byId.get(mine.id);
+          if (!theirs) return mine;
+          const out = Object.assign({}, mine);
+          /* Terminal status recorded elsewhere always wins over our
+             possibly-stale in-memory copy. */
+          if (TERMINAL.has(theirs.status) && !TERMINAL.has(mine.status)) {
+            out.status = theirs.status;
+            out.lastError = theirs.lastError || out.lastError;
+            out.appliedAt = theirs.appliedAt || out.appliedAt;
+            if (theirs.confirmed !== undefined) out.confirmed = theirs.confirmed;
+            if (theirs.confirmedBy !== undefined) out.confirmedBy = theirs.confirmedBy;
+          }
+          /* attempts only ever moves forward */
+          out.attempts = Math.max(mine.attempts || 0, theirs.attempts || 0);
+          return out;
+        });
+        /* Keep any job that exists in storage but not in our cache. */
+        const mineIds = new Set(queue.map(j => j.id));
+        for (const j of stored) if (!mineIds.has(j.id)) merged.push(j);
+        queue = merged;
+        ST.set({ [KEY_QUEUE]: merged }, res);
+      });
+    });
   }
   function getRunnerState() {
     return new Promise(res => {
@@ -411,6 +447,9 @@
      we only ever create/close tabs we opened ourselves (tracked in
      _tabMap) and only navigate via fresh chrome.tabs.create.
      ────────────────────────────────────────────────────────── */
+  /* A job may be opened at most this many times, ever. Hard backstop
+     against any race that returns an already-opened job to 'pending'. */
+  const MAX_OPEN_ATTEMPTS = 3;
   const KEY_CONCURRENCY = 'ohJobQueueConcurrency';
   const KEY_ADVANCE_REQ = 'ohJobQueueAdvanceReq';
   let _tabMap = new Map();       // jobId → tabId (tabs WE opened)
@@ -432,32 +471,166 @@
     return n;
   }
 
-  /* Open up to `concurrency` pending jobs, each in its own tab. */
+  /* Drop entries from _tabMap whose tab no longer exists, and return the
+     number of job tabs we ACTUALLY still have open. Trusting _tabMap (or
+     a job's stored status) alone was unsafe: if chrome.tabs.create ever
+     failed to yield a tab id, the "running with tab" count stayed 0 and
+     the fill loop kept opening tabs forever. */
+  async function liveJobTabCount() {
+    const entries = [..._tabMap.entries()];
+    let live = 0;
+    for (const [jobId, tabId] of entries) {
+      /* -1 is an in-flight reservation (tab being created right now).
+         It occupies a slot but has no real tab to query yet. */
+      if (tabId === -1) { live++; continue; }
+      const ok = await new Promise(res => {
+        try {
+          chrome.tabs.get(tabId, (t) => {
+            const err = chrome.runtime.lastError;
+            res(!err && !!t);
+          });
+        } catch (_) { res(false); }
+      });
+      if (ok) live++; else _tabMap.delete(jobId);
+    }
+    return live;
+  }
+
+  /* ── Single-orchestrator election ──────────────────────────────────
+     Every open copy of this page runs its own orchestrator with its own
+     _tabMap and _orchestrating guard, so two Queue Manager tabs meant
+     two independent fillers each opening `concurrency` tabs — a second
+     way to end up with a wall of tabs. Exactly one instance (identified
+     by its own chrome tab id) owns orchestration; the others render the
+     UI read-only. Ownership is reclaimed if the owner tab is gone. */
+  const KEY_OWNER = 'ohJobQueueOwnerTab';
+  let _myTabId = null;
+
+  function getMyTabId() {
+    return new Promise(res => {
+      try { chrome.tabs.getCurrent(t => res(t && t.id != null ? t.id : null)); }
+      catch (_) { res(null); }
+    });
+  }
+  function tabExists(tabId) {
+    return new Promise(res => {
+      if (tabId == null) return res(false);
+      try {
+        chrome.tabs.get(tabId, (t) => res(!chrome.runtime.lastError && !!t));
+      } catch (_) { res(false); }
+    });
+  }
+  /* True when this page is (or just became) the orchestration owner. */
+  async function claimOwnership() {
+    if (_myTabId == null) _myTabId = await getMyTabId();
+    if (_myTabId == null) return true;   // not in a tab context — act alone
+    const d = await new Promise(r => ST.get([KEY_OWNER], r));
+    const owner = d && d[KEY_OWNER];
+    if (owner === _myTabId) return true;
+    if (owner != null && await tabExists(owner)) return false;  // someone else owns it
+    await new Promise(r => ST.set({ [KEY_OWNER]: _myTabId }, r));
+    return true;
+  }
+
+  /* Open up to `concurrency` pending jobs, each in its own tab.
+     Hardened against the runaway-tab bug: the loop is bounded, every job
+     is re-looked-up from the LIVE queue after each await (the storage
+     listener REPLACES the `queue` array, so any reference held across an
+     await is stale and mutating it silently did nothing — leaving the job
+     'pending' so it was picked again and again), and the slot count comes
+     from tabs that verifiably exist. */
   async function fillSlots() {
     if (_orchestrating) return; _orchestrating = true;
     try {
+      /* Only the elected owner opens tabs, so extra Queue Manager tabs
+         can't each spawn their own set. */
+      if (!(await claimOwnership())) return;
       const conc = getConcurrency();
       let opened = false;
-      while (runningWithTab() < conc) {
-        const next = queue.find(j => j.status === 'pending');
-        if (!next) break;
-        next.status = 'running';
-        next.attempts = (next.attempts || 0) + 1;
-        next.lastActionTs = Date.now();
+      /* Hard bound: never open more than `conc` tabs per invocation, no
+         matter what the counters say. */
+      for (let guard = 0; guard < conc; guard++) {
+        const live = await liveJobTabCount();
+        if (live >= conc) break;
+        /* Pick the next pending job from the LIVE queue, and capture only
+           its id — never an object reference that an await could stale.
+           Two extra guards make repeat-opening structurally impossible:
+             • attempts cap — ohJobQueue has THREE independent
+               read-modify-write writers (this saveQueue(), and the content
+               script's advance() and self-navigate fallback). A stale
+               write can clobber a job back to 'pending' after we already
+               opened it, so without a cap the same job is reopened
+               forever (this is what produced dozens of tabs for one job).
+             • URL dedupe — never open a URL we already have a tab for,
+               even if it appears under a different job id. */
+        const openUrls = new Set();
+        for (const [jid] of _tabMap) {
+          const t = queue.find(j => j.id === jid);
+          if (t && t.url) openUrls.add(normaliseUrl(t.url));
+        }
+        const candidate = queue.find(j =>
+          j.status === 'pending' &&
+          !_tabMap.has(j.id) &&
+          (j.attempts || 0) < MAX_OPEN_ATTEMPTS &&
+          !(j.url && openUrls.has(normaliseUrl(j.url)))
+        );
+        /* Retire anything that blew the attempts cap so it can't be
+           re-selected on the next pass either. */
+        let retired = false;
+        for (const j of queue) {
+          if (j.status === 'pending' && (j.attempts || 0) >= MAX_OPEN_ATTEMPTS) {
+            j.status = 'failed';
+            j.lastError = `gave up after ${MAX_OPEN_ATTEMPTS} open attempts`;
+            j.lastActionTs = Date.now();
+            retired = true;
+          }
+        }
+        if (retired) await saveQueue();
+        if (!candidate) break;
+        const jobId = candidate.id;
+        const jobUrl = candidate.url;
+        if (!jobUrl) { /* nothing to open — mark failed so we can't spin */
+          const bad = queue.find(j => j.id === jobId);
+          if (bad) { bad.status = 'failed'; bad.lastError = 'missing URL'; }
+          await saveQueue();
+          continue;
+        }
+        /* Reserve the slot BEFORE the async tab creation so a re-entrant
+           or concurrent pass can't select the same job again. */
+        _tabMap.set(jobId, -1);   // placeholder: reserved, tab not yet known
+        const jobRef = queue.find(j => j.id === jobId);
+        if (jobRef) {
+          jobRef.status = 'running';
+          jobRef.attempts = (jobRef.attempts || 0) + 1;
+          jobRef.lastActionTs = Date.now();
+        }
         await saveQueue();
-        /* Open in a NEW tab, ACTIVE. A background (active:false) tab is
-           throttled by Chrome and often never lays out, so the content
-           script couldn't detect the form and autofill never ran — the
-           exact "automation doesn't start" the user hit. Opening active
-           guarantees the page renders so autofill fires. At concurrency 1
-           (default) only one job tab is focused at a time; it's a
-           separate tab so the OptimHire my-jobs page is untouched. */
+        /* Open in a NEW tab. Kept in the background so a run can never
+           steal focus or pile visible tabs over the user's work; the
+           content script's queue runner drives the fill regardless. */
         const tab = await new Promise(res => {
-          try { chrome.tabs.create({ url: next.url, active: true }, res); }
-          catch (_) { res(null); }
+          try {
+            chrome.tabs.create({ url: jobUrl, active: false }, (t) => {
+              const err = chrome.runtime.lastError;
+              res(err ? null : t);
+            });
+          } catch (_) { res(null); }
         });
-        if (tab && tab.id != null) _tabMap.set(next.id, tab.id);
-        opened = true;
+        if (tab && tab.id != null) {
+          _tabMap.set(jobId, tab.id);
+          opened = true;
+        } else {
+          /* Tab creation failed — release the reservation and mark the job
+             failed so the loop cannot retry it indefinitely. */
+          _tabMap.delete(jobId);
+          const failed = queue.find(j => j.id === jobId);
+          if (failed) {
+            failed.status = 'failed';
+            failed.lastError = 'could not open tab';
+            failed.lastActionTs = Date.now();
+          }
+          await saveQueue();
+        }
       }
       if (opened) render();
     } catch (_) {} finally { _orchestrating = false; }
@@ -468,6 +641,7 @@
     const tabId = _tabMap.get(jobId);
     if (tabId == null) return;
     _tabMap.delete(jobId);
+    if (tabId === -1) return;   // reservation only — no real tab yet
     try { chrome.tabs.remove(tabId, () => void chrome.runtime.lastError); } catch (_) {}
   }
 
@@ -508,6 +682,10 @@
        those tabs, so re-queue them cleanly. */
     for (const j of queue) if (j.status === 'running') j.status = 'pending';
     _tabMap.clear();
+    /* The tab the user pressed Start in becomes the orchestration owner,
+       taking over from any stale owner. */
+    if (_myTabId == null) _myTabId = await getMyTabId();
+    if (_myTabId != null) await new Promise(r => ST.set({ [KEY_OWNER]: _myTabId }, r));
     await saveQueue();
     await new Promise(res => ST.set({
       [KEY_ACTIVE]: true, [KEY_CURRENT]: null, [KEY_ADVANCE_REQ]: null,
@@ -531,6 +709,7 @@
     }, res));
     /* Close every tab we opened and demote running jobs. */
     for (const [, tabId] of _tabMap) {
+      if (tabId === -1) continue;   // reservation only — no real tab
       try { chrome.tabs.remove(tabId, () => void chrome.runtime.lastError); } catch (_) {}
     }
     _tabMap.clear();

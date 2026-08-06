@@ -366,6 +366,61 @@
     }
   }
 
+  /* ── Active-job-tab gate (CRITICAL: prevents runaway tab spawning) ───
+   * This content script runs in EVERY tab. Several independent watchdogs
+   * send { action:'skipCurrent' }, and OptimHire answers a skipCurrent by
+   * OPENING THE NEXT JOB IN A NEW TAB. Because those watchdogs were not
+   * scoped to the tab actually being automated, any unrelated tab the
+   * user had open (Indeed, Ashby, a job board…) would eventually report
+   * "no progress" and fire a skip — spawning a job tab, whose content
+   * script then ran the same watchdogs and skipped again. That feedback
+   * loop is what buried the browser in tabs.
+   *
+   * A queue-advancing message may now only be sent from the tab that is
+   * genuinely the current job: the URL matches OptimHire's active job
+   * (autoApplyState.applicationDetails.source.apply_now_url), or a
+   * 'running' CSV-queue job, or the user just triggered autofill here.
+   * ────────────────────────────────────────────────────────────────── */
+  function _urlsMatchLoose(a, b) {
+    try {
+      const ua = new URL(a), ub = new URL(b);
+      if (ua.hostname.toLowerCase() !== ub.hostname.toLowerCase()) return false;
+      const pa = ua.pathname.split('/').filter(Boolean);
+      const pb = ub.pathname.split('/').filter(Boolean);
+      if (!pa.length || !pb.length) return true;
+      return pa[0] === pb[0];
+    } catch (_) { return false; }
+  }
+
+  async function isActiveJobTab() {
+    try {
+      if (window.top !== window.self) return false;   // never from sub-frames
+      if (Date.now() - _manualTriggerTs < 30_000) return true;  // user acted here
+      const d = await ST.get(['autoApplyState', 'ohJobQueue', 'ohJobQueueActive']);
+      const here = location.href;
+      const ad = d.autoApplyState && d.autoApplyState.applicationDetails;
+      const applyUrl = ad && ad.source && ad.source.apply_now_url;
+      if (applyUrl && _urlsMatchLoose(here, applyUrl)) return true;
+      if (d.ohJobQueueActive && Array.isArray(d.ohJobQueue)) {
+        if (d.ohJobQueue.some(j => j && j.status === 'running' &&
+                                   j.url && _urlsMatchLoose(here, j.url))) return true;
+      }
+      return false;
+    } catch (_) { return false; }
+  }
+
+  /* The ONLY way this file may ask the queue to advance. Silently drops
+     the request unless this tab is the active job. */
+  async function requestSkipCurrent(reason) {
+    if (!(await isActiveJobTab())) {
+      LOG(`skipCurrent suppressed (not the active job tab): ${reason || ''}`);
+      return false;
+    }
+    try { chrome.runtime.sendMessage({ action: 'skipCurrent' }).catch(() => {}); } catch (_) {}
+    LOG(`skipCurrent sent: ${reason || ''}`);
+    return true;
+  }
+
   /* User explicitly clicked Autofill on this tab → arm manual mode for 30s */
   chrome.runtime.onMessage.addListener((msg) => {
     if (!msg) return;
@@ -707,6 +762,13 @@
 
   /* ── T16: Hide referral / upgrade / credit-count UI ───────── */
   (function hideReferral() {
+    /* SCOPE GUARD: this only ever needs to hide OptimHire's own referral
+       and upgrade UI, but the stylesheet below was previously injected
+       into EVERY site. Substring selectors like [class*="referral"] and
+       [class*="affiliate"] are common class fragments on job boards, so
+       on third-party sites this silently hid legitimate content. Bail out
+       entirely unless we are on optimhire.com. */
+    if (!/(^|\.)optimhire\.com$/i.test(location.hostname)) return;
     /* CSS-only rules first: safe selectors that cannot match the
        page root. */
     const style = document.createElement('style');
@@ -2874,7 +2936,7 @@
           return;
         }
         LOG('Missing-details iframe still present after 8s — force-skipping');
-        chrome.runtime.sendMessage({ action: 'skipCurrent' }).catch(() => {});
+        await requestSkipCurrent('missing-details iframe stuck');
         // Also remove the iframe so the page is unblocked
         try {
           still.remove();
@@ -2992,7 +3054,7 @@
       /* No progress signal at all — has it been long enough? */
       if (now - _lastProgressTs >= STUCK_TIMEOUT_MS) {
         LOG(`Stuck watchdog: no progress for ${STUCK_TIMEOUT_MS/1000}s on ${cur} — force-skipping`);
-        chrome.runtime.sendMessage({ action: 'skipCurrent' }).catch(() => {});
+        requestSkipCurrent('stuck watchdog');
         _lastProgressTs = now; // cooldown so we don't spam skips
       }
     }
@@ -3449,17 +3511,13 @@
         try { realClick(btn); } catch (_) { try { btn.click(); } catch (__) {} }
         /* Also tell the queue to advance — even if the dismiss closes the
            modal, the underlying page might not navigate. */
-        setTimeout(() => {
-          try { chrome.runtime.sendMessage({ action: 'skipCurrent' }).catch(() => {}); }
-          catch (_) {}
-        }, 600);
+        setTimeout(() => { requestSkipCurrent('already-applied dismissed'); }, 600);
         return;
       }
       /* No dismiss button found — just skip */
       _dismissedFingerprints.add(fp);
       LOG('Flow: already-applied detected, no dismiss button — skipping');
-      try { chrome.runtime.sendMessage({ action: 'skipCurrent' }).catch(() => {}); }
-      catch (_) {}
+      requestSkipCurrent('already-applied, no dismiss button');
     }
 
     /* ── T43: Generic terminal-submit fallback ──
@@ -3531,8 +3589,7 @@
       if (requiredFieldsSatisfied()) return;
       _missingSkipFiredForUrl = location.href;
       LOG(`Flow: missing required fields ${MISSING_SKIP_MS/1000}s after fill — skipCurrent`);
-      try { chrome.runtime.sendMessage({ action: 'skipCurrent' }).catch(() => {}); }
-      catch (_) {}
+      requestSkipCurrent('required fields unsatisfied after fill');
     }
 
     /* URL-change resets the fingerprint cache, the per-URL fill flag,
@@ -4537,22 +4594,53 @@
     const badge = document.createElement('span');
     badge.className = 'oh-fresh';
     badge.textContent = text;
-    badge.style.cssText = `display:inline-block;background:${color};color:#fff;
+    /* Layout-safe styling. A plain inline-block span becomes a FLEX ITEM
+       when the host card is a flex/grid container and stretches to the
+       full row width — that is what smeared giant green/red bars across
+       third-party job boards. Pinning flex/grid sizing and max-width
+       keeps the badge inert inside any layout. */
+    badge.style.cssText = `display:inline-block!important;background:${color};color:#fff;
       font-size:10px;font-weight:700;padding:2px 7px;border-radius:20px;
-      margin-left:6px;vertical-align:middle;`;
+      margin-left:6px;vertical-align:middle;
+      flex:0 0 auto!important;align-self:center!important;grid-area:auto!important;
+      width:auto!important;max-width:max-content!important;height:auto!important;
+      position:static!important;float:none!important;box-sizing:border-box!important;
+      line-height:1.4!important;white-space:nowrap!important;pointer-events:none;`;
     const heading = el.querySelector('h1,h2,h3,h4,a');
     if (heading) heading.after(badge); else el.prepend(badge);
   }
 
+  /* Freshness badges are cosmetic and inject into OTHER sites' markup, so
+     they are OFF unless explicitly enabled (ohFreshBadges === true).
+     They previously ran on every page every 4s with very broad selectors
+     ([class*="result-"], [class*="listing"]) that matched large layout
+     containers rather than job cards, visibly breaking sites such as
+     jobright.ai. Nothing in the auto-apply flow depends on them. */
+  let _freshBadgesEnabled = false;
   function processFreshness() {
+    if (!_freshBadgesEnabled) return;
     $$(
-      '.jobsearch-SerpJobCard,.job_seen_beacon,[class*="result-"],' + /* Indeed */
+      '.jobsearch-SerpJobCard,.job_seen_beacon,' +                     /* Indeed */
       '.jobs-search-results__list-item,.job-card-container,' +         /* LinkedIn */
-      '[class*="job-card"],[class*="jobCard"],[class*="listing"]'      /* Generic */
+      '[class*="job-card"],[class*="jobCard"]'                         /* Generic */
     ).forEach(addFreshBadge);
   }
+  /* Remove any badges we already injected when the feature is disabled. */
+  function clearFreshBadges() {
+    try { $$('.oh-fresh').forEach(b => b.remove()); } catch (_) {}
+  }
+  try {
+    ST.get(['ohFreshBadges'], (d) => {
+      _freshBadgesEnabled = !!(d && d.ohFreshBadges === true);
+      if (_freshBadgesEnabled) processFreshness(); else clearFreshBadges();
+    });
+    chrome.storage.onChanged.addListener((c, a) => {
+      if (a !== 'local' || !c.ohFreshBadges) return;
+      _freshBadgesEnabled = c.ohFreshBadges.newValue === true;
+      if (_freshBadgesEnabled) processFreshness(); else clearFreshBadges();
+    });
+  } catch (_) {}
   setInterval(processFreshness, 4000);
-  processFreshness();
 
   /* ── T30a: Recruitee autofill ───────────────────────────── */
   async function recruiteeAutofill() {
