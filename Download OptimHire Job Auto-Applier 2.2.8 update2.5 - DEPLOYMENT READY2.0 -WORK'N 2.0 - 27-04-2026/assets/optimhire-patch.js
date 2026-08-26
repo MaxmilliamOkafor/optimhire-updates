@@ -3386,9 +3386,63 @@
        reads on most ticks. */
     const automationActive = () => isAutomationActive();
 
+    /* OptimHire filled the form itself (its own engine, not ours) and is
+       now waiting for a human to press submit — the sidebar shows "Form
+       filled" / "Review and submit the form" / "Form ready for
+       submission". _everFilledOnThisUrl only flips for OUR fill passes,
+       so on those jobs fillStable() stayed false and the generic
+       terminal-submit (T43) never fired, which is why the user had to
+       click Submit by hand on some ATSes. Treat OptimHire's own
+       completed fill as an equally valid trigger. */
+    let _ohReadyState = null;
+    try {
+      ST.get(['autoApplyState'], d => { _ohReadyState = d && d.autoApplyState; });
+      chrome.storage.onChanged.addListener((c, a) => {
+        if (a === 'local' && c.autoApplyState) _ohReadyState = c.autoApplyState.newValue;
+      });
+    } catch (_) {}
+
+    const OH_READY_RE = /review and submit|form ready for submission|form filled|ready to submit/i;
+    function optimHireFilledReady() {
+      try {
+        const st = _ohReadyState;
+        if (!st || st.isActive !== true) return false;
+        const msg = String(st.statusMessage || '');
+        if (OH_READY_RE.test(msg)) return true;
+        /* progress >= 90 with no outstanding missing-questions error also
+           means its fill finished and it is holding at the submit step. */
+        if (typeof st.progress === 'number' && st.progress >= 90 &&
+            String(st.applicationState || '') !== 'missing-questions') return true;
+        return false;
+      } catch (_) { return false; }
+    }
+    /* Also catch the prompt rendered on the page/sidebar DOM itself. */
+    function pageSaysReviewAndSubmit() {
+      try {
+        const t = (document.body && document.body.innerText || '').slice(0, 4000);
+        return OH_READY_RE.test(t);
+      } catch (_) { return false; }
+    }
+
     function fillStable() {
       if (_fillActive) return false;
-      if (!_everFilledOnThisUrl) return false; // no fill ever happened here
+      if (!_everFilledOnThisUrl) {
+        /* Not our fill — but if OptimHire finished filling and every
+           visible required field is satisfied, the form is genuinely
+           ready to submit, so allow the terminal-submit to proceed.
+           requiredFieldsSatisfied() is vacuously true on a page with no
+           required fields, so demand that a real, populated form is
+           actually present before trusting this path. */
+        if (!(optimHireFilledReady() || pageSaysReviewAndSubmit())) return false;
+        if (!requiredFieldsSatisfied()) return false;
+        const reqCount = $$(
+          'input[required]:not([type=hidden]):not([type=submit]):not([type=button]),' +
+          'input[aria-required="true"]:not([type=hidden]):not([type=submit]):not([type=button]),' +
+          'textarea[required],textarea[aria-required="true"],' +
+          'select[required],select[aria-required="true"]'
+        ).filter(isVisible).length;
+        return reqCount > 0;
+      }
       if (Date.now() - _lastFillCompletedTs < SETTLE_MS) return false;
       return true;
     }
@@ -3527,7 +3581,11 @@
          - No validation errors are visible on the page
          - The page contains a button whose text matches a terminal pattern
        Marks _submitAttempted so the stuck watchdog doesn't fire. */
-    const T43_TERMINAL_RE = /^(submit\s+application|send\s+application|submit\s+my\s+application|complete\s+application|submit)$/i;
+    /* Terminal-submit wording varies by ATS. Kept anchored (^…$) so it
+       only matches a button whose ENTIRE label is a submit action, never
+       something like "Submit a referral". Ashby/Workable/Greenhouse/
+       Lever/iCIMS wording added so the user never has to press submit. */
+    const T43_TERMINAL_RE = /^(submit\s+application|submit\s+your\s+application|send\s+application|send\s+my\s+application|submit\s+my\s+application|complete\s+application|finish\s+application|submit\s+&\s+apply|submit\s+and\s+apply|submit\s+profile|send\s+profile|submit)$/i;
 
     async function tickGenericSubmit() {
       if (!await automationActive()) return;
