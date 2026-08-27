@@ -772,6 +772,55 @@
     if (d?.isAutoProcessStartJob) acquireWakeLock();
   });
 
+  /* ── Single-tab ownership for page-side automation ───────────────────
+   * This content script runs in EVERY tab. With two OptimHire tabs open
+   * both were pressing Apply and driving applications at once — the user
+   * saw applying jump between tab 1 and tab 2, and the browser bogged
+   * down under the duplicated work.
+   *
+   * Content scripts cannot read their own tab id, so ownership is
+   * elected through storage with a heartbeat: one instance holds
+   * ohTabOwner {id, ts}; others stand down. If the owner stops
+   * heartbeating (tab closed/navigated) another claims it within
+   * OWNER_STALE_MS.
+   * ────────────────────────────────────────────────────────────────── */
+  const _OWNER_ID = 'oh_' + Math.random().toString(36).slice(2) + Date.now().toString(36);
+  const OWNER_STALE_MS = 12_000;
+  let _ownerCache = { own: false, ts: 0 };
+
+  async function isAutomationOwnerTab() {
+    /* Cache so a 2s loop doesn't hit storage constantly. */
+    if (Date.now() - _ownerCache.ts < 2000) return _ownerCache.own;
+    try {
+      const d = await ST.get(['ohTabOwner']);
+      const cur = d && d.ohTabOwner;
+      const now = Date.now();
+      let own;
+      if (cur && cur.id === _OWNER_ID) {
+        await ST.set({ ohTabOwner: { id: _OWNER_ID, ts: now } });   // heartbeat
+        own = true;
+      } else if (!cur || !cur.ts || now - cur.ts > OWNER_STALE_MS) {
+        await ST.set({ ohTabOwner: { id: _OWNER_ID, ts: now } });   // claim
+        own = true;
+      } else {
+        own = false;                                                // someone else owns it
+      }
+      _ownerCache = { own, ts: now };
+      return own;
+    } catch (_) { return true; }   // storage unavailable → act alone
+  }
+  /* Release ownership when this tab goes away so the next one can act
+     immediately rather than waiting for the heartbeat to go stale. */
+  try {
+    window.addEventListener('pagehide', () => {
+      try {
+        ST.get(['ohTabOwner'], (d) => {
+          if (d && d.ohTabOwner && d.ohTabOwner.id === _OWNER_ID) ST.set({ ohTabOwner: null });
+        });
+      } catch (_) {}
+    });
+  } catch (_) {}
+
   /* ── Auto-press "Apply" on optimhire.com's job-apply page ────────────
    * OptimHire's WEB APP (optimhire.com/d/job-apply) renders its own
    * Skip / Apply pair at the bottom of each job, separate from the one
@@ -835,6 +884,8 @@
                         !!(d && d.ohJobQueueActive) ||
                         !!(d && d.ohAutoApplyEngaged);
         if (!engaged) return;
+        /* Only one tab may drive applications. */
+        if (!(await isAutomationOwnerTab())) return;
         if (_submitAttempted && Date.now() - _submitAttemptTs < 30_000) return;
         const btn = findApplyButton();
         if (!btn) return;
@@ -846,7 +897,7 @@
         try { realClick(btn); } catch (_) { try { btn.click(); } catch (__) {} }
       } catch (_) {}
     }
-    setInterval(tick, 1200);
+    setInterval(tick, 2000);
   })();
 
   /* ── Location typeahead rescue ───────────────────────────────────────
@@ -952,6 +1003,8 @@
         if (_tries >= MAX_TRIES) return;
         if (_fillActive) return;
         if (!(await isAutomationActive())) return;
+        /* Only rescue fields on the tab that is actually the current job. */
+        if (!(await isActiveJobTab())) return;
         const targets = findLocationInputs();
         if (!targets.length) return;
         _busy = true;
@@ -966,7 +1019,7 @@
         LOG('Location typeahead error', e);
       } finally { _busy = false; }
     }
-    setInterval(tick, 2500);
+    setInterval(tick, 4000);
   })();
 
   /* ── Auto-submit when OptimHire says "Review and submit the form" ────
@@ -1100,6 +1153,11 @@
                         !!(d && d.isAutoProcessStartJob) ||
                         !!(d && d.ohJobQueueActive);
         if (!engaged) return;
+        /* Confine the heavy DOM work to the tab that IS the current job.
+           Previously this ran in every tab that had automation engaged,
+           and document.body.innerText forces a full layout — with several
+           tabs open that alone made the browser crawl. */
+        if (!(await isActiveJobTab())) return;
 
         const pageReady = READY_RE.test((document.body && document.body.innerText || '').slice(0, 4000));
         const ready = ohSaysReady(d && d.autoApplyState) || pageReady;
@@ -1132,7 +1190,7 @@
         try { realClick(hit.btn); } catch (_) { try { hit.btn.click(); } catch (__) {} }
       } catch (_) {}
     }
-    setInterval(tick, 1500);
+    setInterval(tick, 2500);
   })();
 
   /* ── T16: Hide referral / upgrade / credit-count UI ───────── */

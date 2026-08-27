@@ -1160,8 +1160,13 @@
    * ─────────────────────────────────────────────────────────────────── */
   (function installAutoApplyClicker() {
     var COOLDOWN_MS = 4000;
+    var NOKEY_COOLDOWN_MS = 20000;  // much slower when we can't identify the job
+    var MAX_PER_MIN = 6;            // hard ceiling on presses per minute
+    var NO_KEY = ' nokey';
     var _lastClickTs = 0;
     var _lastJobKey = '';
+    var _recent = [];
+    var _clickedBtns = (typeof WeakSet !== 'undefined') ? new WeakSet() : { has: function(){return false;}, add: function(){} };
 
     function currentJobKey() {
       try {
@@ -1217,9 +1222,25 @@
               var btn = findApplyButton();
               if (!btn) return;
               var key = currentJobKey();
-              if (key && key === _lastJobKey) return; // already applied here
-              _lastJobKey = key;
-              _lastClickTs = Date.now();
+              /* Dedupe. The old guard was `if (key && key === _lastJobKey)`,
+                 which SKIPPED the check entirely whenever the key was
+                 empty (no h1/h2 rendered yet) — so Apply was re-pressed
+                 every cooldown, producing the repeated "Auto-pressed
+                 Apply" bursts. Dedupe on the button ELEMENT as well, so
+                 the same node is never clicked twice regardless of the
+                 key, and rate-cap the whole thing. */
+              if (_clickedBtns.has(btn)) return;
+              if (key && key === _lastJobKey) return;   // same job again
+              if (!key && _lastJobKey === NO_KEY && Date.now() - _lastClickTs < NOKEY_COOLDOWN_MS) return;
+              /* Hard rate cap: never more than MAX_PER_MIN presses a
+                 minute, whatever the DOM does. */
+              var now = Date.now();
+              _recent = _recent.filter(function (t) { return now - t < 60_000; });
+              if (_recent.length >= MAX_PER_MIN) return;
+              _recent.push(now);
+              _clickedBtns.add(btn);
+              _lastJobKey = key || NO_KEY;
+              _lastClickTs = now;
               try {
                 btn.dispatchEvent(new MouseEvent('mouseover', { bubbles: true }));
                 btn.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
