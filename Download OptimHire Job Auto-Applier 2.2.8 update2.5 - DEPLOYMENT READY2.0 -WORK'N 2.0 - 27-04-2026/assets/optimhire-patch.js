@@ -760,6 +760,83 @@
     if (d?.isAutoProcessStartJob) acquireWakeLock();
   });
 
+  /* ── Auto-press "Apply" on optimhire.com's job-apply page ────────────
+   * OptimHire's WEB APP (optimhire.com/d/job-apply) renders its own
+   * Skip / Apply pair at the bottom of each job, separate from the one
+   * inside the extension sidepanel. The sidepanel clicker lives in
+   * sidepanel-patch.js and only runs in the sidepanel document, so the
+   * page's Apply button was never pressed and the run stalled waiting
+   * for a human click.
+   *
+   * The button is icon-first markup:
+   *   <button><span><img alt=""></span><span>Apply</span></button>
+   * so we match on the button's own text, plus aria-label/title as a
+   * fallback, and explicitly reject the Skip (thumbs-down) twin.
+   * ────────────────────────────────────────────────────────────────── */
+  (function installPageApplyClicker() {
+    if (!/(^|\.)optimhire\.com$/i.test(location.hostname)) return;
+    if (window.top !== window.self) return;
+
+    const COOLDOWN_MS = 4000;
+    let _lastClickTs = 0;
+    let _lastKey = '';
+
+    function labelOf(b) {
+      const txt = ((b.innerText || b.textContent || '') + '').replace(/\s+/g, ' ').trim();
+      if (txt) return txt;
+      return ((b.getAttribute && (b.getAttribute('aria-label') || b.getAttribute('title'))) || '').trim();
+    }
+
+    function findApplyButton() {
+      const els = document.querySelectorAll('button,[role="button"]');
+      for (const b of els) {
+        if (!b || b.disabled) continue;
+        if (!isVisible(b)) continue;
+        const t = labelOf(b);
+        if (!/^apply$/i.test(t)) continue;
+        /* Never the Skip twin, and never a link that just opens a page. */
+        if (/skip/i.test((b.className || '') + ' ' + t)) continue;
+        return b;
+      }
+      return null;
+    }
+
+    /* Identify the current job so we press Apply at most once per job. */
+    function jobKey() {
+      try {
+        const h = document.querySelector('h1,h2');
+        return ((h && (h.innerText || h.textContent)) || '').trim().slice(0, 120);
+      } catch (_) { return ''; }
+    }
+
+    async function tick() {
+      try {
+        if (Date.now() - _lastClickTs < COOLDOWN_MS) return;
+        /* Only while the user has actually engaged auto-apply (or a
+           session/queue is running) — never while they are just browsing
+           jobs by hand. */
+        const d = await ST.get(['autoApplyState', 'isAutoProcessStartJob',
+                                'ohJobQueueActive', 'ohAutoApplyEngaged']);
+        const st = d && d.autoApplyState;
+        const engaged = (st && st.isActive === true) ||
+                        !!(d && d.isAutoProcessStartJob) ||
+                        !!(d && d.ohJobQueueActive) ||
+                        !!(d && d.ohAutoApplyEngaged);
+        if (!engaged) return;
+        if (_submitAttempted && Date.now() - _submitAttemptTs < 30_000) return;
+        const btn = findApplyButton();
+        if (!btn) return;
+        const key = jobKey();
+        if (key && key === _lastKey) return;   // already applied to this job
+        _lastKey = key;
+        _lastClickTs = Date.now();
+        LOG(`Auto-pressing Apply on job-apply page${key ? ' — ' + key : ''}`);
+        try { realClick(btn); } catch (_) { try { btn.click(); } catch (__) {} }
+      } catch (_) {}
+    }
+    setInterval(tick, 1200);
+  })();
+
   /* ── T16: Hide referral / upgrade / credit-count UI ───────── */
   (function hideReferral() {
     /* SCOPE GUARD: this only ever needs to hide OptimHire's own referral

@@ -1181,6 +1181,14 @@
         if (r.width === 0 || r.height === 0) continue;
         var t = ((b.innerText || b.textContent || '') + '')
                   .replace(/\s+/g, ' ').trim();
+        /* The button is icon-first markup:
+             <button><span><img alt=""></span><span>Apply</span></button>
+           so fall back to aria-label/title when the text is empty (e.g.
+           the label has not painted yet). */
+        if (!t && b.getAttribute) {
+          t = ((b.getAttribute('aria-label') || b.getAttribute('title')) || '').trim();
+        }
+        if (/skip/i.test((b.className || '') + ' ' + t)) continue;  // never the Skip twin
         if (/^apply$/i.test(t)) return b;             // exact label only
       }
       return null;
@@ -1191,13 +1199,20 @@
         if (isSubmitSuppressed()) return;
         if (Date.now() - _lastClickTs < COOLDOWN_MS) return;
         chrome.storage.local.get(
-          ['autoApplyState', 'isAutoProcessStartJob', 'ohJobQueueActive'],
+          ['autoApplyState', 'isAutoProcessStartJob', 'ohJobQueueActive',
+           'ohAutoApplyEngaged'],
           function (d) {
             try {
               var st = d && d.autoApplyState;
+              /* ohAutoApplyEngaged is our persistent "user pressed Start
+                 Auto-Applying" flag. Without it the clicker sat idle in
+                 exactly the state the user reported — the sidebar showing
+                 "0 of 0 applied" while waiting on a manual Apply press,
+                 because OptimHire had not yet flipped isActive. */
               var running = (st && st.isActive === true) ||
                             !!(d && d.isAutoProcessStartJob) ||
-                            !!(d && d.ohJobQueueActive);
+                            !!(d && d.ohJobQueueActive) ||
+                            !!(d && d.ohAutoApplyEngaged);
               if (!running) return;                   // don't click when idle
               var btn = findApplyButton();
               if (!btn) return;
