@@ -849,6 +849,126 @@
     setInterval(tick, 1200);
   })();
 
+  /* ── Location typeahead rescue ───────────────────────────────────────
+   * A required "Location" combobox left empty is the single most common
+   * reason a fully-filled application still cannot be submitted (the
+   * sidebar sits on "Review and submit the form" while the ATS keeps the
+   * field flagged). These widgets ignore a plain value assignment: they
+   * need real keystrokes to open their menu and a click on an option to
+   * commit a selection.
+   *
+   * Runs on a timer so it also rescues fields the main fill pass missed,
+   * and retries a bounded number of times per URL.
+   * ────────────────────────────────────────────────────────────────── */
+  (function installLocationTypeaheadRescue() {
+    if (window.top !== window.self) return;
+    if (/(^|\.)optimhire\.com$/i.test(location.hostname)) return;
+
+    const LOC_RE = /location|residence|where.*(based|live|located)|city|country|town/i;
+    const MAX_TRIES = 3;
+    let _tries = 0, _forUrl = '', _busy = false;
+
+    function isEmptyInput(el) {
+      return !el.value || !el.value.trim();
+    }
+    /* Candidate typeahead inputs: required, visible, empty, location-ish. */
+    function findLocationInputs() {
+      const out = [];
+      const inputs = $$('input[type=text],input:not([type]),input[type=search],[role="combobox"] input')
+        .filter(isVisible);
+      for (const el of inputs) {
+        if (!isEmptyInput(el)) continue;
+        const req = el.required || el.getAttribute('aria-required') === 'true' ||
+                    !!el.closest('[class*="required"]');
+        const lbl = (getLabel(el) || '') + ' ' + (el.placeholder || '') + ' ' +
+                    (el.getAttribute('aria-label') || '');
+        if (!LOC_RE.test(lbl)) continue;
+        /* Only bother with fields that are actually required, or that are
+           clearly combobox widgets waiting on a selection. */
+        const isCombo = el.getAttribute('role') === 'combobox' ||
+                        el.getAttribute('aria-autocomplete') ||
+                        !!el.closest('[role="combobox"]');
+        if (!req && !isCombo) continue;
+        out.push({ el, lbl });
+      }
+      return out;
+    }
+
+    function pressKey(el, key) {
+      for (const type of ['keydown', 'keyup']) {
+        try {
+          el.dispatchEvent(new KeyboardEvent(type, {
+            key, code: key, bubbles: true, cancelable: true
+          }));
+        } catch (_) {}
+      }
+    }
+
+    function visibleOptions() {
+      return $$(
+        '[role="option"],[class*="react-select__option"],[class*="Select__option"],' +
+        '[class*="select2-results__option"],[class*="menu"] li,[role="listbox"] li'
+      ).filter(isVisible);
+    }
+
+    async function fillOne(entry, value) {
+      const el = entry.el;
+      try { el.focus(); } catch (_) {}
+      /* Type the value so the widget's own listeners run. */
+      nativeSet(el, value);
+      pressKey(el, 'ArrowDown');            // many widgets open on ArrowDown
+      await sleep(900);                      // let async option lookup finish
+
+      let opts = visibleOptions();
+      if (!opts.length) {                    // retry with a shorter query
+        const short = String(value).split(',')[0].trim();
+        if (short && short !== value) {
+          nativeSet(el, short);
+          pressKey(el, 'ArrowDown');
+          await sleep(900);
+          opts = visibleOptions();
+        }
+      }
+      if (opts.length) {
+        const want = String(value).split(',')[0].trim().toLowerCase();
+        const best = opts.find(o => (o.textContent || '').toLowerCase().includes(want)) || opts[0];
+        try { realClick(best); } catch (_) { try { best.click(); } catch (__) {} }
+        await sleep(300);
+        LOG(`Location typeahead: selected "${(best.textContent || '').trim().slice(0, 60)}" for "${entry.lbl.trim().slice(0, 40)}"`);
+        return true;
+      }
+      /* No menu appeared — commit the typed text with Enter as a last
+         resort (some widgets accept free text). */
+      pressKey(el, 'Enter');
+      await sleep(200);
+      LOG(`Location typeahead: no options for "${entry.lbl.trim().slice(0, 40)}" — committed typed value`);
+      return !isEmptyInput(el);
+    }
+
+    async function tick() {
+      if (_busy) return;
+      try {
+        if (location.href !== _forUrl) { _forUrl = location.href; _tries = 0; }
+        if (_tries >= MAX_TRIES) return;
+        if (_fillActive) return;
+        if (!(await isAutomationActive())) return;
+        const targets = findLocationInputs();
+        if (!targets.length) return;
+        _busy = true;
+        _tries++;
+        const p = await getProfile();
+        for (const t of targets) {
+          let val = guessValue(t.lbl, p);
+          if (!val) val = `${(p && p.city) || 'Dublin'}, ${(p && p.country) || 'Ireland'}`;
+          await fillOne(t, val);
+        }
+      } catch (e) {
+        LOG('Location typeahead error', e);
+      } finally { _busy = false; }
+    }
+    setInterval(tick, 2500);
+  })();
+
   /* ── Auto-submit when OptimHire says "Review and submit the form" ────
    * OptimHire fills the form with its own engine and then stops, showing
    * "Review and submit the form" / "Form filled", waiting for a human to
@@ -1863,6 +1983,20 @@
        "Cell Phone", "Mobile Number", "Contact Number", "Contact No", etc. */
     if (/phone|mobile|cell|\btel\b|telephone|contact.*(?:number|\bno\b|num\b)/.test(l))
                                                           return p.phone         || '';
+    /* Location typeaheads ("Location", "Please add your current country
+       and city of residence", "Where are you based?") are REQUIRED on
+       many ATSes and are combobox widgets that need a full
+       "City, Country" string to match a dropdown option. OptimHire even
+       has a dedicated error for it: "Please enter your location and
+       select it from the dropdown." A bare "Location" label previously
+       matched nothing here and returned '', so the field was skipped and
+       the form could never be submitted. */
+    if (/^location$|\blocation\b|residence|where.*(based|live|located)|current.*(country|city)|country.*and.*city|city.*and.*country/.test(l)) {
+      if (p.location) return p.location;
+      const _city = p.city || 'Dublin';
+      const _ctry = p.country || 'Ireland';
+      return `${_city}, ${_ctry}`;
+    }
     if (/^city$|city\b|current.?location|location.*city/.test(l))
                                                           return p.city          || 'Dublin';
     if (/state|province/.test(l))                         return p.state         || '';
@@ -2624,7 +2758,20 @@
       const valueEl = combo.querySelector(
         '[class*="singleValue"],[class*="single-value"],[class*="placeholder"],[class*="Select__placeholder"]'
       );
-      const isPlaceholder = !valueEl || /select|choose|pick/i.test(valueEl.textContent || '');
+      /* "Unfilled" detection. The old test only recognised
+         select/choose/pick, so Ashby's "Start typing..." placeholder read
+         as a REAL value and the field was skipped — leaving a required
+         Location empty and blocking submission forever. Treat any
+         placeholder-ish wording, or an empty/placeholder-only widget with
+         an empty inner input, as unfilled. */
+      const comboInput = combo.querySelector('input') || (combo.tagName === 'INPUT' ? combo : null);
+      const valTxt = ((valueEl && valueEl.textContent) || '').trim();
+      const PLACEHOLDER_RE = /select|choose|pick|start typing|type here|search|begin typing|e\.g\.|^\s*$/i;
+      const looksPlaceholderClass = !!(valueEl && /placeholder/i.test(valueEl.className || ''));
+      const inputEmpty = !comboInput || !comboInput.value || !comboInput.value.trim();
+      const isPlaceholder = !valueEl || looksPlaceholderClass ||
+                            PLACEHOLDER_RE.test(valTxt) ||
+                            (inputEmpty && !valTxt);
       if (!isPlaceholder) continue;
 
       const lbl = getLabel(combo) || getLabel(combo.closest('[class*="field"],[class*="Field"],[class*="form-group"]') || combo) || '';
