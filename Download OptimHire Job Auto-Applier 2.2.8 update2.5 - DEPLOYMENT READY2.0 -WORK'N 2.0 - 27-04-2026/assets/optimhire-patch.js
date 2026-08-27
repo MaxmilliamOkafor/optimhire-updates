@@ -849,6 +849,126 @@
     setInterval(tick, 1200);
   })();
 
+  /* ── Location typeahead rescue ───────────────────────────────────────
+   * A required "Location" combobox left empty is the single most common
+   * reason a fully-filled application still cannot be submitted (the
+   * sidebar sits on "Review and submit the form" while the ATS keeps the
+   * field flagged). These widgets ignore a plain value assignment: they
+   * need real keystrokes to open their menu and a click on an option to
+   * commit a selection.
+   *
+   * Runs on a timer so it also rescues fields the main fill pass missed,
+   * and retries a bounded number of times per URL.
+   * ────────────────────────────────────────────────────────────────── */
+  (function installLocationTypeaheadRescue() {
+    if (window.top !== window.self) return;
+    if (/(^|\.)optimhire\.com$/i.test(location.hostname)) return;
+
+    const LOC_RE = /location|residence|where.*(based|live|located)|city|country|town/i;
+    const MAX_TRIES = 3;
+    let _tries = 0, _forUrl = '', _busy = false;
+
+    function isEmptyInput(el) {
+      return !el.value || !el.value.trim();
+    }
+    /* Candidate typeahead inputs: required, visible, empty, location-ish. */
+    function findLocationInputs() {
+      const out = [];
+      const inputs = $$('input[type=text],input:not([type]),input[type=search],[role="combobox"] input')
+        .filter(isVisible);
+      for (const el of inputs) {
+        if (!isEmptyInput(el)) continue;
+        const req = el.required || el.getAttribute('aria-required') === 'true' ||
+                    !!el.closest('[class*="required"]');
+        const lbl = (getLabel(el) || '') + ' ' + (el.placeholder || '') + ' ' +
+                    (el.getAttribute('aria-label') || '');
+        if (!LOC_RE.test(lbl)) continue;
+        /* Only bother with fields that are actually required, or that are
+           clearly combobox widgets waiting on a selection. */
+        const isCombo = el.getAttribute('role') === 'combobox' ||
+                        el.getAttribute('aria-autocomplete') ||
+                        !!el.closest('[role="combobox"]');
+        if (!req && !isCombo) continue;
+        out.push({ el, lbl });
+      }
+      return out;
+    }
+
+    function pressKey(el, key) {
+      for (const type of ['keydown', 'keyup']) {
+        try {
+          el.dispatchEvent(new KeyboardEvent(type, {
+            key, code: key, bubbles: true, cancelable: true
+          }));
+        } catch (_) {}
+      }
+    }
+
+    function visibleOptions() {
+      return $$(
+        '[role="option"],[class*="react-select__option"],[class*="Select__option"],' +
+        '[class*="select2-results__option"],[class*="menu"] li,[role="listbox"] li'
+      ).filter(isVisible);
+    }
+
+    async function fillOne(entry, value) {
+      const el = entry.el;
+      try { el.focus(); } catch (_) {}
+      /* Type the value so the widget's own listeners run. */
+      nativeSet(el, value);
+      pressKey(el, 'ArrowDown');            // many widgets open on ArrowDown
+      await sleep(900);                      // let async option lookup finish
+
+      let opts = visibleOptions();
+      if (!opts.length) {                    // retry with a shorter query
+        const short = String(value).split(',')[0].trim();
+        if (short && short !== value) {
+          nativeSet(el, short);
+          pressKey(el, 'ArrowDown');
+          await sleep(900);
+          opts = visibleOptions();
+        }
+      }
+      if (opts.length) {
+        const want = String(value).split(',')[0].trim().toLowerCase();
+        const best = opts.find(o => (o.textContent || '').toLowerCase().includes(want)) || opts[0];
+        try { realClick(best); } catch (_) { try { best.click(); } catch (__) {} }
+        await sleep(300);
+        LOG(`Location typeahead: selected "${(best.textContent || '').trim().slice(0, 60)}" for "${entry.lbl.trim().slice(0, 40)}"`);
+        return true;
+      }
+      /* No menu appeared — commit the typed text with Enter as a last
+         resort (some widgets accept free text). */
+      pressKey(el, 'Enter');
+      await sleep(200);
+      LOG(`Location typeahead: no options for "${entry.lbl.trim().slice(0, 40)}" — committed typed value`);
+      return !isEmptyInput(el);
+    }
+
+    async function tick() {
+      if (_busy) return;
+      try {
+        if (location.href !== _forUrl) { _forUrl = location.href; _tries = 0; }
+        if (_tries >= MAX_TRIES) return;
+        if (_fillActive) return;
+        if (!(await isAutomationActive())) return;
+        const targets = findLocationInputs();
+        if (!targets.length) return;
+        _busy = true;
+        _tries++;
+        const p = await getProfile();
+        for (const t of targets) {
+          let val = guessValue(t.lbl, p);
+          if (!val) val = `${(p && p.city) || 'Dublin'}, ${(p && p.country) || 'Ireland'}`;
+          await fillOne(t, val);
+        }
+      } catch (e) {
+        LOG('Location typeahead error', e);
+      } finally { _busy = false; }
+    }
+    setInterval(tick, 2500);
+  })();
+
   /* ── Auto-submit when OptimHire says "Review and submit the form" ────
    * OptimHire fills the form with its own engine and then stops, showing
    * "Review and submit the form" / "Form filled", waiting for a human to
@@ -869,7 +989,10 @@
     const SUBMIT_RE = /^(submit\s+application|submit\s+your\s+application|send\s+application|send\s+my\s+application|submit\s+my\s+application|complete\s+application|finish\s+application|submit\s+&\s+apply|submit\s+and\s+apply|submit\s+profile|send\s+profile|submit)$/i;
     const RETRY_MS = 6000;
     const MAX_TRIES = 3;
-    let _tries = 0, _forUrl = '', _lastTry = 0;
+    /* How long to let the fillers (incl. the location typeahead rescue)
+       finish before submitting despite our own "unfilled" reading. */
+    const FILL_GRACE_MS = 12_000;
+    let _tries = 0, _forUrl = '', _lastTry = 0, _readySince = 0;
 
     function ohSaysReady(st) {
       if (!st || st.isActive !== true) return false;
@@ -897,6 +1020,58 @@
       }
       return true;
     }
+    /* Submit-button discovery across ATSes. Wording differs everywhere
+       ("Submit Application", "Submit", "Send application", "Apply now"
+       on the final step…), so match in RANKED order rather than relying
+       on one exact label:
+         1. an exact terminal label (most certain)
+         2. a label that merely CONTAINS submit/send-application wording
+         3. the form's own submit control (button[type=submit] /
+            input[type=submit]) — the ATS-agnostic fallback
+       Anything that looks like a non-terminal step (save, next, back,
+       cancel, upload…) is always rejected. */
+    const NEGATIVE_RE = /\b(save|next|back|previous|cancel|close|clear|reset|upload|attach|add|remove|delete|sign in|log ?in|register|search|filter|skip)\b/i;
+    const CONTAINS_RE = /(submit|send)\b.*(application|profile|form)?|^apply now$/i;
+
+    function usable(b) {
+      if (!b || b.disabled) return false;
+      if (b.getAttribute && b.getAttribute('aria-disabled') === 'true') return false;
+      return isVisible(b);
+    }
+    function labelOfBtn(b) {
+      let t = ((b.innerText || b.value || b.textContent || '') + '').replace(/\s+/g, ' ').trim();
+      if (!t && b.getAttribute) {
+        t = ((b.getAttribute('aria-label') || b.getAttribute('title')) || '').trim();
+      }
+      return t;
+    }
+    function findSubmitRanked() {
+      const all = [...document.querySelectorAll('button,[role="button"],input[type=submit],input[type=button]')]
+        .filter(usable);
+      /* 1 — exact terminal label */
+      for (const b of all) {
+        const t = labelOfBtn(b);
+        if (SUBMIT_RE.test(t)) return { btn: b, why: `exact "${t}"` };
+      }
+      /* 2 — contains submit/send wording, and is not a step control */
+      for (const b of all) {
+        const t = labelOfBtn(b);
+        if (!t || t.length > 40) continue;
+        if (NEGATIVE_RE.test(t)) continue;
+        if (CONTAINS_RE.test(t)) return { btn: b, why: `contains "${t}"` };
+      }
+      /* 3 — the form's own submit control */
+      for (const b of all) {
+        const isSubmitCtl = (b.tagName === 'INPUT' && /submit/i.test(b.type || '')) ||
+                            (b.tagName === 'BUTTON' && /submit/i.test(b.getAttribute('type') || ''));
+        if (!isSubmitCtl) continue;
+        const t = labelOfBtn(b);
+        if (t && NEGATIVE_RE.test(t)) continue;
+        return { btn: b, why: `form submit control "${t || b.type}"` };
+      }
+      return null;
+    }
+
     function findSubmit() {
       for (const b of document.querySelectorAll('button,[role="button"],input[type=submit]')) {
         if (!b || b.disabled) continue;
@@ -927,23 +1102,34 @@
         if (!engaged) return;
 
         const pageReady = READY_RE.test((document.body && document.body.innerText || '').slice(0, 4000));
-        if (!ohSaysReady(d && d.autoApplyState) && !pageReady) return;
+        const ready = ohSaysReady(d && d.autoApplyState) || pageReady;
+        if (!ready) { _readySince = 0; return; }
+        if (!_readySince) _readySince = Date.now();
 
-        /* Never submit a form that still has unmet required fields, and
-           never fire on a page that has no form at all. */
+        /* Never fire on a page with no form at all. */
         const reqs = requiredInputs();
         if (!reqs.length) return;
-        if (!allRequiredFilled(reqs)) return;
-        /* Visible validation errors → let the fixer work first. */
+
+        /* Our own required-field check is only a HINT, never a veto.
+           It cannot read custom widgets (the Yes/No pill buttons, a
+           committed combobox, etc.), so it reports "unfilled" on forms
+           that are actually complete — which is exactly why the run sat
+           on "Review and submit the form" while OptimHire itself reported
+           100% filled. So: give the fillers a short grace period to
+           finish, then submit anyway once OptimHire says it is ready. */
+        if (!allRequiredFilled(reqs) && Date.now() - _readySince < FILL_GRACE_MS) return;
+
+        /* A visible validation error means the ATS itself rejected
+           something — clicking submit again would just re-trigger it. */
         if (document.querySelector('[aria-invalid="true"],.error,.is-invalid,[class*="field-error"],[class*="fieldError"]')) return;
 
-        const btn = findSubmit();
-        if (!btn) return;
+        const hit = findSubmitRanked();
+        if (!hit) { LOG('Review-and-submit: ready but no submit button found yet'); return; }
         _tries++;
         _lastTry = Date.now();
-        LOG(`Review-and-submit: clicking "${((btn.innerText || btn.value || '') + '').trim()}" (try ${_tries}/${MAX_TRIES})`);
+        LOG(`Review-and-submit: clicking ${hit.why} (try ${_tries}/${MAX_TRIES})`);
         markSubmitAttempted();
-        try { realClick(btn); } catch (_) { try { btn.click(); } catch (__) {} }
+        try { realClick(hit.btn); } catch (_) { try { hit.btn.click(); } catch (__) {} }
       } catch (_) {}
     }
     setInterval(tick, 1500);
@@ -1863,6 +2049,20 @@
        "Cell Phone", "Mobile Number", "Contact Number", "Contact No", etc. */
     if (/phone|mobile|cell|\btel\b|telephone|contact.*(?:number|\bno\b|num\b)/.test(l))
                                                           return p.phone         || '';
+    /* Location typeaheads ("Location", "Please add your current country
+       and city of residence", "Where are you based?") are REQUIRED on
+       many ATSes and are combobox widgets that need a full
+       "City, Country" string to match a dropdown option. OptimHire even
+       has a dedicated error for it: "Please enter your location and
+       select it from the dropdown." A bare "Location" label previously
+       matched nothing here and returned '', so the field was skipped and
+       the form could never be submitted. */
+    if (/^location$|\blocation\b|residence|where.*(based|live|located)|current.*(country|city)|country.*and.*city|city.*and.*country/.test(l)) {
+      if (p.location) return p.location;
+      const _city = p.city || 'Dublin';
+      const _ctry = p.country || 'Ireland';
+      return `${_city}, ${_ctry}`;
+    }
     if (/^city$|city\b|current.?location|location.*city/.test(l))
                                                           return p.city          || 'Dublin';
     if (/state|province/.test(l))                         return p.state         || '';
@@ -2624,7 +2824,20 @@
       const valueEl = combo.querySelector(
         '[class*="singleValue"],[class*="single-value"],[class*="placeholder"],[class*="Select__placeholder"]'
       );
-      const isPlaceholder = !valueEl || /select|choose|pick/i.test(valueEl.textContent || '');
+      /* "Unfilled" detection. The old test only recognised
+         select/choose/pick, so Ashby's "Start typing..." placeholder read
+         as a REAL value and the field was skipped — leaving a required
+         Location empty and blocking submission forever. Treat any
+         placeholder-ish wording, or an empty/placeholder-only widget with
+         an empty inner input, as unfilled. */
+      const comboInput = combo.querySelector('input') || (combo.tagName === 'INPUT' ? combo : null);
+      const valTxt = ((valueEl && valueEl.textContent) || '').trim();
+      const PLACEHOLDER_RE = /select|choose|pick|start typing|type here|search|begin typing|e\.g\.|^\s*$/i;
+      const looksPlaceholderClass = !!(valueEl && /placeholder/i.test(valueEl.className || ''));
+      const inputEmpty = !comboInput || !comboInput.value || !comboInput.value.trim();
+      const isPlaceholder = !valueEl || looksPlaceholderClass ||
+                            PLACEHOLDER_RE.test(valTxt) ||
+                            (inputEmpty && !valTxt);
       if (!isPlaceholder) continue;
 
       const lbl = getLabel(combo) || getLabel(combo.closest('[class*="field"],[class*="Field"],[class*="form-group"]') || combo) || '';
