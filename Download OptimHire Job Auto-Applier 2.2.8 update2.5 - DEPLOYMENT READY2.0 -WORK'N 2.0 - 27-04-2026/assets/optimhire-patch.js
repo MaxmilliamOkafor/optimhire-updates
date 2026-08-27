@@ -349,15 +349,27 @@
       return _automationCache.active;
     }
     try {
-      const { csvActiveJobId, isAutoProcessStartJob, autoApplyStateUpdate, ohJobQueueActive } =
-        await ST.get(['csvActiveJobId', 'isAutoProcessStartJob', 'autoApplyStateUpdate', 'ohJobQueueActive']);
+      const { csvActiveJobId, isAutoProcessStartJob, autoApplyStateUpdate, ohJobQueueActive,
+              ohAutoApplyEngaged, autoApplyState } =
+        await ST.get(['csvActiveJobId', 'isAutoProcessStartJob', 'autoApplyStateUpdate',
+                      'ohJobQueueActive', 'ohAutoApplyEngaged', 'autoApplyState']);
       const isRunning = !!(autoApplyStateUpdate && autoApplyStateUpdate.isRunning);
       /* ohJobQueueActive is OUR CSV queue runner — treat it just like
          OptimHire's own automation flags so all existing autofill
          triggers (autoFillPage, T39/T40, watchdog, etc.) fire on
-         queue-driven job pages. */
+         queue-driven job pages.
+
+         ohAutoApplyEngaged (our persistent "user pressed Start
+         Auto-Applying" flag) and autoApplyState.isActive are included
+         because newer OptimHire builds do not always set the legacy
+         isAutoProcessStartJob / autoApplyStateUpdate.isRunning flags.
+         Without them this returned false, and since the generic
+         terminal-submit (T43) bails on its very first line when
+         automation is inactive, the run sat on "Review and submit the
+         form" waiting for a human click. */
+      const stateActive = !!(autoApplyState && autoApplyState.isActive === true);
       const active = !!csvActiveJobId || !!isAutoProcessStartJob || isRunning ||
-                     !!ohJobQueueActive ||
+                     !!ohJobQueueActive || !!ohAutoApplyEngaged || stateActive ||
                      (Date.now() - _manualTriggerTs < 30_000);
       _automationCache = { active, ts: Date.now() };
       return active;
@@ -835,6 +847,106 @@
       } catch (_) {}
     }
     setInterval(tick, 1200);
+  })();
+
+  /* ── Auto-submit when OptimHire says "Review and submit the form" ────
+   * OptimHire fills the form with its own engine and then stops, showing
+   * "Review and submit the form" / "Form filled", waiting for a human to
+   * press the ATS's submit button.
+   *
+   * This runs INDEPENDENTLY of the T41/T43 flow controller on purpose.
+   * T43 is gated behind fillStable() (which historically only tracked OUR
+   * fill passes) and it blacklists a page fingerprint after a single
+   * attempt, so one missed click meant the run stalled forever. This
+   * handler watches for the ready condition directly and retries.
+   * ────────────────────────────────────────────────────────────────── */
+  (function installReviewAndSubmit() {
+    if (window.top !== window.self) return;
+    /* optimhire.com drives submit through its own overlay (T39/T40). */
+    if (/(^|\.)optimhire\.com$/i.test(location.hostname)) return;
+
+    const READY_RE = /review and submit|form ready for submission|form filled|ready to submit/i;
+    const SUBMIT_RE = /^(submit\s+application|submit\s+your\s+application|send\s+application|send\s+my\s+application|submit\s+my\s+application|complete\s+application|finish\s+application|submit\s+&\s+apply|submit\s+and\s+apply|submit\s+profile|send\s+profile|submit)$/i;
+    const RETRY_MS = 6000;
+    const MAX_TRIES = 3;
+    let _tries = 0, _forUrl = '', _lastTry = 0;
+
+    function ohSaysReady(st) {
+      if (!st || st.isActive !== true) return false;
+      if (READY_RE.test(String(st.statusMessage || ''))) return true;
+      return typeof st.progress === 'number' && st.progress >= 90 &&
+             String(st.applicationState || '') !== 'missing-questions';
+    }
+    function requiredInputs() {
+      return $$(
+        'input[required]:not([type=hidden]):not([type=submit]):not([type=button]),' +
+        'input[aria-required="true"]:not([type=hidden]):not([type=submit]):not([type=button]),' +
+        'textarea[required],textarea[aria-required="true"],' +
+        'select[required],select[aria-required="true"]'
+      ).filter(isVisible);
+    }
+    function allRequiredFilled(reqs) {
+      for (const el of reqs) {
+        if (el.type === 'radio' && el.name) {
+          if (![...document.getElementsByName(el.name)].some(r => r.checked)) return false;
+        } else if (el.type === 'checkbox') {
+          if (!el.checked) return false;
+        } else if (el.tagName === 'SELECT') {
+          if (!el.value) return false;
+        } else if (!el.value || !el.value.trim()) return false;
+      }
+      return true;
+    }
+    function findSubmit() {
+      for (const b of document.querySelectorAll('button,[role="button"],input[type=submit]')) {
+        if (!b || b.disabled) continue;
+        if (b.getAttribute && b.getAttribute('aria-disabled') === 'true') continue;
+        if (!isVisible(b)) continue;
+        const t = ((b.innerText || b.value || b.textContent || '') + '')
+                    .replace(/\s+/g, ' ').trim();
+        if (SUBMIT_RE.test(t)) return b;
+      }
+      return null;
+    }
+
+    async function tick() {
+      try {
+        if (location.href !== _forUrl) { _forUrl = location.href; _tries = 0; }
+        if (_tries >= MAX_TRIES) return;
+        if (Date.now() - _lastTry < RETRY_MS) return;
+        /* Don't fight an in-flight submit. */
+        if (_submitAttempted && Date.now() - _submitAttemptTs < 30_000) return;
+        if (_fillActive) return;
+
+        const d = await ST.get(['autoApplyState', 'ohAutoApplyEngaged',
+                                'isAutoProcessStartJob', 'ohJobQueueActive']);
+        const engaged = ohSaysReady(d && d.autoApplyState) ||
+                        !!(d && d.ohAutoApplyEngaged) ||
+                        !!(d && d.isAutoProcessStartJob) ||
+                        !!(d && d.ohJobQueueActive);
+        if (!engaged) return;
+
+        const pageReady = READY_RE.test((document.body && document.body.innerText || '').slice(0, 4000));
+        if (!ohSaysReady(d && d.autoApplyState) && !pageReady) return;
+
+        /* Never submit a form that still has unmet required fields, and
+           never fire on a page that has no form at all. */
+        const reqs = requiredInputs();
+        if (!reqs.length) return;
+        if (!allRequiredFilled(reqs)) return;
+        /* Visible validation errors → let the fixer work first. */
+        if (document.querySelector('[aria-invalid="true"],.error,.is-invalid,[class*="field-error"],[class*="fieldError"]')) return;
+
+        const btn = findSubmit();
+        if (!btn) return;
+        _tries++;
+        _lastTry = Date.now();
+        LOG(`Review-and-submit: clicking "${((btn.innerText || btn.value || '') + '').trim()}" (try ${_tries}/${MAX_TRIES})`);
+        markSubmitAttempted();
+        try { realClick(btn); } catch (_) { try { btn.click(); } catch (__) {} }
+      } catch (_) {}
+    }
+    setInterval(tick, 1500);
   })();
 
   /* ── T16: Hide referral / upgrade / credit-count UI ───────── */
