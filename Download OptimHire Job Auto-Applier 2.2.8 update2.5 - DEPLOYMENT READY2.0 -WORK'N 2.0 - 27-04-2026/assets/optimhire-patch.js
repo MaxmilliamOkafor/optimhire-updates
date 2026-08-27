@@ -989,7 +989,10 @@
     const SUBMIT_RE = /^(submit\s+application|submit\s+your\s+application|send\s+application|send\s+my\s+application|submit\s+my\s+application|complete\s+application|finish\s+application|submit\s+&\s+apply|submit\s+and\s+apply|submit\s+profile|send\s+profile|submit)$/i;
     const RETRY_MS = 6000;
     const MAX_TRIES = 3;
-    let _tries = 0, _forUrl = '', _lastTry = 0;
+    /* How long to let the fillers (incl. the location typeahead rescue)
+       finish before submitting despite our own "unfilled" reading. */
+    const FILL_GRACE_MS = 12_000;
+    let _tries = 0, _forUrl = '', _lastTry = 0, _readySince = 0;
 
     function ohSaysReady(st) {
       if (!st || st.isActive !== true) return false;
@@ -1017,6 +1020,58 @@
       }
       return true;
     }
+    /* Submit-button discovery across ATSes. Wording differs everywhere
+       ("Submit Application", "Submit", "Send application", "Apply now"
+       on the final step…), so match in RANKED order rather than relying
+       on one exact label:
+         1. an exact terminal label (most certain)
+         2. a label that merely CONTAINS submit/send-application wording
+         3. the form's own submit control (button[type=submit] /
+            input[type=submit]) — the ATS-agnostic fallback
+       Anything that looks like a non-terminal step (save, next, back,
+       cancel, upload…) is always rejected. */
+    const NEGATIVE_RE = /\b(save|next|back|previous|cancel|close|clear|reset|upload|attach|add|remove|delete|sign in|log ?in|register|search|filter|skip)\b/i;
+    const CONTAINS_RE = /(submit|send)\b.*(application|profile|form)?|^apply now$/i;
+
+    function usable(b) {
+      if (!b || b.disabled) return false;
+      if (b.getAttribute && b.getAttribute('aria-disabled') === 'true') return false;
+      return isVisible(b);
+    }
+    function labelOfBtn(b) {
+      let t = ((b.innerText || b.value || b.textContent || '') + '').replace(/\s+/g, ' ').trim();
+      if (!t && b.getAttribute) {
+        t = ((b.getAttribute('aria-label') || b.getAttribute('title')) || '').trim();
+      }
+      return t;
+    }
+    function findSubmitRanked() {
+      const all = [...document.querySelectorAll('button,[role="button"],input[type=submit],input[type=button]')]
+        .filter(usable);
+      /* 1 — exact terminal label */
+      for (const b of all) {
+        const t = labelOfBtn(b);
+        if (SUBMIT_RE.test(t)) return { btn: b, why: `exact "${t}"` };
+      }
+      /* 2 — contains submit/send wording, and is not a step control */
+      for (const b of all) {
+        const t = labelOfBtn(b);
+        if (!t || t.length > 40) continue;
+        if (NEGATIVE_RE.test(t)) continue;
+        if (CONTAINS_RE.test(t)) return { btn: b, why: `contains "${t}"` };
+      }
+      /* 3 — the form's own submit control */
+      for (const b of all) {
+        const isSubmitCtl = (b.tagName === 'INPUT' && /submit/i.test(b.type || '')) ||
+                            (b.tagName === 'BUTTON' && /submit/i.test(b.getAttribute('type') || ''));
+        if (!isSubmitCtl) continue;
+        const t = labelOfBtn(b);
+        if (t && NEGATIVE_RE.test(t)) continue;
+        return { btn: b, why: `form submit control "${t || b.type}"` };
+      }
+      return null;
+    }
+
     function findSubmit() {
       for (const b of document.querySelectorAll('button,[role="button"],input[type=submit]')) {
         if (!b || b.disabled) continue;
@@ -1047,23 +1102,34 @@
         if (!engaged) return;
 
         const pageReady = READY_RE.test((document.body && document.body.innerText || '').slice(0, 4000));
-        if (!ohSaysReady(d && d.autoApplyState) && !pageReady) return;
+        const ready = ohSaysReady(d && d.autoApplyState) || pageReady;
+        if (!ready) { _readySince = 0; return; }
+        if (!_readySince) _readySince = Date.now();
 
-        /* Never submit a form that still has unmet required fields, and
-           never fire on a page that has no form at all. */
+        /* Never fire on a page with no form at all. */
         const reqs = requiredInputs();
         if (!reqs.length) return;
-        if (!allRequiredFilled(reqs)) return;
-        /* Visible validation errors → let the fixer work first. */
+
+        /* Our own required-field check is only a HINT, never a veto.
+           It cannot read custom widgets (the Yes/No pill buttons, a
+           committed combobox, etc.), so it reports "unfilled" on forms
+           that are actually complete — which is exactly why the run sat
+           on "Review and submit the form" while OptimHire itself reported
+           100% filled. So: give the fillers a short grace period to
+           finish, then submit anyway once OptimHire says it is ready. */
+        if (!allRequiredFilled(reqs) && Date.now() - _readySince < FILL_GRACE_MS) return;
+
+        /* A visible validation error means the ATS itself rejected
+           something — clicking submit again would just re-trigger it. */
         if (document.querySelector('[aria-invalid="true"],.error,.is-invalid,[class*="field-error"],[class*="fieldError"]')) return;
 
-        const btn = findSubmit();
-        if (!btn) return;
+        const hit = findSubmitRanked();
+        if (!hit) { LOG('Review-and-submit: ready but no submit button found yet'); return; }
         _tries++;
         _lastTry = Date.now();
-        LOG(`Review-and-submit: clicking "${((btn.innerText || btn.value || '') + '').trim()}" (try ${_tries}/${MAX_TRIES})`);
+        LOG(`Review-and-submit: clicking ${hit.why} (try ${_tries}/${MAX_TRIES})`);
         markSubmitAttempted();
-        try { realClick(btn); } catch (_) { try { btn.click(); } catch (__) {} }
+        try { realClick(hit.btn); } catch (_) { try { hit.btn.click(); } catch (__) {} }
       } catch (_) {}
     }
     setInterval(tick, 1500);
