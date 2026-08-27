@@ -1144,6 +1144,97 @@
     setInterval(tick, 3000);
   })();
 
+  /* ── Auto-press the sidebar's "Apply" (thumbs-up) ────────────────────
+   * OptimHire shows a per-job Skip / Apply choice and waits for a human
+   * click, which stalls a hands-off run. The user asked for zero manual
+   * effort, so press Apply automatically.
+   *
+   * Deliberately conservative:
+   *   - only while an auto-apply session is genuinely running,
+   *   - only the button whose own label is exactly "Apply" (never
+   *     "Apply Now" in the cover-letter modal — the content script's T40
+   *     owns that — and never "Skip"),
+   *   - never within the submit-suppression window,
+   *   - one click per job (tracked by the rendered job title) plus a
+   *     cooldown, so a re-render can't produce a burst of clicks.
+   * ─────────────────────────────────────────────────────────────────── */
+  (function installAutoApplyClicker() {
+    var COOLDOWN_MS = 4000;
+    var _lastClickTs = 0;
+    var _lastJobKey = '';
+
+    function currentJobKey() {
+      try {
+        var h = document.querySelector('h1,h2');
+        var t = h ? (h.innerText || h.textContent || '').trim() : '';
+        return t.slice(0, 120);
+      } catch (_) { return ''; }
+    }
+
+    function findApplyButton() {
+      var els = document.querySelectorAll('button,[role="button"]');
+      for (var i = 0; i < els.length; i++) {
+        var b = els[i];
+        if (!b || b.disabled) continue;
+        if (b.id === 'aapBtnSkip') continue;          // our own panel
+        var r = b.getBoundingClientRect();
+        if (r.width === 0 || r.height === 0) continue;
+        var t = ((b.innerText || b.textContent || '') + '')
+                  .replace(/\s+/g, ' ').trim();
+        /* The button is icon-first markup:
+             <button><span><img alt=""></span><span>Apply</span></button>
+           so fall back to aria-label/title when the text is empty (e.g.
+           the label has not painted yet). */
+        if (!t && b.getAttribute) {
+          t = ((b.getAttribute('aria-label') || b.getAttribute('title')) || '').trim();
+        }
+        if (/skip/i.test((b.className || '') + ' ' + t)) continue;  // never the Skip twin
+        if (/^apply$/i.test(t)) return b;             // exact label only
+      }
+      return null;
+    }
+
+    function tick() {
+      try {
+        if (isSubmitSuppressed()) return;
+        if (Date.now() - _lastClickTs < COOLDOWN_MS) return;
+        chrome.storage.local.get(
+          ['autoApplyState', 'isAutoProcessStartJob', 'ohJobQueueActive',
+           'ohAutoApplyEngaged'],
+          function (d) {
+            try {
+              var st = d && d.autoApplyState;
+              /* ohAutoApplyEngaged is our persistent "user pressed Start
+                 Auto-Applying" flag. Without it the clicker sat idle in
+                 exactly the state the user reported — the sidebar showing
+                 "0 of 0 applied" while waiting on a manual Apply press,
+                 because OptimHire had not yet flipped isActive. */
+              var running = (st && st.isActive === true) ||
+                            !!(d && d.isAutoProcessStartJob) ||
+                            !!(d && d.ohJobQueueActive) ||
+                            !!(d && d.ohAutoApplyEngaged);
+              if (!running) return;                   // don't click when idle
+              var btn = findApplyButton();
+              if (!btn) return;
+              var key = currentJobKey();
+              if (key && key === _lastJobKey) return; // already applied here
+              _lastJobKey = key;
+              _lastClickTs = Date.now();
+              try {
+                btn.dispatchEvent(new MouseEvent('mouseover', { bubbles: true }));
+                btn.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+                btn.dispatchEvent(new MouseEvent('mouseup',   { bubbles: true }));
+                btn.click();
+              } catch (_) { try { btn.click(); } catch (__) {} }
+              addLog('Auto-pressed Apply' + (key ? ' — ' + key : ''), 'success');
+            } catch (_) {}
+          }
+        );
+      } catch (_) {}
+    }
+    setInterval(tick, 1200);
+  })();
+
   /* ── Keep Auto-Apply running until genuinely complete ────────────────
    * OptimHire's session ends on its own after a few applies (a 404'd
    * job, a transient backend error, etc.) and reverts to the start

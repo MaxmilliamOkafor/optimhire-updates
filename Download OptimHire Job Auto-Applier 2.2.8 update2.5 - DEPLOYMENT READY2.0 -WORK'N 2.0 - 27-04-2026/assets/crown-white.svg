@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg id="Filled" xmlns="http://www.w3.org/2000/svg" version="1.1" viewBox="0 0 512 512">
+  <!-- Generator: Adobe Illustrator 29.2.1, SVG Export Plug-In . SVG Version: 2.1.0 Build 116)  -->
+  <defs>
+    <style>
+      .st0 {
+        fill: #fff;
+      }
+    </style>
+  </defs>
+  <path class="st0" d="M485.7,97.4c-15.9-6.6-34.3-3-46.5,9.3l-55.2,55.2-97.8-97.8c-16.7-16.7-43.7-16.7-60.3,0l-97.8,97.8-55.2-55.2c-16.7-16.7-43.7-16.7-60.3,0C4.5,114.7,0,125.5,0,136.8v225.8c0,58.9,47.8,106.6,106.7,106.7h298.7c58.9,0,106.6-47.8,106.7-106.7v-225.8c0-17.3-10.4-32.8-26.3-39.4Z"/>
+</svg>
