@@ -408,8 +408,21 @@
     try {
       if (window.top !== window.self) return false;   // never from sub-frames
       if (Date.now() - _manualTriggerTs < 30_000) return true;  // user acted here
-      const d = await ST.get(['autoApplyState', 'ohJobQueue', 'ohJobQueueActive']);
+      const d = await ST.get(['autoApplyState', 'ohJobQueue', 'ohJobQueueActive',
+                              'ohAutoApplyEngaged', 'isAutoProcessStartJob']);
       const here = location.href;
+      /* optimhire.com's own copilot page is the automation's CONTROL
+         SURFACE, not a job page, so its URL never matches apply_now_url.
+         Excluding it meant every recovery skip sent from there was
+         suppressed — which left the run stuck forever on "Loading your
+         Job" with no way out. It was never the source of the runaway
+         tab-spam either (that came from unrelated job-board tabs such as
+         Indeed), so allow it whenever automation is engaged. */
+      if (/(^|\.)optimhire\.com$/i.test(location.hostname)) {
+        const st = d.autoApplyState;
+        if ((st && st.isActive === true) || d.ohAutoApplyEngaged ||
+            d.isAutoProcessStartJob || d.ohJobQueueActive) return true;
+      }
       const ad = d.autoApplyState && d.autoApplyState.applicationDetails;
       const applyUrl = ad && ad.source && ad.source.apply_now_url;
       if (applyUrl && _urlsMatchLoose(here, applyUrl)) return true;

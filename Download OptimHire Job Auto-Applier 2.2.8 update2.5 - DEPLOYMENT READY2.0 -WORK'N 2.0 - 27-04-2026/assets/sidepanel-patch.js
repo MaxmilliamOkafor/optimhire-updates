@@ -1256,6 +1256,79 @@
     setInterval(tick, 1200);
   })();
 
+  /* ── "Loading your Job" stall watchdog ───────────────────────────────
+   * OptimHire sometimes never resolves this spinner (its fetch for the
+   * next job fails silently), leaving the run stuck forever. Nothing else
+   * recovers it: the generic stuck-watchdog keys off job/URL changes,
+   * and this screen has neither.
+   *
+   * If the spinner is continuously present for STALL_MS while a session
+   * is engaged, escalate: first a real Skip (which advances OptimHire to
+   * the next job), then, if it is STILL stuck, a "Back to Main" to force
+   * a fresh batch. Rate-limited so it can never loop.
+   * ─────────────────────────────────────────────────────────────────── */
+  (function installLoadingStallWatchdog() {
+    var STALL_MS = 45_000;        // spinner must persist this long
+    var COOLDOWN_MS = 60_000;     // min gap between recovery attempts
+    var LOADING_RE = /loading your job|loading job|fetching your job/i;
+    var _since = 0, _lastRecoveryTs = 0, _escalated = false;
+
+    function spinnerVisible() {
+      try {
+        var t = (document.body && document.body.innerText || '').slice(0, 3000);
+        return LOADING_RE.test(t);
+      } catch (_) { return false; }
+    }
+    function clickBackToMain() {
+      var btns = document.querySelectorAll('button,[role="button"],a');
+      for (var i = 0; i < btns.length; i++) {
+        var b = btns[i];
+        if (!b) continue;
+        var r = b.getBoundingClientRect();
+        if (r.width === 0 || r.height === 0) continue;
+        var t = ((b.innerText || b.textContent || '') + '').replace(/\s+/g, ' ').trim();
+        if (/^back to main$/i.test(t)) { try { b.click(); return true; } catch (_) {} }
+      }
+      return false;
+    }
+
+    function tick() {
+      try {
+        if (!spinnerVisible()) { _since = 0; _escalated = false; return; }
+        var now = Date.now();
+        if (!_since) { _since = now; return; }
+        if (now - _since < STALL_MS) return;
+        if (now - _lastRecoveryTs < COOLDOWN_MS) return;
+        chrome.storage.local.get(
+          ['autoApplyState', 'ohAutoApplyEngaged', 'isAutoProcessStartJob', 'ohJobQueueActive'],
+          function (d) {
+            try {
+              var st = d && d.autoApplyState;
+              var engaged = (st && st.isActive === true) ||
+                            !!(d && d.ohAutoApplyEngaged) ||
+                            !!(d && d.isAutoProcessStartJob) ||
+                            !!(d && d.ohJobQueueActive);
+              if (!engaged) return;   // user is idle — leave the UI alone
+              _lastRecoveryTs = Date.now();
+              if (!_escalated) {
+                _escalated = true;
+                addLog('Stuck on "Loading your Job" for ' + Math.round(STALL_MS / 1000) +
+                       's — skipping to the next job', '');
+                forceAdvanceSkip('Loading-your-Job stall');
+              } else {
+                addLog('Still stuck on "Loading your Job" — returning to main for a fresh batch', '');
+                if (!clickBackToMain()) forceAdvanceSkip('Loading-your-Job stall (retry)');
+                _escalated = false;
+              }
+              _since = 0;
+            } catch (_) {}
+          }
+        );
+      } catch (_) {}
+    }
+    setInterval(tick, 5000);
+  })();
+
   /* ── Keep Auto-Apply running until genuinely complete ────────────────
    * OptimHire's session ends on its own after a few applies (a 404'd
    * job, a transient backend error, etc.) and reverts to the start
