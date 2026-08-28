@@ -1256,6 +1256,44 @@
     setInterval(tick, 1200);
   })();
 
+  /* Relay the on-demand fill's progress into the status log. */
+  try {
+    chrome.runtime.onMessage.addListener(function (msg) {
+      if (!msg || msg.type !== 'OH_MANUAL_FILL_STATUS') return;
+      if (msg.state === 'start') addLog('Autofill this page: started', '');
+      else if (msg.state === 'done') addLog('Autofill this page: finished', 'success');
+      else if (msg.state === 'error') addLog('Autofill this page: failed', 'error');
+    });
+  } catch (_) {}
+
+  /* ── Unlock 2.8.2's own "Autofill Application" button ────────────────
+   * 2.8.2 added an on-demand autofill but put it behind a lock icon and
+   * an unlock/upgrade modal. Strip the disabled state and hide the lock
+   * so it behaves like the rest of the unrestricted build. Our own
+   * "Autofill this page" button stays as the reliable path since it runs
+   * our fill engine. */
+  (function unlockAutofillApplication() {
+    function tick() {
+      try {
+        var btns = document.querySelectorAll('button,[role="button"]');
+        for (var i = 0; i < btns.length; i++) {
+          var b = btns[i];
+          var t = ((b.innerText || b.textContent || '') + '').replace(/\s+/g, ' ').trim();
+          if (!/^autofill application$/i.test(t)) continue;
+          if (b.disabled) { try { b.disabled = false; } catch (_) {} }
+          b.removeAttribute && b.removeAttribute('aria-disabled');
+          if (b.className && /disabled:opacity|cursor-not-allowed/.test(b.className)) {
+            b.style.setProperty('opacity', '1', 'important');
+            b.style.setProperty('cursor', 'pointer', 'important');
+          }
+          var lock = b.querySelector('img[alt="lock" i],img[src*="lock" i]');
+          if (lock) lock.style.setProperty('display', 'none', 'important');
+        }
+      } catch (_) {}
+    }
+    setInterval(tick, 2000);
+  })();
+
   /* ── "Loading your Job" stall watchdog ───────────────────────────────
    * OptimHire sometimes never resolves this spinner (its fetch for the
    * next job fails silently), leaving the run stuck forever. Nothing else
@@ -2046,6 +2084,16 @@
           'style="width:100%;background:#0f1117;color:#c4b5fd;border:1px solid #3a3d4a;' +
           'padding:7px 10px;border-radius:8px;font-size:11.5px;cursor:pointer">' +
           '⬇ Export queue job URLs (0)</button>' +
+        '<div style="display:flex;gap:6px;margin-top:6px">' +
+          '<button id="oh-qc-fill" title="Fill the job application on the tab you are currently viewing, using our autofill engine (works on any site, no unlock needed)" ' +
+            'style="flex:1;background:#0f1117;color:#4ade80;border:1px solid #3a3d4a;' +
+            'padding:7px 10px;border-radius:8px;font-size:11.5px;cursor:pointer;font-weight:600">' +
+            '⚡ Autofill this page</button>' +
+          '<button id="oh-qc-fillsubmit" title="Autofill this page AND click its submit button" ' +
+            'style="background:#0f1117;color:#c4b5fd;border:1px solid #3a3d4a;' +
+            'padding:7px 10px;border-radius:8px;font-size:11.5px;cursor:pointer">' +
+            '+ submit</button>' +
+        '</div>' +
         '<div id="oh-qc-truth" title="OptimHire’s ‘X applied’ counter also counts SKIPS. This shows how many actually got a real submission confirmation." ' +
           'style="margin-top:7px;font-size:10.5px;color:#94a3b8;line-height:1.5;text-align:center">' +
           'Real outcome: — submitted · — skipped</div>';
@@ -2065,6 +2113,34 @@
       if (exportBtn) exportBtn.addEventListener('click', function () {
         exportHarvestedJobs();
       });
+
+      /* "Autofill this page" — run our fill engine on whatever tab the
+         user is currently viewing. This is our unrestricted equivalent of
+         2.8.2's "Autofill Application", which sits behind an unlock modal. */
+      function autofillActiveTab(withSubmit) {
+        try {
+          chrome.tabs.query({ active: true, currentWindow: true }, function (tabs) {
+            var t = tabs && tabs[0];
+            if (!t || t.id == null) { addLog('Autofill this page: no active tab', 'error'); return; }
+            if (/^chrome(-extension)?:\/\//i.test(t.url || '')) {
+              addLog('Autofill this page: cannot run on a browser page', 'error');
+              return;
+            }
+            addLog('Autofill this page: ' + (withSubmit ? 'filling + submitting…' : 'filling…'), '');
+            try {
+              chrome.tabs.sendMessage(t.id, {
+                type: 'OH_AUTOFILL_THIS_PAGE', submit: !!withSubmit
+              }).catch(function () {
+                addLog('Autofill this page: page not ready — reload it and retry', 'error');
+              });
+            } catch (_) {}
+          });
+        } catch (_) {}
+      }
+      var fillBtn = document.getElementById('oh-qc-fill');
+      if (fillBtn) fillBtn.addEventListener('click', function () { autofillActiveTab(false); });
+      var fillSubmitBtn = document.getElementById('oh-qc-fillsubmit');
+      if (fillSubmitBtn) fillSubmitBtn.addEventListener('click', function () { autofillActiveTab(true); });
       /* × collapses the card to a small re-open pill in the corner. */
       var collapse = document.getElementById('oh-qc-collapse');
       if (collapse) collapse.addEventListener('click', function (e) {

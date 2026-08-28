@@ -446,13 +446,74 @@
     return true;
   }
 
+  /* ── "Autofill this page" — on-demand fill of whatever page you are on ──
+   * 2.8.2 shipped an "Autofill Application" button for this, but it is
+   * gated behind a lock/upgrade modal. This is our own equivalent, using
+   * OUR fill engine (location typeahead, phone country code, device type,
+   * field-of-study, sanitize passes), so it works on any site with no
+   * restriction.
+   *
+   * Previously this listener only ARMED manual mode and never actually
+   * filled anything — the trigger did nothing visible.
+   * ────────────────────────────────────────────────────────────────── */
+  /* Set by installReviewAndSubmit() so the on-demand fill can reuse the
+     same ranked submit-button finder. Null on optimhire.com, where that
+     module returns early. */
+  let findAnySubmitButton = null;
+  let _manualFillRunning = false;
+
+  async function runManualAutofill(opts) {
+    if (_manualFillRunning) { LOG('Autofill this page: already running'); return; }
+    _manualFillRunning = true;
+    const submitAfter = !!(opts && opts.submit);
+    try {
+      LOG('Autofill this page: starting');
+      try { chrome.runtime.sendMessage({ type: 'OH_MANUAL_FILL_STATUS', state: 'start' }).catch(() => {}); } catch (_) {}
+      _fillActive = true;
+      await runAtsAutofill();
+      try { await solveCaptcha(); } catch (_) {}
+      await sleep(400);
+      try { await detectAndFixValidationErrors(); } catch (_) {}
+      await sleep(600);  try { await sanitizeBadFills(); } catch (_) {}
+      await sleep(800);  try { await sanitizeBadFills(); } catch (_) {}
+      _fillActive = false;
+      /* Give the location-typeahead rescue a moment, then optionally
+         submit. Submitting is opt-in so a plain fill never sends an
+         application the user only wanted filled in. */
+      if (submitAfter) {
+        await sleep(1200);
+        const hit = (typeof findAnySubmitButton === 'function') ? findAnySubmitButton() : null;
+        if (hit) {
+          LOG(`Autofill this page: submitting via "${hit.why}"`);
+          markSubmitAttempted();
+          try { realClick(hit.btn); } catch (_) { try { hit.btn.click(); } catch (__) {} }
+        } else {
+          LOG('Autofill this page: no submit button found');
+        }
+      }
+      LOG('Autofill this page: done');
+      try { chrome.runtime.sendMessage({ type: 'OH_MANUAL_FILL_STATUS', state: 'done' }).catch(() => {}); } catch (_) {}
+    } catch (e) {
+      LOG('Autofill this page: error', e);
+      try { chrome.runtime.sendMessage({ type: 'OH_MANUAL_FILL_STATUS', state: 'error' }).catch(() => {}); } catch (_) {}
+    } finally {
+      _fillActive = false;
+      _manualFillRunning = false;
+    }
+  }
+
   /* User explicitly clicked Autofill on this tab → arm manual mode for 30s */
   chrome.runtime.onMessage.addListener((msg) => {
     if (!msg) return;
     if (msg.type === 'TRIGGER_AUTOFILL' || msg.type === 'MANUAL_AUTOFILL' ||
-        msg.action === 'autofill' || msg.action === 'startAutofill') {
+        msg.action === 'autofill' || msg.action === 'startAutofill' ||
+        msg.type === 'OH_AUTOFILL_THIS_PAGE') {
       _manualTriggerTs = Date.now();
       _automationCache = { active: true, ts: Date.now() };
+      /* Only the top frame drives the fill so we don't run once per iframe. */
+      if (window.top === window.self) {
+        runManualAutofill({ submit: !!(msg && msg.submit) });
+      }
     }
   });
 
@@ -1137,6 +1198,9 @@
       }
       return null;
     }
+
+    /* Publish for the on-demand "Autofill this page" action. */
+    findAnySubmitButton = findSubmitRanked;
 
     function findSubmit() {
       for (const b of document.querySelectorAll('button,[role="button"],input[type=submit]')) {
