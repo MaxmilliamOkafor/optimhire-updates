@@ -32,8 +32,8 @@
   var KEY         = 'ohDebugLog';
   var KEY_ENABLED = 'ohDebugEnabled';
   var KEY_PAUSED  = 'ohDebugPaused';
-  var MAX         = 5000;          // ring-buffer cap
-  var FLUSH_MS    = 500;           // debounce writes
+  var MAX         = 1500;          // ring-buffer cap (5000 made every flush rewrite a multi-MB array)
+  var FLUSH_MS    = 2000;          // debounce writes (was 500ms — constant storage churn during automation)
   var MAX_STR     = 4000;          // truncate long strings
   var MAX_BUF     = 200;           // emergency flush threshold
 
@@ -196,7 +196,13 @@
   });
 
   /* ── Auto-capture: storage changes (skip our own keys to avoid loop) */
-  var SELF_KEYS = { ohDebugLog: 1, ohDebugEnabled: 1, ohDebugPaused: 1 };
+  var SELF_KEYS = { ohDebugLog: 1, ohDebugEnabled: 1, ohDebugPaused: 1, ohTabOwner: 1 };
+  /* High-frequency keys change every second during automation; logging
+     each change made the logger itself a CPU/storage hog. Record at most
+     one entry per key per THROTTLE_MS. */
+  var THROTTLED_KEYS = { autoApplyState: 1, appliedCount: 1, autoApplyStateUpdate: 1, pageQuestions: 1, ohHarvestedJobs: 1, complexFormData: 1 };
+  var THROTTLE_MS = 5000;
+  var _lastKeyLog = {};
   try {
     chrome.storage.onChanged.addListener(function (changes, area) {
       if (area !== 'local') return;
@@ -205,6 +211,11 @@
       for (var i = 0; i < keys.length; i++) {
         var k = keys[i];
         if (SELF_KEYS[k]) continue;
+        if (THROTTLED_KEYS[k]) {
+          var nowTs = Date.now();
+          if (_lastKeyLog[k] && nowTs - _lastKeyLog[k] < THROTTLE_MS) continue;
+          _lastKeyLog[k] = nowTs;
+        }
         var c = changes[k];
         log('storage', k, { from: safe(c.oldValue), to: safe(c.newValue) });
       }

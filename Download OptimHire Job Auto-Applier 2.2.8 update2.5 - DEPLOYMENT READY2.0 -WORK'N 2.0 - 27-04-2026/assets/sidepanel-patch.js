@@ -1160,8 +1160,13 @@
    * ─────────────────────────────────────────────────────────────────── */
   (function installAutoApplyClicker() {
     var COOLDOWN_MS = 4000;
+    var NOKEY_COOLDOWN_MS = 20000;  // much slower when we can't identify the job
+    var MAX_PER_MIN = 6;            // hard ceiling on presses per minute
+    var NO_KEY = ' nokey';
     var _lastClickTs = 0;
     var _lastJobKey = '';
+    var _recent = [];
+    var _clickedBtns = (typeof WeakSet !== 'undefined') ? new WeakSet() : { has: function(){return false;}, add: function(){} };
 
     function currentJobKey() {
       try {
@@ -1217,9 +1222,25 @@
               var btn = findApplyButton();
               if (!btn) return;
               var key = currentJobKey();
-              if (key && key === _lastJobKey) return; // already applied here
-              _lastJobKey = key;
-              _lastClickTs = Date.now();
+              /* Dedupe. The old guard was `if (key && key === _lastJobKey)`,
+                 which SKIPPED the check entirely whenever the key was
+                 empty (no h1/h2 rendered yet) — so Apply was re-pressed
+                 every cooldown, producing the repeated "Auto-pressed
+                 Apply" bursts. Dedupe on the button ELEMENT as well, so
+                 the same node is never clicked twice regardless of the
+                 key, and rate-cap the whole thing. */
+              if (_clickedBtns.has(btn)) return;
+              if (key && key === _lastJobKey) return;   // same job again
+              if (!key && _lastJobKey === NO_KEY && Date.now() - _lastClickTs < NOKEY_COOLDOWN_MS) return;
+              /* Hard rate cap: never more than MAX_PER_MIN presses a
+                 minute, whatever the DOM does. */
+              var now = Date.now();
+              _recent = _recent.filter(function (t) { return now - t < 60_000; });
+              if (_recent.length >= MAX_PER_MIN) return;
+              _recent.push(now);
+              _clickedBtns.add(btn);
+              _lastJobKey = key || NO_KEY;
+              _lastClickTs = now;
               try {
                 btn.dispatchEvent(new MouseEvent('mouseover', { bubbles: true }));
                 btn.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
@@ -1233,6 +1254,117 @@
       } catch (_) {}
     }
     setInterval(tick, 1200);
+  })();
+
+  /* Relay the on-demand fill's progress into the status log. */
+  try {
+    chrome.runtime.onMessage.addListener(function (msg) {
+      if (!msg || msg.type !== 'OH_MANUAL_FILL_STATUS') return;
+      if (msg.state === 'start') addLog('Autofill this page: started', '');
+      else if (msg.state === 'done') addLog('Autofill this page: finished', 'success');
+      else if (msg.state === 'error') addLog('Autofill this page: failed', 'error');
+    });
+  } catch (_) {}
+
+  /* ── Unlock 2.8.2's own "Autofill Application" button ────────────────
+   * 2.8.2 added an on-demand autofill but put it behind a lock icon and
+   * an unlock/upgrade modal. Strip the disabled state and hide the lock
+   * so it behaves like the rest of the unrestricted build. Our own
+   * "Autofill this page" button stays as the reliable path since it runs
+   * our fill engine. */
+  (function unlockAutofillApplication() {
+    function tick() {
+      try {
+        var btns = document.querySelectorAll('button,[role="button"]');
+        for (var i = 0; i < btns.length; i++) {
+          var b = btns[i];
+          var t = ((b.innerText || b.textContent || '') + '').replace(/\s+/g, ' ').trim();
+          if (!/^autofill application$/i.test(t)) continue;
+          if (b.disabled) { try { b.disabled = false; } catch (_) {} }
+          b.removeAttribute && b.removeAttribute('aria-disabled');
+          if (b.className && /disabled:opacity|cursor-not-allowed/.test(b.className)) {
+            b.style.setProperty('opacity', '1', 'important');
+            b.style.setProperty('cursor', 'pointer', 'important');
+          }
+          var lock = b.querySelector('img[alt="lock" i],img[src*="lock" i]');
+          if (lock) lock.style.setProperty('display', 'none', 'important');
+        }
+      } catch (_) {}
+    }
+    setInterval(tick, 2000);
+  })();
+
+  /* ── "Loading your Job" stall watchdog ───────────────────────────────
+   * OptimHire sometimes never resolves this spinner (its fetch for the
+   * next job fails silently), leaving the run stuck forever. Nothing else
+   * recovers it: the generic stuck-watchdog keys off job/URL changes,
+   * and this screen has neither.
+   *
+   * If the spinner is continuously present for STALL_MS while a session
+   * is engaged, escalate: first a real Skip (which advances OptimHire to
+   * the next job), then, if it is STILL stuck, a "Back to Main" to force
+   * a fresh batch. Rate-limited so it can never loop.
+   * ─────────────────────────────────────────────────────────────────── */
+  (function installLoadingStallWatchdog() {
+    var STALL_MS = 45_000;        // spinner must persist this long
+    var COOLDOWN_MS = 60_000;     // min gap between recovery attempts
+    var LOADING_RE = /loading your job|loading job|fetching your job/i;
+    var _since = 0, _lastRecoveryTs = 0, _escalated = false;
+
+    function spinnerVisible() {
+      try {
+        var t = (document.body && document.body.innerText || '').slice(0, 3000);
+        return LOADING_RE.test(t);
+      } catch (_) { return false; }
+    }
+    function clickBackToMain() {
+      var btns = document.querySelectorAll('button,[role="button"],a');
+      for (var i = 0; i < btns.length; i++) {
+        var b = btns[i];
+        if (!b) continue;
+        var r = b.getBoundingClientRect();
+        if (r.width === 0 || r.height === 0) continue;
+        var t = ((b.innerText || b.textContent || '') + '').replace(/\s+/g, ' ').trim();
+        if (/^back to main$/i.test(t)) { try { b.click(); return true; } catch (_) {} }
+      }
+      return false;
+    }
+
+    function tick() {
+      try {
+        if (!spinnerVisible()) { _since = 0; _escalated = false; return; }
+        var now = Date.now();
+        if (!_since) { _since = now; return; }
+        if (now - _since < STALL_MS) return;
+        if (now - _lastRecoveryTs < COOLDOWN_MS) return;
+        chrome.storage.local.get(
+          ['autoApplyState', 'ohAutoApplyEngaged', 'isAutoProcessStartJob', 'ohJobQueueActive'],
+          function (d) {
+            try {
+              var st = d && d.autoApplyState;
+              var engaged = (st && st.isActive === true) ||
+                            !!(d && d.ohAutoApplyEngaged) ||
+                            !!(d && d.isAutoProcessStartJob) ||
+                            !!(d && d.ohJobQueueActive);
+              if (!engaged) return;   // user is idle — leave the UI alone
+              _lastRecoveryTs = Date.now();
+              if (!_escalated) {
+                _escalated = true;
+                addLog('Stuck on "Loading your Job" for ' + Math.round(STALL_MS / 1000) +
+                       's — skipping to the next job', '');
+                forceAdvanceSkip('Loading-your-Job stall');
+              } else {
+                addLog('Still stuck on "Loading your Job" — returning to main for a fresh batch', '');
+                if (!clickBackToMain()) forceAdvanceSkip('Loading-your-Job stall (retry)');
+                _escalated = false;
+              }
+              _since = 0;
+            } catch (_) {}
+          }
+        );
+      } catch (_) {}
+    }
+    setInterval(tick, 5000);
   })();
 
   /* ── Keep Auto-Apply running until genuinely complete ────────────────
@@ -1952,6 +2084,16 @@
           'style="width:100%;background:#0f1117;color:#c4b5fd;border:1px solid #3a3d4a;' +
           'padding:7px 10px;border-radius:8px;font-size:11.5px;cursor:pointer">' +
           '⬇ Export queue job URLs (0)</button>' +
+        '<div style="display:flex;gap:6px;margin-top:6px">' +
+          '<button id="oh-qc-fill" title="Fill the job application on the tab you are currently viewing, using our autofill engine (works on any site, no unlock needed)" ' +
+            'style="flex:1;background:#0f1117;color:#4ade80;border:1px solid #3a3d4a;' +
+            'padding:7px 10px;border-radius:8px;font-size:11.5px;cursor:pointer;font-weight:600">' +
+            '⚡ Autofill this page</button>' +
+          '<button id="oh-qc-fillsubmit" title="Autofill this page AND click its submit button" ' +
+            'style="background:#0f1117;color:#c4b5fd;border:1px solid #3a3d4a;' +
+            'padding:7px 10px;border-radius:8px;font-size:11.5px;cursor:pointer">' +
+            '+ submit</button>' +
+        '</div>' +
         '<div id="oh-qc-truth" title="OptimHire’s ‘X applied’ counter also counts SKIPS. This shows how many actually got a real submission confirmation." ' +
           'style="margin-top:7px;font-size:10.5px;color:#94a3b8;line-height:1.5;text-align:center">' +
           'Real outcome: — submitted · — skipped</div>';
@@ -1971,6 +2113,34 @@
       if (exportBtn) exportBtn.addEventListener('click', function () {
         exportHarvestedJobs();
       });
+
+      /* "Autofill this page" — run our fill engine on whatever tab the
+         user is currently viewing. This is our unrestricted equivalent of
+         2.8.2's "Autofill Application", which sits behind an unlock modal. */
+      function autofillActiveTab(withSubmit) {
+        try {
+          chrome.tabs.query({ active: true, currentWindow: true }, function (tabs) {
+            var t = tabs && tabs[0];
+            if (!t || t.id == null) { addLog('Autofill this page: no active tab', 'error'); return; }
+            if (/^chrome(-extension)?:\/\//i.test(t.url || '')) {
+              addLog('Autofill this page: cannot run on a browser page', 'error');
+              return;
+            }
+            addLog('Autofill this page: ' + (withSubmit ? 'filling + submitting…' : 'filling…'), '');
+            try {
+              chrome.tabs.sendMessage(t.id, {
+                type: 'OH_AUTOFILL_THIS_PAGE', submit: !!withSubmit
+              }).catch(function () {
+                addLog('Autofill this page: page not ready — reload it and retry', 'error');
+              });
+            } catch (_) {}
+          });
+        } catch (_) {}
+      }
+      var fillBtn = document.getElementById('oh-qc-fill');
+      if (fillBtn) fillBtn.addEventListener('click', function () { autofillActiveTab(false); });
+      var fillSubmitBtn = document.getElementById('oh-qc-fillsubmit');
+      if (fillSubmitBtn) fillSubmitBtn.addEventListener('click', function () { autofillActiveTab(true); });
       /* × collapses the card to a small re-open pill in the corner. */
       var collapse = document.getElementById('oh-qc-collapse');
       if (collapse) collapse.addEventListener('click', function (e) {

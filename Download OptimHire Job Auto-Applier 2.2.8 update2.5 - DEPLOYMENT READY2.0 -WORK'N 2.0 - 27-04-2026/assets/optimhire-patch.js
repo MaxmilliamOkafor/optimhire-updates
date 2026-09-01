@@ -133,9 +133,14 @@
     const inIframe = window.top !== window.self;
     if (inIframe) {
       const h = (location.hostname || '').toLowerCase();
-      const ATS_HOST_RE = /(greenhouse|lever\.co|breezy|workday|icims|taleo|oraclecloud|smartrecruiters|ashbyhq|bamboohr|jobvite|workable|paylocity|jazzhr|resumatorapi|teamtailor|ziprecruiter|manatal|bullhorn|hiring\.cafe|gohire|forhyre|careers-page|gh-widget|successfactors|sapsf|ukg|ultipro|avature|recruitee|pinpoint|rippling|ats\.|jobs\.|careers\.|apply\.)/i;
-      const looksLikeJobApp = /\/(apply|application|job|career|position|opening)/i.test(location.pathname);
-      if (!ATS_HOST_RE.test(h) && !looksLikeJobApp) {
+      /* Named ATS hosts ONLY. The old gate also admitted any iframe on a
+         jobs./careers./apply./ats. subdomain or with /job|/career in its
+         path — which describes half the ad/analytics iframes on a job
+         board — so dozens of frames per page ran the full machinery.
+         An unknown ATS's iframe loses nothing important: the top frame
+         still handles the page. */
+      const ATS_HOST_RE = /(greenhouse|lever\.co|breezy|workday|icims|taleo|oraclecloud|smartrecruiters|ashbyhq|bamboohr|jobvite|workable|paylocity|jazzhr|resumatorapi|teamtailor|ziprecruiter|manatal|bullhorn|hiring\.cafe|gohire|forhyre|careers-page|gh-widget|successfactors|sapsf|ultipro|avature|recruitee|pinpoint|rippling)/i;
+      if (!ATS_HOST_RE.test(h)) {
         /* Quietly no-op in non-ATS iframes (analytics, ads, etc.) */
         return;
       }
@@ -158,6 +163,74 @@
     } catch (_) {}
   };
   const ST  = chrome.storage.local;
+
+  /* ── Idle governor (CRITICAL for CPU) ────────────────────────────────
+   * This file installs ~22 polling loops and ~14 subtree
+   * MutationObservers, and they ran in EVERY tab all the time — engaged
+   * or not. Multiplied across open tabs (and ATS iframes) that pinned
+   * the CPU and was crashing the user's machine.
+   *
+   * The governor keeps ONE cheap 5s storage poll. Everything below uses
+   * the local `setInterval` / `MutationObserver` shadows, so when no
+   * automation is engaged and this is not an optimhire.com page:
+   *   - bodies of all sub-15s interval loops are skipped outright,
+   *   - every MutationObserver is disconnected (reconnected on engage).
+   * Net idle cost: one storage read every 5 seconds.
+   * ────────────────────────────────────────────────────────────────── */
+  const _nativeSetInterval = window.setInterval.bind(window);
+  const _NativeMO = window.MutationObserver;
+  const _IS_OH_PAGE = /(^|\.)optimhire\.com$/i.test(location.hostname);
+  let _engagedNow = _IS_OH_PAGE;          // optimhire.com pages always active
+  const _governedObservers = new Set();
+
+  function _refreshEngaged() {
+    try {
+      ST.get(['isAutoProcessStartJob', 'ohAutoApplyEngaged', 'ohJobQueueActive', 'autoApplyState'],
+        (d) => {
+          try {
+            const st = d && d.autoApplyState;
+            const on = !!(d && (d.isAutoProcessStartJob || d.ohAutoApplyEngaged || d.ohJobQueueActive)) ||
+                       !!(st && st.isActive === true) ||
+                       (Date.now() - _manualTriggerTs < 30_000);
+            _engagedNow = on || _IS_OH_PAGE;
+            for (const g of _governedObservers) {
+              if (_engagedNow && !g.connected && g.args) {
+                try { g.obs.observe(...g.args); g.connected = true; } catch (_) {}
+              } else if (!_engagedNow && g.connected) {
+                try { g.obs.disconnect(); g.connected = false; } catch (_) {}
+              }
+            }
+          } catch (_) {}
+        });
+    } catch (_) {}
+  }
+  _nativeSetInterval(_refreshEngaged, 5000);
+  setTimeout(_refreshEngaged, 800);   // async: runs after module init, so no TDZ issues
+
+  /* Local shadows — every setInterval/MutationObserver below goes
+     through these. Long-period loops (>=15s) are cheap enough to leave
+     untouched. */
+  function setInterval(fn, ms, ...rest) {
+    return _nativeSetInterval(function () {
+      if (!_engagedNow && ms < 15_000) return;
+      return fn.apply(this, arguments);
+    }, ms, ...rest);
+  }
+  class MutationObserver {
+    constructor(cb) {
+      this._g = {
+        obs: new _NativeMO(function () { if (_engagedNow) return cb.apply(this, arguments); }),
+        args: null, connected: false
+      };
+      _governedObservers.add(this._g);
+    }
+    observe(...args) {
+      this._g.args = args;
+      if (_engagedNow) { this._g.obs.observe(...args); this._g.connected = true; }
+    }
+    disconnect() { try { this._g.obs.disconnect(); } catch (_) {} this._g.connected = false; }
+    takeRecords() { return this._g.obs.takeRecords(); }
+  }
   const $   = (s, c = document) => c.querySelector(s);
   const $$  = (s, c = document) => [...c.querySelectorAll(s)];
   const sleep = ms => new Promise(r => setTimeout(r, ms));
@@ -408,8 +481,21 @@
     try {
       if (window.top !== window.self) return false;   // never from sub-frames
       if (Date.now() - _manualTriggerTs < 30_000) return true;  // user acted here
-      const d = await ST.get(['autoApplyState', 'ohJobQueue', 'ohJobQueueActive']);
+      const d = await ST.get(['autoApplyState', 'ohJobQueue', 'ohJobQueueActive',
+                              'ohAutoApplyEngaged', 'isAutoProcessStartJob']);
       const here = location.href;
+      /* optimhire.com's own copilot page is the automation's CONTROL
+         SURFACE, not a job page, so its URL never matches apply_now_url.
+         Excluding it meant every recovery skip sent from there was
+         suppressed — which left the run stuck forever on "Loading your
+         Job" with no way out. It was never the source of the runaway
+         tab-spam either (that came from unrelated job-board tabs such as
+         Indeed), so allow it whenever automation is engaged. */
+      if (/(^|\.)optimhire\.com$/i.test(location.hostname)) {
+        const st = d.autoApplyState;
+        if ((st && st.isActive === true) || d.ohAutoApplyEngaged ||
+            d.isAutoProcessStartJob || d.ohJobQueueActive) return true;
+      }
       const ad = d.autoApplyState && d.autoApplyState.applicationDetails;
       const applyUrl = ad && ad.source && ad.source.apply_now_url;
       if (applyUrl && _urlsMatchLoose(here, applyUrl)) return true;
@@ -433,13 +519,74 @@
     return true;
   }
 
+  /* ── "Autofill this page" — on-demand fill of whatever page you are on ──
+   * 2.8.2 shipped an "Autofill Application" button for this, but it is
+   * gated behind a lock/upgrade modal. This is our own equivalent, using
+   * OUR fill engine (location typeahead, phone country code, device type,
+   * field-of-study, sanitize passes), so it works on any site with no
+   * restriction.
+   *
+   * Previously this listener only ARMED manual mode and never actually
+   * filled anything — the trigger did nothing visible.
+   * ────────────────────────────────────────────────────────────────── */
+  /* Set by installReviewAndSubmit() so the on-demand fill can reuse the
+     same ranked submit-button finder. Null on optimhire.com, where that
+     module returns early. */
+  let findAnySubmitButton = null;
+  let _manualFillRunning = false;
+
+  async function runManualAutofill(opts) {
+    if (_manualFillRunning) { LOG('Autofill this page: already running'); return; }
+    _manualFillRunning = true;
+    const submitAfter = !!(opts && opts.submit);
+    try {
+      LOG('Autofill this page: starting');
+      try { chrome.runtime.sendMessage({ type: 'OH_MANUAL_FILL_STATUS', state: 'start' }).catch(() => {}); } catch (_) {}
+      _fillActive = true;
+      await runAtsAutofill();
+      try { await solveCaptcha(); } catch (_) {}
+      await sleep(400);
+      try { await detectAndFixValidationErrors(); } catch (_) {}
+      await sleep(600);  try { await sanitizeBadFills(); } catch (_) {}
+      await sleep(800);  try { await sanitizeBadFills(); } catch (_) {}
+      _fillActive = false;
+      /* Give the location-typeahead rescue a moment, then optionally
+         submit. Submitting is opt-in so a plain fill never sends an
+         application the user only wanted filled in. */
+      if (submitAfter) {
+        await sleep(1200);
+        const hit = (typeof findAnySubmitButton === 'function') ? findAnySubmitButton() : null;
+        if (hit) {
+          LOG(`Autofill this page: submitting via "${hit.why}"`);
+          markSubmitAttempted();
+          try { realClick(hit.btn); } catch (_) { try { hit.btn.click(); } catch (__) {} }
+        } else {
+          LOG('Autofill this page: no submit button found');
+        }
+      }
+      LOG('Autofill this page: done');
+      try { chrome.runtime.sendMessage({ type: 'OH_MANUAL_FILL_STATUS', state: 'done' }).catch(() => {}); } catch (_) {}
+    } catch (e) {
+      LOG('Autofill this page: error', e);
+      try { chrome.runtime.sendMessage({ type: 'OH_MANUAL_FILL_STATUS', state: 'error' }).catch(() => {}); } catch (_) {}
+    } finally {
+      _fillActive = false;
+      _manualFillRunning = false;
+    }
+  }
+
   /* User explicitly clicked Autofill on this tab → arm manual mode for 30s */
   chrome.runtime.onMessage.addListener((msg) => {
     if (!msg) return;
     if (msg.type === 'TRIGGER_AUTOFILL' || msg.type === 'MANUAL_AUTOFILL' ||
-        msg.action === 'autofill' || msg.action === 'startAutofill') {
+        msg.action === 'autofill' || msg.action === 'startAutofill' ||
+        msg.type === 'OH_AUTOFILL_THIS_PAGE') {
       _manualTriggerTs = Date.now();
       _automationCache = { active: true, ts: Date.now() };
+      /* Only the top frame drives the fill so we don't run once per iframe. */
+      if (window.top === window.self) {
+        runManualAutofill({ submit: !!(msg && msg.submit) });
+      }
     }
   });
 
@@ -772,6 +919,55 @@
     if (d?.isAutoProcessStartJob) acquireWakeLock();
   });
 
+  /* ── Single-tab ownership for page-side automation ───────────────────
+   * This content script runs in EVERY tab. With two OptimHire tabs open
+   * both were pressing Apply and driving applications at once — the user
+   * saw applying jump between tab 1 and tab 2, and the browser bogged
+   * down under the duplicated work.
+   *
+   * Content scripts cannot read their own tab id, so ownership is
+   * elected through storage with a heartbeat: one instance holds
+   * ohTabOwner {id, ts}; others stand down. If the owner stops
+   * heartbeating (tab closed/navigated) another claims it within
+   * OWNER_STALE_MS.
+   * ────────────────────────────────────────────────────────────────── */
+  const _OWNER_ID = 'oh_' + Math.random().toString(36).slice(2) + Date.now().toString(36);
+  const OWNER_STALE_MS = 12_000;
+  let _ownerCache = { own: false, ts: 0 };
+
+  async function isAutomationOwnerTab() {
+    /* Cache so a 2s loop doesn't hit storage constantly. */
+    if (Date.now() - _ownerCache.ts < 2000) return _ownerCache.own;
+    try {
+      const d = await ST.get(['ohTabOwner']);
+      const cur = d && d.ohTabOwner;
+      const now = Date.now();
+      let own;
+      if (cur && cur.id === _OWNER_ID) {
+        await ST.set({ ohTabOwner: { id: _OWNER_ID, ts: now } });   // heartbeat
+        own = true;
+      } else if (!cur || !cur.ts || now - cur.ts > OWNER_STALE_MS) {
+        await ST.set({ ohTabOwner: { id: _OWNER_ID, ts: now } });   // claim
+        own = true;
+      } else {
+        own = false;                                                // someone else owns it
+      }
+      _ownerCache = { own, ts: now };
+      return own;
+    } catch (_) { return true; }   // storage unavailable → act alone
+  }
+  /* Release ownership when this tab goes away so the next one can act
+     immediately rather than waiting for the heartbeat to go stale. */
+  try {
+    window.addEventListener('pagehide', () => {
+      try {
+        ST.get(['ohTabOwner'], (d) => {
+          if (d && d.ohTabOwner && d.ohTabOwner.id === _OWNER_ID) ST.set({ ohTabOwner: null });
+        });
+      } catch (_) {}
+    });
+  } catch (_) {}
+
   /* ── Auto-press "Apply" on optimhire.com's job-apply page ────────────
    * OptimHire's WEB APP (optimhire.com/d/job-apply) renders its own
    * Skip / Apply pair at the bottom of each job, separate from the one
@@ -835,6 +1031,8 @@
                         !!(d && d.ohJobQueueActive) ||
                         !!(d && d.ohAutoApplyEngaged);
         if (!engaged) return;
+        /* Only one tab may drive applications. */
+        if (!(await isAutomationOwnerTab())) return;
         if (_submitAttempted && Date.now() - _submitAttemptTs < 30_000) return;
         const btn = findApplyButton();
         if (!btn) return;
@@ -846,7 +1044,7 @@
         try { realClick(btn); } catch (_) { try { btn.click(); } catch (__) {} }
       } catch (_) {}
     }
-    setInterval(tick, 1200);
+    setInterval(tick, 2000);
   })();
 
   /* ── Location typeahead rescue ───────────────────────────────────────
@@ -952,6 +1150,8 @@
         if (_tries >= MAX_TRIES) return;
         if (_fillActive) return;
         if (!(await isAutomationActive())) return;
+        /* Only rescue fields on the tab that is actually the current job. */
+        if (!(await isActiveJobTab())) return;
         const targets = findLocationInputs();
         if (!targets.length) return;
         _busy = true;
@@ -966,7 +1166,7 @@
         LOG('Location typeahead error', e);
       } finally { _busy = false; }
     }
-    setInterval(tick, 2500);
+    setInterval(tick, 4000);
   })();
 
   /* ── Auto-submit when OptimHire says "Review and submit the form" ────
@@ -1072,6 +1272,9 @@
       return null;
     }
 
+    /* Publish for the on-demand "Autofill this page" action. */
+    findAnySubmitButton = findSubmitRanked;
+
     function findSubmit() {
       for (const b of document.querySelectorAll('button,[role="button"],input[type=submit]')) {
         if (!b || b.disabled) continue;
@@ -1100,6 +1303,11 @@
                         !!(d && d.isAutoProcessStartJob) ||
                         !!(d && d.ohJobQueueActive);
         if (!engaged) return;
+        /* Confine the heavy DOM work to the tab that IS the current job.
+           Previously this ran in every tab that had automation engaged,
+           and document.body.innerText forces a full layout — with several
+           tabs open that alone made the browser crawl. */
+        if (!(await isActiveJobTab())) return;
 
         const pageReady = READY_RE.test((document.body && document.body.innerText || '').slice(0, 4000));
         const ready = ohSaysReady(d && d.autoApplyState) || pageReady;
@@ -1132,7 +1340,7 @@
         try { realClick(hit.btn); } catch (_) { try { hit.btn.click(); } catch (__) {} }
       } catch (_) {}
     }
-    setInterval(tick, 1500);
+    setInterval(tick, 2500);
   })();
 
   /* ── T16: Hide referral / upgrade / credit-count UI ───────── */
