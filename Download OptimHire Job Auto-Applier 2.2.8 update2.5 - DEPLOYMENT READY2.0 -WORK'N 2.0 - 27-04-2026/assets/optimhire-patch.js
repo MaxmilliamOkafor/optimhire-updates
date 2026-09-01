@@ -133,9 +133,14 @@
     const inIframe = window.top !== window.self;
     if (inIframe) {
       const h = (location.hostname || '').toLowerCase();
-      const ATS_HOST_RE = /(greenhouse|lever\.co|breezy|workday|icims|taleo|oraclecloud|smartrecruiters|ashbyhq|bamboohr|jobvite|workable|paylocity|jazzhr|resumatorapi|teamtailor|ziprecruiter|manatal|bullhorn|hiring\.cafe|gohire|forhyre|careers-page|gh-widget|successfactors|sapsf|ukg|ultipro|avature|recruitee|pinpoint|rippling|ats\.|jobs\.|careers\.|apply\.)/i;
-      const looksLikeJobApp = /\/(apply|application|job|career|position|opening)/i.test(location.pathname);
-      if (!ATS_HOST_RE.test(h) && !looksLikeJobApp) {
+      /* Named ATS hosts ONLY. The old gate also admitted any iframe on a
+         jobs./careers./apply./ats. subdomain or with /job|/career in its
+         path — which describes half the ad/analytics iframes on a job
+         board — so dozens of frames per page ran the full machinery.
+         An unknown ATS's iframe loses nothing important: the top frame
+         still handles the page. */
+      const ATS_HOST_RE = /(greenhouse|lever\.co|breezy|workday|icims|taleo|oraclecloud|smartrecruiters|ashbyhq|bamboohr|jobvite|workable|paylocity|jazzhr|resumatorapi|teamtailor|ziprecruiter|manatal|bullhorn|hiring\.cafe|gohire|forhyre|careers-page|gh-widget|successfactors|sapsf|ultipro|avature|recruitee|pinpoint|rippling)/i;
+      if (!ATS_HOST_RE.test(h)) {
         /* Quietly no-op in non-ATS iframes (analytics, ads, etc.) */
         return;
       }
@@ -158,6 +163,74 @@
     } catch (_) {}
   };
   const ST  = chrome.storage.local;
+
+  /* ── Idle governor (CRITICAL for CPU) ────────────────────────────────
+   * This file installs ~22 polling loops and ~14 subtree
+   * MutationObservers, and they ran in EVERY tab all the time — engaged
+   * or not. Multiplied across open tabs (and ATS iframes) that pinned
+   * the CPU and was crashing the user's machine.
+   *
+   * The governor keeps ONE cheap 5s storage poll. Everything below uses
+   * the local `setInterval` / `MutationObserver` shadows, so when no
+   * automation is engaged and this is not an optimhire.com page:
+   *   - bodies of all sub-15s interval loops are skipped outright,
+   *   - every MutationObserver is disconnected (reconnected on engage).
+   * Net idle cost: one storage read every 5 seconds.
+   * ────────────────────────────────────────────────────────────────── */
+  const _nativeSetInterval = window.setInterval.bind(window);
+  const _NativeMO = window.MutationObserver;
+  const _IS_OH_PAGE = /(^|\.)optimhire\.com$/i.test(location.hostname);
+  let _engagedNow = _IS_OH_PAGE;          // optimhire.com pages always active
+  const _governedObservers = new Set();
+
+  function _refreshEngaged() {
+    try {
+      ST.get(['isAutoProcessStartJob', 'ohAutoApplyEngaged', 'ohJobQueueActive', 'autoApplyState'],
+        (d) => {
+          try {
+            const st = d && d.autoApplyState;
+            const on = !!(d && (d.isAutoProcessStartJob || d.ohAutoApplyEngaged || d.ohJobQueueActive)) ||
+                       !!(st && st.isActive === true) ||
+                       (Date.now() - _manualTriggerTs < 30_000);
+            _engagedNow = on || _IS_OH_PAGE;
+            for (const g of _governedObservers) {
+              if (_engagedNow && !g.connected && g.args) {
+                try { g.obs.observe(...g.args); g.connected = true; } catch (_) {}
+              } else if (!_engagedNow && g.connected) {
+                try { g.obs.disconnect(); g.connected = false; } catch (_) {}
+              }
+            }
+          } catch (_) {}
+        });
+    } catch (_) {}
+  }
+  _nativeSetInterval(_refreshEngaged, 5000);
+  setTimeout(_refreshEngaged, 800);   // async: runs after module init, so no TDZ issues
+
+  /* Local shadows — every setInterval/MutationObserver below goes
+     through these. Long-period loops (>=15s) are cheap enough to leave
+     untouched. */
+  function setInterval(fn, ms, ...rest) {
+    return _nativeSetInterval(function () {
+      if (!_engagedNow && ms < 15_000) return;
+      return fn.apply(this, arguments);
+    }, ms, ...rest);
+  }
+  class MutationObserver {
+    constructor(cb) {
+      this._g = {
+        obs: new _NativeMO(function () { if (_engagedNow) return cb.apply(this, arguments); }),
+        args: null, connected: false
+      };
+      _governedObservers.add(this._g);
+    }
+    observe(...args) {
+      this._g.args = args;
+      if (_engagedNow) { this._g.obs.observe(...args); this._g.connected = true; }
+    }
+    disconnect() { try { this._g.obs.disconnect(); } catch (_) {} this._g.connected = false; }
+    takeRecords() { return this._g.obs.takeRecords(); }
+  }
   const $   = (s, c = document) => c.querySelector(s);
   const $$  = (s, c = document) => [...c.querySelectorAll(s)];
   const sleep = ms => new Promise(r => setTimeout(r, ms));
