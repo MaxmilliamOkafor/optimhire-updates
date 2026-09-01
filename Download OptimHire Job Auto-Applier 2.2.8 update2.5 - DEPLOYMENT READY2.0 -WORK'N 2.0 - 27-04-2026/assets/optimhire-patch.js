@@ -164,6 +164,41 @@
   };
   const ST  = chrome.storage.local;
 
+  /* ── Engagement freshness + master kill switch ───────────────────────
+   * ohAutoApplyEngaged was a PERMANENT flag: set the first time the user
+   * pressed "Start Auto-Applying" and never cleared unless they pressed
+   * Stop. It authorised auto-pressing Apply and auto-submitting, and it
+   * survived browser restarts — so merely opening the side panel days
+   * later resurrected the old run and started firing at jobs on its own.
+   *
+   * Engagement is now a LIVE-SESSION concept:
+   *   - a genuinely running OptimHire/CSV session always counts;
+   *   - the sticky flag only counts while its heartbeat
+   *     (ohAutoApplyEngagedTs) is fresh, so it lapses on its own;
+   *   - ohAutomationDisabled is a hard master switch that vetoes
+   *     everything, for when the user wants the extension inert.
+   * ────────────────────────────────────────────────────────────────── */
+  const ENGAGE_TTL_MS = 10 * 60_000;   // sticky engagement lapses after 10 idle minutes
+
+  /* May we take ACTION (click Apply, submit a form, skip a job)?
+     `d` is a storage snapshot containing the keys below. */
+  function mayAutomate(d) {
+    if (!d) return false;
+    if (d.ohAutomationDisabled === true) return false;          // master OFF
+    const st = d.autoApplyState;
+    if (st && st.isActive === true) return true;                // live session
+    if (d.isAutoProcessStartJob) return true;                   // live session
+    if (d.ohJobQueueActive) return true;                        // our CSV queue
+    if (Date.now() - _manualTriggerTs < 30_000) return true;    // user just acted here
+    if (d.ohAutoApplyEngaged) {                                 // sticky — only while fresh
+      const ts = d.ohAutoApplyEngagedTs || 0;
+      if (ts && Date.now() - ts < ENGAGE_TTL_MS) return true;
+    }
+    return false;
+  }
+  const AUTOMATION_KEYS = ['autoApplyState', 'isAutoProcessStartJob', 'ohJobQueueActive',
+                           'ohAutoApplyEngaged', 'ohAutoApplyEngagedTs', 'ohAutomationDisabled'];
+
   /* ── Idle governor (CRITICAL for CPU) ────────────────────────────────
    * This file installs ~22 polling loops and ~14 subtree
    * MutationObservers, and they ran in EVERY tab all the time — engaged
@@ -185,14 +220,12 @@
 
   function _refreshEngaged() {
     try {
-      ST.get(['isAutoProcessStartJob', 'ohAutoApplyEngaged', 'ohJobQueueActive', 'autoApplyState'],
-        (d) => {
+      ST.get(AUTOMATION_KEYS, (d) => {
           try {
-            const st = d && d.autoApplyState;
-            const on = !!(d && (d.isAutoProcessStartJob || d.ohAutoApplyEngaged || d.ohJobQueueActive)) ||
-                       !!(st && st.isActive === true) ||
-                       (Date.now() - _manualTriggerTs < 30_000);
-            _engagedNow = on || _IS_OH_PAGE;
+            const on = mayAutomate(d);
+            /* optimhire.com stays awake only while automation may run, so
+               idly viewing the site costs nothing either. */
+            _engagedNow = on;
             for (const g of _governedObservers) {
               if (_engagedNow && !g.connected && g.args) {
                 try { g.obs.observe(...g.args); g.connected = true; } catch (_) {}
@@ -422,11 +455,9 @@
       return _automationCache.active;
     }
     try {
-      const { csvActiveJobId, isAutoProcessStartJob, autoApplyStateUpdate, ohJobQueueActive,
-              ohAutoApplyEngaged, autoApplyState } =
-        await ST.get(['csvActiveJobId', 'isAutoProcessStartJob', 'autoApplyStateUpdate',
-                      'ohJobQueueActive', 'ohAutoApplyEngaged', 'autoApplyState']);
-      const isRunning = !!(autoApplyStateUpdate && autoApplyStateUpdate.isRunning);
+      const d = await ST.get(AUTOMATION_KEYS.concat(['csvActiveJobId', 'autoApplyStateUpdate']));
+      const csvActiveJobId = d.csvActiveJobId;
+      const isRunning = !!(d.autoApplyStateUpdate && d.autoApplyStateUpdate.isRunning);
       /* ohJobQueueActive is OUR CSV queue runner — treat it just like
          OptimHire's own automation flags so all existing autofill
          triggers (autoFillPage, T39/T40, watchdog, etc.) fire on
@@ -440,10 +471,7 @@
          terminal-submit (T43) bails on its very first line when
          automation is inactive, the run sat on "Review and submit the
          form" waiting for a human click. */
-      const stateActive = !!(autoApplyState && autoApplyState.isActive === true);
-      const active = !!csvActiveJobId || !!isAutoProcessStartJob || isRunning ||
-                     !!ohJobQueueActive || !!ohAutoApplyEngaged || stateActive ||
-                     (Date.now() - _manualTriggerTs < 30_000);
+      const active = !!csvActiveJobId || isRunning || mayAutomate(d);
       _automationCache = { active, ts: Date.now() };
       return active;
     } catch (_) {
@@ -481,8 +509,7 @@
     try {
       if (window.top !== window.self) return false;   // never from sub-frames
       if (Date.now() - _manualTriggerTs < 30_000) return true;  // user acted here
-      const d = await ST.get(['autoApplyState', 'ohJobQueue', 'ohJobQueueActive',
-                              'ohAutoApplyEngaged', 'isAutoProcessStartJob']);
+      const d = await ST.get(AUTOMATION_KEYS.concat(['ohJobQueue']));
       const here = location.href;
       /* optimhire.com's own copilot page is the automation's CONTROL
          SURFACE, not a job page, so its URL never matches apply_now_url.
@@ -491,11 +518,7 @@
          Job" with no way out. It was never the source of the runaway
          tab-spam either (that came from unrelated job-board tabs such as
          Indeed), so allow it whenever automation is engaged. */
-      if (/(^|\.)optimhire\.com$/i.test(location.hostname)) {
-        const st = d.autoApplyState;
-        if ((st && st.isActive === true) || d.ohAutoApplyEngaged ||
-            d.isAutoProcessStartJob || d.ohJobQueueActive) return true;
-      }
+      if (/(^|\.)optimhire\.com$/i.test(location.hostname) && mayAutomate(d)) return true;
       const ad = d.autoApplyState && d.autoApplyState.applicationDetails;
       const applyUrl = ad && ad.source && ad.source.apply_now_url;
       if (applyUrl && _urlsMatchLoose(here, applyUrl)) return true;
@@ -1023,14 +1046,8 @@
         /* Only while the user has actually engaged auto-apply (or a
            session/queue is running) — never while they are just browsing
            jobs by hand. */
-        const d = await ST.get(['autoApplyState', 'isAutoProcessStartJob',
-                                'ohJobQueueActive', 'ohAutoApplyEngaged']);
-        const st = d && d.autoApplyState;
-        const engaged = (st && st.isActive === true) ||
-                        !!(d && d.isAutoProcessStartJob) ||
-                        !!(d && d.ohJobQueueActive) ||
-                        !!(d && d.ohAutoApplyEngaged);
-        if (!engaged) return;
+        const d = await ST.get(AUTOMATION_KEYS);
+        if (!mayAutomate(d)) return;
         /* Only one tab may drive applications. */
         if (!(await isAutomationOwnerTab())) return;
         if (_submitAttempted && Date.now() - _submitAttemptTs < 30_000) return;
@@ -1296,13 +1313,8 @@
         if (_submitAttempted && Date.now() - _submitAttemptTs < 30_000) return;
         if (_fillActive) return;
 
-        const d = await ST.get(['autoApplyState', 'ohAutoApplyEngaged',
-                                'isAutoProcessStartJob', 'ohJobQueueActive']);
-        const engaged = ohSaysReady(d && d.autoApplyState) ||
-                        !!(d && d.ohAutoApplyEngaged) ||
-                        !!(d && d.isAutoProcessStartJob) ||
-                        !!(d && d.ohJobQueueActive);
-        if (!engaged) return;
+        const d = await ST.get(AUTOMATION_KEYS);
+        if (!mayAutomate(d)) return;
         /* Confine the heavy DOM work to the tab that IS the current job.
            Previously this ran in every tab that had automation engaged,
            and document.body.innerText forces a full layout — with several
