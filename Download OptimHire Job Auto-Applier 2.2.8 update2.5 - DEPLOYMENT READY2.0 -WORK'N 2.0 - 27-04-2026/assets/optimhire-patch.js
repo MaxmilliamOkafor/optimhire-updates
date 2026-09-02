@@ -340,7 +340,18 @@
   function isVisible(el) {
     if (!el) return false;
     const r = el.getBoundingClientRect();
-    return r.width > 0 && r.height > 0 && el.offsetParent !== null;
+    if (r.width <= 0 || r.height <= 0) return false;
+    if (el.offsetParent !== null) return true;
+    /* offsetParent is ALWAYS null for position:fixed (and for sticky in
+       some stacking contexts) even when the element is plainly on screen.
+       Lots of ATSes pin "Submit application" in a fixed/sticky footer
+       bar, so the old check reported those buttons invisible and the
+       auto-submit could never find them. Fall back to computed style. */
+    try {
+      const cs = getComputedStyle(el);
+      if (cs.display === 'none' || cs.visibility === 'hidden' || cs.opacity === '0') return false;
+      return cs.position === 'fixed' || cs.position === 'sticky';
+    } catch (_) { return false; }
   }
 
   /* ── optimHireBusy: is OptimHire's own autofill actively working? ──
@@ -1204,11 +1215,11 @@
 
     const READY_RE = /review and submit|form ready for submission|form filled|ready to submit/i;
     const SUBMIT_RE = /^(submit\s+application|submit\s+your\s+application|send\s+application|send\s+my\s+application|submit\s+my\s+application|complete\s+application|finish\s+application|submit\s+&\s+apply|submit\s+and\s+apply|submit\s+profile|send\s+profile|submit)$/i;
-    const RETRY_MS = 6000;
-    const MAX_TRIES = 3;
+    const RETRY_MS = 4000;
+    const MAX_TRIES = 4;
     /* How long to let the fillers (incl. the location typeahead rescue)
        finish before submitting despite our own "unfilled" reading. */
-    const FILL_GRACE_MS = 12_000;
+    const FILL_GRACE_MS = 5_000;
     let _tries = 0, _forUrl = '', _lastTry = 0, _readySince = 0;
 
     function ohSaysReady(st) {
@@ -1326,18 +1337,28 @@
         if (!ready) { _readySince = 0; return; }
         if (!_readySince) _readySince = Date.now();
 
-        /* Never fire on a page with no form at all. */
-        const reqs = requiredInputs();
-        if (!reqs.length) return;
+        /* Prove this is a REAL, filled application form before submitting.
+           The old guard demanded native required/aria-required inputs,
+           but plenty of ATSes (Ashby among them) mark required fields
+           only with an asterisk in the label and validate themselves — so
+           requiredInputs() came back empty and the submit was skipped
+           entirely. That is why the run kept stopping at "Review and
+           submit the form". Judge the form by what is actually on the
+           page instead of by markup that may not exist. */
+        const fields = $$('input:not([type=hidden]):not([type=submit]):not([type=button]):not([type=search]),textarea,select')
+          .filter(isVisible);
+        if (fields.length < 2) return;                 // not an application form
+        const filled = fields.filter(el => (
+          el.type === 'checkbox' || el.type === 'radio' ? el.checked : (el.value && String(el.value).trim())
+        )).length;
+        if (!filled) return;                           // nothing filled yet — too early
 
-        /* Our own required-field check is only a HINT, never a veto.
-           It cannot read custom widgets (the Yes/No pill buttons, a
-           committed combobox, etc.), so it reports "unfilled" on forms
-           that are actually complete — which is exactly why the run sat
-           on "Review and submit the form" while OptimHire itself reported
-           100% filled. So: give the fillers a short grace period to
-           finish, then submit anyway once OptimHire says it is ready. */
-        if (!allRequiredFilled(reqs) && Date.now() - _readySince < FILL_GRACE_MS) return;
+        /* If native required markup DOES exist and something is still
+           unmet, give the fillers a brief grace period, then submit
+           anyway once OptimHire says it is ready (our reading cannot see
+           custom widgets, so it must never be a permanent veto). */
+        const reqs = requiredInputs();
+        if (reqs.length && !allRequiredFilled(reqs) && Date.now() - _readySince < FILL_GRACE_MS) return;
 
         /* A visible validation error means the ATS itself rejected
            something — clicking submit again would just re-trigger it. */
