@@ -132,7 +132,7 @@
   function load() {
     ST.get([KEY, KEY_ENABLED, KEY_PAUSED], function (d) {
       entries = Array.isArray(d[KEY]) ? d[KEY] : [];
-      document.getElementById('toggleEnabled').checked = d[KEY_ENABLED] !== false;
+      document.getElementById("toggleEnabled").checked = d[KEY_ENABLED] === true;
       document.getElementById('togglePaused').checked  = !!d[KEY_PAUSED];
       renderAll();
     });
@@ -145,7 +145,7 @@
       entries = changes[KEY].newValue || [];
       renderAll();
     }
-    if (changes[KEY_ENABLED]) document.getElementById('toggleEnabled').checked = changes[KEY_ENABLED].newValue !== false;
+    if (changes[KEY_ENABLED]) document.getElementById('toggleEnabled').checked = changes[KEY_ENABLED].newValue === true;
     if (changes[KEY_PAUSED])  document.getElementById('togglePaused').checked  = !!changes[KEY_PAUSED].newValue;
   });
 

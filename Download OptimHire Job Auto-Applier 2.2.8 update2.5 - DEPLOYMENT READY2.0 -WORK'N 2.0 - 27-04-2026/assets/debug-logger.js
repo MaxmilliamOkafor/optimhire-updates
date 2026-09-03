@@ -37,7 +37,12 @@
   var MAX_STR     = 4000;          // truncate long strings
   var MAX_BUF     = 200;           // emergency flush threshold
 
-  var _enabled   = true;
+  /* DEFAULT OFF. This recorder runs in EVERY tab: it wraps console.*,
+     subscribes to every storage change and every runtime message, and
+     writes batches to storage. That is real per-tab cost paid all day for
+     a diagnostic that is only needed when investigating a problem. It is
+     now opt-in — enable it from the Debug Log viewer when you need it. */
+  var _enabled   = false;
   var _paused    = false;
   var _buf       = [];
   var _flushTimer = null;
@@ -46,7 +51,7 @@
   /* Load initial enable/pause state from storage. */
   try {
     ST.get([KEY_ENABLED, KEY_PAUSED], function (d) {
-      if (d && d[KEY_ENABLED] === false) _enabled = false;
+      _enabled = !!(d && d[KEY_ENABLED] === true);   // opt-in
       if (d && d[KEY_PAUSED]  === true)  _paused  = true;
     });
   } catch (_) {}
@@ -56,7 +61,7 @@
   try {
     chrome.storage.onChanged.addListener(function (changes, area) {
       if (area !== 'local') return;
-      if (changes[KEY_ENABLED]) _enabled = changes[KEY_ENABLED].newValue !== false;
+      if (changes[KEY_ENABLED]) _enabled = changes[KEY_ENABLED].newValue === true;
       if (changes[KEY_PAUSED])  _paused  = !!changes[KEY_PAUSED].newValue;
     });
   } catch (_) {}
@@ -182,7 +187,7 @@
       console[lvl] = function () {
         try {
           var first = arguments[0];
-          if (typeof first === 'string' && TAG_RE.test(first)) {
+          if (_enabled && !_paused && typeof first === 'string' && TAG_RE.test(first)) {
             var args = [];
             for (var i = 0; i < arguments.length; i++) args.push(arguments[i]);
             log('console', args.length === 1 ? String(args[0]) : args.map(function (a) {
@@ -206,7 +211,7 @@
   try {
     chrome.storage.onChanged.addListener(function (changes, area) {
       if (area !== 'local') return;
-      if (!_enabled || _paused) return;
+      if (!_enabled || _paused) return;   // opt-in: zero work when off
       var keys = Object.keys(changes);
       for (var i = 0; i < keys.length; i++) {
         var k = keys[i];

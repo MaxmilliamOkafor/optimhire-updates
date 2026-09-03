@@ -10,6 +10,75 @@
 (function () {
   'use strict';
 
+  /* ── Idle governor (sidepanel) ───────────────────────────────────────
+   * The side panel is open the whole time the extension is used, and it
+   * was running ~10 polling loops plus 4 body-subtree MutationObservers
+   * continuously — including a 500ms pass that did
+   * querySelectorAll('h1,h2,h3,h4,p,span,div') and read textContent of
+   * every node, re-triggered by each observer on every React re-render.
+   * That was a constant CPU drain even with nothing being automated.
+   *
+   * Same approach as the content script: local setInterval /
+   * MutationObserver shadows. When automation is not engaged, sub-15s
+   * loop bodies are skipped and observers are disconnected. Observer
+   * callbacks are additionally coalesced so a burst of re-render
+   * mutations costs one pass, not hundreds.
+   * ────────────────────────────────────────────────────────────────── */
+  var _spNativeSetInterval = window.setInterval.bind(window);
+  var _SpNativeMO = window.MutationObserver;
+  var _spEngaged = false;
+  var _spObservers = new Set();
+  var _SP_KEYS = ['autoApplyState', 'isAutoProcessStartJob', 'ohJobQueueActive',
+                  'ohAutoApplyEngaged', 'ohAutoApplyEngagedTs', 'ohAutomationDisabled'];
+  function _spRefreshEngaged() {
+    try {
+      chrome.storage.local.get(_SP_KEYS, function (d) {
+        try {
+          var on = false;
+          if (!d || d.ohAutomationDisabled !== true) {
+            var st = d && d.autoApplyState;
+            on = !!(st && st.isActive === true) || !!(d && d.isAutoProcessStartJob) ||
+                 !!(d && d.ohJobQueueActive);
+            if (!on && d && d.ohAutoApplyEngaged) {
+              var ts = d.ohAutoApplyEngagedTs || 0;
+              on = !!ts && (Date.now() - ts < 10 * 60 * 1000);
+            }
+          }
+          _spEngaged = on;
+          _spObservers.forEach(function (g) {
+            if (on && !g.connected && g.args) { try { g.obs.observe.apply(g.obs, g.args); g.connected = true; } catch (_) {} }
+            else if (!on && g.connected) { try { g.obs.disconnect(); } catch (_) {} g.connected = false; }
+          });
+        } catch (_) {}
+      });
+    } catch (_) {}
+  }
+  _spNativeSetInterval(_spRefreshEngaged, 5000);
+  setTimeout(_spRefreshEngaged, 500);
+
+  function setInterval(fn, ms) {
+    return _spNativeSetInterval(function () {
+      if (!_spEngaged && ms < 15000) return;
+      return fn.apply(this, arguments);
+    }, ms);
+  }
+  function MutationObserver(cb) {
+    var g = { args: null, connected: false, pending: false };
+    /* Coalesce: one callback per animation-frame-ish window instead of
+       one per mutation record burst. */
+    g.obs = new _SpNativeMO(function () {
+      if (!_spEngaged || g.pending) return;
+      g.pending = true;
+      setTimeout(function () { g.pending = false; try { cb(); } catch (_) {} }, 250);
+    });
+    _spObservers.add(g);
+    return {
+      observe: function () { g.args = arguments; if (_spEngaged) { try { g.obs.observe.apply(g.obs, arguments); g.connected = true; } catch (_) {} } },
+      disconnect: function () { try { g.obs.disconnect(); } catch (_) {} g.connected = false; },
+      takeRecords: function () { return g.obs.takeRecords(); }
+    };
+  }
+
   /* ════════════════════════════════════════════════════════════
      ZERO LIMITATION — DOM hide + safe storage WRITE-wrap
      ════════════════════════════════════════════════════════════
@@ -383,7 +452,9 @@
     function begin() {
       if (started) return; started = true;
       hideMatching();
-      setInterval(hideMatching, 1500);
+      /* Native + slower: the limit/upgrade hiding must apply even when no
+       automation is running, but it does a text scan so 1.5s was wasteful. */
+    _spNativeSetInterval(hideMatching, 4000);
       if (document.body) {
         try {
           new MutationObserver(hideMatching).observe(document.body, {
@@ -978,7 +1049,7 @@
 
   /* Drive on tight poll + MutationObserver so we react quickly when
      the warning paints. */
-  setInterval(checkMissingDetails, 500);
+  setInterval(checkMissingDetails, 1500);
   if (document.body) {
     try {
       new MutationObserver(checkMissingDetails).observe(document.body, {
@@ -2280,7 +2351,9 @@
 
     function startup() {
       refresh();
-      setInterval(refresh, 5000);
+      /* Native interval on purpose: refresh() creates the card and drives
+         the master ON/OFF switch, so it must keep working while idle. */
+      _spNativeSetInterval(refresh, 5000);
       try {
         chrome.storage.onChanged.addListener(function (changes, area) {
           if (area === 'local' && (changes[KEY_QUEUE] || changes[KEY_ACTIVE] || changes.ohHarvestedJobs)) refresh();
