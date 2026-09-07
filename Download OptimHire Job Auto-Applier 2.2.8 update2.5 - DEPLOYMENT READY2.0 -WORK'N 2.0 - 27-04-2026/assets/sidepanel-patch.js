@@ -10,6 +10,75 @@
 (function () {
   'use strict';
 
+  /* ── Idle governor (sidepanel) ───────────────────────────────────────
+   * The side panel is open the whole time the extension is used, and it
+   * was running ~10 polling loops plus 4 body-subtree MutationObservers
+   * continuously — including a 500ms pass that did
+   * querySelectorAll('h1,h2,h3,h4,p,span,div') and read textContent of
+   * every node, re-triggered by each observer on every React re-render.
+   * That was a constant CPU drain even with nothing being automated.
+   *
+   * Same approach as the content script: local setInterval /
+   * MutationObserver shadows. When automation is not engaged, sub-15s
+   * loop bodies are skipped and observers are disconnected. Observer
+   * callbacks are additionally coalesced so a burst of re-render
+   * mutations costs one pass, not hundreds.
+   * ────────────────────────────────────────────────────────────────── */
+  var _spNativeSetInterval = window.setInterval.bind(window);
+  var _SpNativeMO = window.MutationObserver;
+  var _spEngaged = false;
+  var _spObservers = new Set();
+  var _SP_KEYS = ['autoApplyState', 'isAutoProcessStartJob', 'ohJobQueueActive',
+                  'ohAutoApplyEngaged', 'ohAutoApplyEngagedTs', 'ohAutomationDisabled'];
+  function _spRefreshEngaged() {
+    try {
+      chrome.storage.local.get(_SP_KEYS, function (d) {
+        try {
+          var on = false;
+          if (!d || d.ohAutomationDisabled !== true) {
+            var st = d && d.autoApplyState;
+            on = !!(st && st.isActive === true) || !!(d && d.isAutoProcessStartJob) ||
+                 !!(d && d.ohJobQueueActive);
+            if (!on && d && d.ohAutoApplyEngaged) {
+              var ts = d.ohAutoApplyEngagedTs || 0;
+              on = !!ts && (Date.now() - ts < 10 * 60 * 1000);
+            }
+          }
+          _spEngaged = on;
+          _spObservers.forEach(function (g) {
+            if (on && !g.connected && g.args) { try { g.obs.observe.apply(g.obs, g.args); g.connected = true; } catch (_) {} }
+            else if (!on && g.connected) { try { g.obs.disconnect(); } catch (_) {} g.connected = false; }
+          });
+        } catch (_) {}
+      });
+    } catch (_) {}
+  }
+  _spNativeSetInterval(_spRefreshEngaged, 5000);
+  setTimeout(_spRefreshEngaged, 500);
+
+  function setInterval(fn, ms) {
+    return _spNativeSetInterval(function () {
+      if (!_spEngaged && ms < 15000) return;
+      return fn.apply(this, arguments);
+    }, ms);
+  }
+  function MutationObserver(cb) {
+    var g = { args: null, connected: false, pending: false };
+    /* Coalesce: one callback per animation-frame-ish window instead of
+       one per mutation record burst. */
+    g.obs = new _SpNativeMO(function () {
+      if (!_spEngaged || g.pending) return;
+      g.pending = true;
+      setTimeout(function () { g.pending = false; try { cb(); } catch (_) {} }, 250);
+    });
+    _spObservers.add(g);
+    return {
+      observe: function () { g.args = arguments; if (_spEngaged) { try { g.obs.observe.apply(g.obs, arguments); g.connected = true; } catch (_) {} } },
+      disconnect: function () { try { g.obs.disconnect(); } catch (_) {} g.connected = false; },
+      takeRecords: function () { return g.obs.takeRecords(); }
+    };
+  }
+
   /* ════════════════════════════════════════════════════════════
      ZERO LIMITATION — DOM hide + safe storage WRITE-wrap
      ════════════════════════════════════════════════════════════
@@ -383,7 +452,9 @@
     function begin() {
       if (started) return; started = true;
       hideMatching();
-      setInterval(hideMatching, 1500);
+      /* Native + slower: the limit/upgrade hiding must apply even when no
+       automation is running, but it does a text scan so 1.5s was wasteful. */
+    _spNativeSetInterval(hideMatching, 4000);
       if (document.body) {
         try {
           new MutationObserver(hideMatching).observe(document.body, {
@@ -978,7 +1049,7 @@
 
   /* Drive on tight poll + MutationObserver so we react quickly when
      the warning paints. */
-  setInterval(checkMissingDetails, 500);
+  setInterval(checkMissingDetails, 1500);
   if (document.body) {
     try {
       new MutationObserver(checkMissingDetails).observe(document.body, {
@@ -1144,6 +1215,55 @@
     setInterval(tick, 3000);
   })();
 
+  /* ── Engagement freshness + master switch (sidepanel side) ───────────
+   * Mirrors the content script. ohAutoApplyEngaged used to be permanent,
+   * so simply opening the side panel resurrected an old run and started
+   * firing at jobs unprompted. It now only counts while its heartbeat is
+   * fresh, a genuinely running session always counts, and
+   * ohAutomationDisabled vetoes everything.
+   * ────────────────────────────────────────────────────────────────── */
+  var OH_ENGAGE_TTL_MS = 10 * 60 * 1000;
+  var OH_AUTOMATION_KEYS = ['autoApplyState', 'isAutoProcessStartJob', 'ohJobQueueActive',
+                            'ohAutoApplyEngaged', 'ohAutoApplyEngagedTs', 'ohAutomationDisabled'];
+  function ohLiveSession(d) {
+    if (!d) return false;
+    var st = d.autoApplyState;
+    return !!(st && st.isActive === true) || !!d.isAutoProcessStartJob || !!d.ohJobQueueActive;
+  }
+  function mayAutomateSP(d) {
+    if (!d) return false;
+    if (d.ohAutomationDisabled === true) return false;
+    if (ohLiveSession(d)) return true;
+    if (d.ohAutoApplyEngaged) {
+      var ts = d.ohAutoApplyEngagedTs || 0;
+      if (ts && Date.now() - ts < OH_ENGAGE_TTL_MS) return true;
+    }
+    return false;
+  }
+  /* Fresh panel open with nothing actually running must NOT resume a
+     previous run — this was the "click the extension and it starts
+     applying to old jobs" complaint. */
+  try {
+    chrome.storage.local.get(OH_AUTOMATION_KEYS, function (d) {
+      try {
+        if (!ohLiveSession(d) && d && d.ohAutoApplyEngaged) {
+          chrome.storage.local.set({ ohAutoApplyEngaged: false, ohAutoApplyEngagedTs: 0 });
+          addLog('Idle on open — previous auto-apply session cleared (press Start to run)', '');
+        }
+      } catch (_) {}
+    });
+  } catch (_) {}
+  /* Heartbeat: keep sticky engagement alive only while really running. */
+  setInterval(function () {
+    try {
+      chrome.storage.local.get(OH_AUTOMATION_KEYS, function (d) {
+        if (ohLiveSession(d) && d.ohAutomationDisabled !== true) {
+          chrome.storage.local.set({ ohAutoApplyEngaged: true, ohAutoApplyEngagedTs: Date.now() });
+        }
+      });
+    } catch (_) {}
+  }, 20000);
+
   /* ── Auto-press the sidebar's "Apply" (thumbs-up) ────────────────────
    * OptimHire shows a per-job Skip / Apply choice and waits for a human
    * click, which stalls a hands-off run. The user asked for zero manual
@@ -1204,21 +1324,10 @@
         if (isSubmitSuppressed()) return;
         if (Date.now() - _lastClickTs < COOLDOWN_MS) return;
         chrome.storage.local.get(
-          ['autoApplyState', 'isAutoProcessStartJob', 'ohJobQueueActive',
-           'ohAutoApplyEngaged'],
+          OH_AUTOMATION_KEYS,
           function (d) {
             try {
-              var st = d && d.autoApplyState;
-              /* ohAutoApplyEngaged is our persistent "user pressed Start
-                 Auto-Applying" flag. Without it the clicker sat idle in
-                 exactly the state the user reported — the sidebar showing
-                 "0 of 0 applied" while waiting on a manual Apply press,
-                 because OptimHire had not yet flipped isActive. */
-              var running = (st && st.isActive === true) ||
-                            !!(d && d.isAutoProcessStartJob) ||
-                            !!(d && d.ohJobQueueActive) ||
-                            !!(d && d.ohAutoApplyEngaged);
-              if (!running) return;                   // don't click when idle
+              if (!mayAutomateSP(d)) return;          // idle / disabled → never click
               var btn = findApplyButton();
               if (!btn) return;
               var key = currentJobKey();
@@ -1338,15 +1447,10 @@
         if (now - _since < STALL_MS) return;
         if (now - _lastRecoveryTs < COOLDOWN_MS) return;
         chrome.storage.local.get(
-          ['autoApplyState', 'ohAutoApplyEngaged', 'isAutoProcessStartJob', 'ohJobQueueActive'],
+          OH_AUTOMATION_KEYS,
           function (d) {
             try {
-              var st = d && d.autoApplyState;
-              var engaged = (st && st.isActive === true) ||
-                            !!(d && d.ohAutoApplyEngaged) ||
-                            !!(d && d.isAutoProcessStartJob) ||
-                            !!(d && d.ohJobQueueActive);
-              if (!engaged) return;   // user is idle — leave the UI alone
+              if (!mayAutomateSP(d)) return;   // idle / disabled — leave the UI alone
               _lastRecoveryTs = Date.now();
               if (!_escalated) {
                 _escalated = true;
@@ -1398,7 +1502,8 @@
     function setEngaged(v) {
       if (_engaged === v) return;
       _engaged = v;
-      try { chrome.storage.local.set({ [KEY_ENGAGED]: v }); } catch (_) {}
+      /* Stamp the heartbeat so sticky engagement can expire on its own. */
+      try { chrome.storage.local.set({ [KEY_ENGAGED]: v, ohAutoApplyEngagedTs: v ? Date.now() : 0 }); } catch (_) {}
     }
 
     function btnText(b) {
@@ -2094,6 +2199,10 @@
             'padding:7px 10px;border-radius:8px;font-size:11.5px;cursor:pointer">' +
             '+ submit</button>' +
         '</div>' +
+        '<button id="oh-qc-master" title="Hard stop: makes the extension completely inert — no auto-clicking, no auto-submitting, no background loops — until you turn it back on" ' +
+          'style="width:100%;margin-top:6px;background:#2d1620;color:#f87171;border:1px solid #7f1d1d;' +
+          'padding:7px 10px;border-radius:8px;font-size:11.5px;cursor:pointer;font-weight:600">' +
+          '■ Automation: ON (click to disable)</button>' +
         '<div id="oh-qc-truth" title="OptimHire’s ‘X applied’ counter also counts SKIPS. This shows how many actually got a real submission confirmation." ' +
           'style="margin-top:7px;font-size:10.5px;color:#94a3b8;line-height:1.5;text-align:center">' +
           'Real outcome: — submitted · — skipped</div>';
@@ -2137,6 +2246,23 @@
           });
         } catch (_) {}
       }
+      var masterBtn = document.getElementById('oh-qc-master');
+      if (masterBtn) masterBtn.addEventListener('click', function () {
+        chrome.storage.local.get(['ohAutomationDisabled'], function (d) {
+          var off = !(d && d.ohAutomationDisabled === true);   // toggle
+          var patch = { ohAutomationDisabled: off };
+          if (off) {                                           // turning OFF: stop everything
+            patch.ohAutoApplyEngaged = false;
+            patch.ohAutoApplyEngagedTs = 0;
+            patch.ohJobQueueActive = false;
+          }
+          chrome.storage.local.set(patch, function () {
+            addLog(off ? 'Automation DISABLED — extension is now inert'
+                       : 'Automation ENABLED — press Start to run', off ? '' : 'success');
+          });
+        });
+      });
+
       var fillBtn = document.getElementById('oh-qc-fill');
       if (fillBtn) fillBtn.addEventListener('click', function () { autofillActiveTab(false); });
       var fillSubmitBtn = document.getElementById('oh-qc-fillsubmit');
@@ -2201,6 +2327,17 @@
           }
           var btn = document.getElementById('oh-qc-export');
           if (btn) btn.textContent = '⬇ Export queue job URLs (' + n + ')';
+          var mb = document.getElementById('oh-qc-master');
+          if (mb) {
+            chrome.storage.local.get(['ohAutomationDisabled'], function (dd) {
+              var off = !!(dd && dd.ohAutomationDisabled === true);
+              mb.textContent = off ? '▶ Automation: OFF (click to enable)'
+                                   : '■ Automation: ON (click to disable)';
+              mb.style.background = off ? '#0f2a16' : '#2d1620';
+              mb.style.color      = off ? '#4ade80' : '#f87171';
+              mb.style.borderColor= off ? '#166534' : '#7f1d1d';
+            });
+          }
           var truth = document.getElementById('oh-qc-truth');
           if (truth) {
             truth.innerHTML = 'Real outcome: ' +
@@ -2214,7 +2351,9 @@
 
     function startup() {
       refresh();
-      setInterval(refresh, 5000);
+      /* Native interval on purpose: refresh() creates the card and drives
+         the master ON/OFF switch, so it must keep working while idle. */
+      _spNativeSetInterval(refresh, 5000);
       try {
         chrome.storage.onChanged.addListener(function (changes, area) {
           if (area === 'local' && (changes[KEY_QUEUE] || changes[KEY_ACTIVE] || changes.ohHarvestedJobs)) refresh();
