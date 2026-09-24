@@ -1164,6 +1164,9 @@
         _lastKey = key;
         _lastClickTs = Date.now();
         LOG(`Auto-pressing Apply on job-apply page${key ? ' — ' + key : ''}`);
+        /* Tells the background this job was started by the automation, so
+           "ATS first, Reed last" may hold a Reed job back (oh-bg.js). */
+        await ST.set({ ohAutoPressTs: Date.now() });
         try { realClick(btn); } catch (_) { try { btn.click(); } catch (__) {} }
       } catch (_) {}
     }
