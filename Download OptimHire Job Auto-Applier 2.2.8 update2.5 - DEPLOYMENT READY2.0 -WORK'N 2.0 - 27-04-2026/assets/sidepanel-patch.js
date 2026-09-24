@@ -1600,6 +1600,8 @@
               _clickedBtns.add(btn);
               _lastJobKey = key || NO_KEY;
               _lastClickTs = now;
+              /* Started by the automation → "ATS first, Reed last" applies. */
+              try { chrome.storage.local.set({ ohAutoPressTs: now }); } catch (_) {}
               try {
                 btn.dispatchEvent(new MouseEvent('mouseover', { bubbles: true }));
                 btn.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
@@ -2728,7 +2730,8 @@
         var tr = s.live && _queueTier && _queueTier.tier;
         tierEl.style.display = tr ? '' : 'none';
         if (tr) tierEl.textContent = 'Now applying: ' + _queueTier.tier +
-          (_queueTier.site ? ' (' + _queueTier.site.charAt(0).toUpperCase() + _queueTier.site.slice(1) + ')' : '');
+          (_queueTier.site ? ' (' + _queueTier.site.charAt(0).toUpperCase() + _queueTier.site.slice(1) + ')' : '') +
+          (_queueTier.heldBack === 'reed' ? ' — Reed jobs held back until ATS jobs are done' : '');
       }
       /* The Auto-Apply panel header showed our CSV queue's "0 of 0 applied". */
       var hdr = document.getElementById('aapCounter');
@@ -2822,6 +2825,11 @@
           if (changes[KEY_QUEUE] || changes[KEY_ACTIVE] || changes.ohHarvestedJobs ||
               changes.isAutoProcessStartJob || changes.isManuallyStartJob || changes.matchingJobCount ||
               changes.ohPreferAts || changes.ohQueueTier) refresh();
+          var qt = changes.ohQueueTier && changes.ohQueueTier.newValue;
+          if (qt && qt.heldBack) {
+            addLog('⇅ Held back a ' + (qt.heldBack === 'reed' ? 'reed.co.uk' : 'job-board') + ' job — applying an ' +
+                   qt.tier + ' job' + (qt.site ? ' (' + qt.site + ')' : '') + ' first', '');
+          }
         });
       } catch (_) {}
     }
