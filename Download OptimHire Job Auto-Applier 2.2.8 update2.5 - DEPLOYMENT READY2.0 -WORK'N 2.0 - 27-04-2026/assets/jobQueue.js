@@ -15,6 +15,11 @@
  */
 (function () {
   'use strict';
+  /* Refuse to run inside a frame. tabs/* is web-accessible to every site
+     (inherited from OptimHire's manifest), so a hostile page could embed this
+     Queue Manager invisibly and trick clicks on "Clear all" / "Start Queue".
+     It is only ever opened as a normal tab. */
+  if (window.top !== window.self) { document.documentElement.innerHTML = ''; return; }
   const ST = chrome.storage.local;
   const KEY_QUEUE   = 'ohJobQueue';
   const KEY_ACTIVE  = 'ohJobQueueActive';
@@ -104,7 +109,10 @@
     const cols = ['url', 'title', 'company', 'ats', 'status', 'confirmed', 'confirmedBy',
                   'lastError', 'notes', 'attempts', 'addedAt', 'appliedAt'];
     const esc = (s) => {
-      const v = String(s == null ? '' : s);
+      let v = String(s == null ? '' : s);
+      /* Neutralise spreadsheet formulas (a job title like =HYPERLINK(...)
+         would execute when the export is opened in Excel / Sheets). */
+      if (/^[=+\-@\t\r]/.test(v)) v = "'" + v;
       if (/[",\n]/.test(v)) return '"' + v.replace(/"/g, '""') + '"';
       return v;
     };
@@ -179,10 +187,23 @@
     const norm = normaliseUrl(url);
     return queue.some(j => normaliseUrl(j.url) === norm);
   }
+  /* Only http(s) job URLs are allowed anywhere in the queue. The Edit box
+     used to store whatever was typed, so a javascript: URL would be rendered
+     as a link inside this extension page, where clicking it runs with the
+     extension's privileges. Bare "example.com/jobs/1" still gets https://. */
+  function safeJobUrl(u) {
+    u = String(u == null ? '' : u).trim();
+    if (!u) return '';
+    if (!/^[a-z][a-z0-9+.-]*:/i.test(u)) u = 'https://' + u;
+    try {
+      const x = new URL(u);
+      return /^https?:$/.test(x.protocol) ? x.href : '';
+    } catch (_) { return ''; }
+  }
+
   function addJob(url, title, company, notes) {
-    url = (url || '').trim();
+    url = safeJobUrl(url);
     if (!url) return null;
-    if (!/^https?:\/\//i.test(url)) url = 'https://' + url;
     if (urlExists(url)) return 'duplicate';
     const job = {
       id: uid(),
@@ -204,6 +225,11 @@
   function editJob(id, updates) {
     const j = queue.find(x => x.id === id);
     if (!j) return false;
+    if (updates.url !== undefined) {
+      const u = safeJobUrl(updates.url);
+      if (!u) return false;               // reject non-http(s) / malformed
+      updates = Object.assign({}, updates, { url: u });
+    }
     Object.assign(j, updates);
     if (updates.url) j.ats = detectAts(updates.url);
     return true;
@@ -328,7 +354,9 @@
         <td class="checkbox-cell"><input type="checkbox" class="row-check" data-id="${j.id}" ${checked}></td>
         <td>${idx + 1}</td>
         <td><span class="badge b-${j.status}" title="${j.status === 'applied' ? (j.confirmed ? esc(j.confirmedBy || 'confirmation page detected') : 'No confirmation was detected — verify manually') : ''}">${j.status}${j.status === 'applied' ? (j.confirmed ? ' ✅' : ' ⚠') : ''}</span></td>
-        <td class="url-col"><a href="${esc(j.url)}" target="_blank" rel="noopener" title="${esc(j.url)}">${esc(truncate(j.url, 60))}</a></td>
+        <td class="url-col">${safeJobUrl(j.url)
+          ? `<a href="${esc(safeJobUrl(j.url))}" target="_blank" rel="noopener" title="${esc(j.url)}">${esc(truncate(j.url, 60))}</a>`
+          : `<span title="Invalid URL">${esc(truncate(String(j.url || ''), 60))}</span>`}</td>
         <td>${esc(j.title || '—')}</td>
         <td>${esc(j.company || '—')}</td>
         <td><span class="ats-tag">${esc(j.ats || 'Other')}</span></td>
@@ -588,8 +616,8 @@
         if (retired) await saveQueue();
         if (!candidate) break;
         const jobId = candidate.id;
-        const jobUrl = candidate.url;
-        if (!jobUrl) { /* nothing to open — mark failed so we can't spin */
+        const jobUrl = safeJobUrl(candidate.url);
+        if (!jobUrl) { /* nothing (valid) to open — mark failed so we can't spin */
           const bad = queue.find(j => j.id === jobId);
           if (bad) { bad.status = 'failed'; bad.lastError = 'missing URL'; }
           await saveQueue();
@@ -746,11 +774,11 @@
        knows the manager handled it. */
     await new Promise(res => ST.set({ [KEY_ADVANCE_REQ]: null }, res));
     /* Any pending left? open more; else finish. */
-    if (queue.some(j => j.status === 'pending')) {
-      await fillSlots();
-    } else if (runningWithTab() === 0) {
-      await finishQueue();
-    }
+    if (queue.some(j => j.status === 'pending')) await fillSlots();
+    /* fillSlots() can retire the last pending jobs (attempts cap / invalid
+       URL) without opening anything. Finish in that case too — otherwise the
+       run never ends and stays "active" with nothing left to do. */
+    if (!queue.some(j => j.status === 'pending') && runningWithTab() === 0) await finishQueue();
     /* If the finished job held the front and the next one does not need
        it, put the user back where they were. */
     await maybeRestoreFocus();
@@ -845,6 +873,7 @@
         /* Only re-queue if it didn't already finish (applied/failed/skipped) */
         if (j && j.status === 'running') { j.status = 'pending'; await saveQueue(); }
         await fillSlots();
+        if (!queue.some(x => x.status === 'pending') && runningWithTab() === 0) await finishQueue();
       });
     } catch (_) {}
   }
@@ -961,7 +990,7 @@
         notes:   document.getElementById('fldNotes').value.trim(),
       };
       if (editingId) {
-        editJob(editingId, updates);
+        if (!editJob(editingId, updates)) { toast('Invalid URL — only http(s) links are allowed', 'error'); return; }
         toast('Job updated', 'success');
       } else {
         const r = addJob(updates.url, updates.title, updates.company, updates.notes);
@@ -979,7 +1008,9 @@
       if (!a || !id) return;
       if (a === 'open') {
         const j = queue.find(x => x.id === id);
-        if (j) chrome.tabs.create({ url: j.url, active: true });
+        const openUrl = j && safeJobUrl(j.url);
+        if (openUrl) chrome.tabs.create({ url: openUrl, active: true });
+        else toast('Invalid URL — edit this job first', 'error');
       } else if (a === 'edit') {
         const j = queue.find(x => x.id === id);
         if (j) openModal(j);
@@ -1016,7 +1047,15 @@
     chrome.storage.onChanged.addListener((changes, area) => {
       if (area !== 'local') return;
       if (changes[KEY_QUEUE]) { queue = changes[KEY_QUEUE].newValue || []; render(); }
-      if (changes[KEY_ACTIVE]) setRunnerIndicator(!!changes[KEY_ACTIVE].newValue);
+      if (changes[KEY_ACTIVE]) {
+        const on = !!changes[KEY_ACTIVE].newValue;
+        setRunnerIndicator(on);
+        /* Stopped from elsewhere (e.g. the sidepanel's Automation OFF switch):
+           close the job tabs this manager opened and return their jobs to
+           pending, exactly like pressing Stop here. stopQueue() also clears
+           this key, so only act while tabs are still open (no loop). */
+        if (!on && _tabMap.size) stopQueue().catch(() => {});
+      }
       if (changes[KEY_ADVANCE_REQ] && changes[KEY_ADVANCE_REQ].newValue) {
         handleAdvanceReq(changes[KEY_ADVANCE_REQ].newValue);
       }

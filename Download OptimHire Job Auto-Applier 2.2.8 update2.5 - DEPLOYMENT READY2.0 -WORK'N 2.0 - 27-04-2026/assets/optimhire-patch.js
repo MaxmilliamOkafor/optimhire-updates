@@ -215,7 +215,10 @@
   const _nativeSetInterval = window.setInterval.bind(window);
   const _NativeMO = window.MutationObserver;
   const _IS_OH_PAGE = /(^|\.)optimhire\.com$/i.test(location.hostname);
-  let _engagedNow = _IS_OH_PAGE;          // optimhire.com pages always active
+  /* Starts awake on optimhire.com so its first pass runs, then follows
+     mayAutomate() like every other page. (optimhire.com's own UI hiding
+     uses native timers so it is not affected.) */
+  let _engagedNow = _IS_OH_PAGE;
   const _governedObservers = new Set();
 
   function _refreshEngaged() {
@@ -398,7 +401,6 @@
     'ziprecruiter.com':    'ZipRecruiter',
     'job.ziprecruiter.com':'ZipRecruiter',
     'manatal.com':         'Manatal',
-    'teamtailor.com':      'Teamtailor',
     'bullhorn.com':        'Bullhorn',
     'dice.com':            'Dice',
     'hiring.cafe':         'HiringCafe',
@@ -409,8 +411,6 @@
     'apply.lever.co':      'Lever',
     'recruiting.ultipro.com': 'UKG',
     'jobs.smartrecruiters.com': 'SmartRecruiters',
-    'careers.icims.com':   'iCIMS',
-    'breezy.hr':           'BreezyHR',   // ensure breezy.hr itself is caught
     'app.breezy.hr':       'BreezyHR',
     'jobs.breezy.hr':      'BreezyHR',
     // v6.0 (T30): five new ATS
@@ -568,11 +568,20 @@
      module returns early. */
   let findAnySubmitButton = null;
   let _manualFillRunning = false;
+  /* URL on which the user asked for a fill WITHOUT submitting. The generic
+     terminal-submit (T43) and the review-and-submit handler leave that page
+     alone, so "Autofill this page" never sends an application the user only
+     wanted filled in. Cleared by "+ submit" or by navigating away. */
+  let _noAutoSubmitUrl = '';
+  function autoSubmitBlockedHere() {
+    return !!_noAutoSubmitUrl && _noAutoSubmitUrl === location.href;
+  }
 
   async function runManualAutofill(opts) {
     if (_manualFillRunning) { LOG('Autofill this page: already running'); return; }
     _manualFillRunning = true;
     const submitAfter = !!(opts && opts.submit);
+    _noAutoSubmitUrl = submitAfter ? '' : location.href;
     try {
       LOG('Autofill this page: starting');
       try { chrome.runtime.sendMessage({ type: 'OH_MANUAL_FILL_STATUS', state: 'start' }).catch(() => {}); } catch (_) {}
@@ -668,26 +677,13 @@
   /* Periodic sweep — covers cases where the popup re-appears */
   setInterval(() => { dismissOhPopup().catch(() => {}); }, 3000);
 
-  /* v6.1 / v2.5.2 port: set OPTIMHIRE_CONFIG.STOP_INJECT_POPUP = true on
-   * the page world so the popup is never injected when user is just
-   * browsing. Re-applied periodically since the official module may
-   * reset its config. */
-  function setStopInjectPopup(stop) {
-    try {
-      const s = document.createElement('script');
-      s.textContent = `;(function(){try{
-        if(!window.__OH_STOP_INJECT_POPUP_ORIG){window.__OH_STOP_INJECT_POPUP_ORIG=true;}
-        window.OPTIMHIRE_STOP_INJECT_POPUP=${stop?'true':'false'};
-        if(window.OPTIMHIRE_CONFIG){window.OPTIMHIRE_CONFIG.STOP_INJECT_POPUP=${stop?'true':'false'};}
-      }catch(e){}})();`;
-      (document.head || document.documentElement).appendChild(s);
-      s.remove();
-    } catch (_) {}
-  }
-  // v6.6: always suppress the popup so the user can edit freely at any time.
-  // OptimHire's autofill continues in the background regardless of the popup.
-  setInterval(() => { setStopInjectPopup(true); }, 5000);
-  setStopInjectPopup(true);
+  /* (Removed: setStopInjectPopup.) It injected an inline <script> to set
+   * OPTIMHIRE_CONFIG.STOP_INJECT_POPUP in the page world every 5s. Under
+   * Manifest V3 the content-script CSP refuses inline scripts, so it never
+   * ran and only logged "Refused to execute inline script" — and even if it
+   * had run, OptimHire's own code lives in the isolated world and could not
+   * see a page-world variable. The popup is handled by the DOM-level
+   * dismissOhPopup() sweep above, which does work. */
 
   /* ── Auto-skip cap: patch any global OPTIMHIRE_CONFIG object ───────────
    * The autofill script (autofill.73df3a6d.js) exposes its config as a
@@ -840,7 +836,13 @@
           if (wasStr && !/^[\[{]/.test(data[k].trim())) return; // not JSON
           const parsed = wasStr ? JSON.parse(data[k]) : data[k];
           if (!parsed || typeof parsed !== 'object') return;
-          const patched = deepPatchCredits(JSON.parse(JSON.stringify(parsed)));
+          const before = JSON.stringify(parsed);
+          const patched = deepPatchCredits(JSON.parse(before));
+          /* Only write keys the patch actually changed. This used to rewrite
+             every profile/plan key every 20s in EVERY tab — constant
+             storage-change churn across all tabs, and a read-then-write that
+             could overwrite a fresh profile OptimHire saved in between. */
+          if (JSON.stringify(patched) === before) return;
           upd[k] = wasStr ? JSON.stringify(patched) : patched;
         } catch (_) {}
       });
@@ -1303,23 +1305,13 @@
     /* Publish for the on-demand "Autofill this page" action. */
     findAnySubmitButton = findSubmitRanked;
 
-    function findSubmit() {
-      for (const b of document.querySelectorAll('button,[role="button"],input[type=submit]')) {
-        if (!b || b.disabled) continue;
-        if (b.getAttribute && b.getAttribute('aria-disabled') === 'true') continue;
-        if (!isVisible(b)) continue;
-        const t = ((b.innerText || b.value || b.textContent || '') + '')
-                    .replace(/\s+/g, ' ').trim();
-        if (SUBMIT_RE.test(t)) return b;
-      }
-      return null;
-    }
 
     async function tick() {
       try {
         if (location.href !== _forUrl) { _forUrl = location.href; _tries = 0; }
         if (_tries >= MAX_TRIES) return;
         if (Date.now() - _lastTry < RETRY_MS) return;
+        if (autoSubmitBlockedHere()) return;   // user asked for fill-only here
         /* Don't fight an in-flight submit. */
         if (_submitAttempted && Date.now() - _submitAttemptTs < 30_000) return;
         if (_fillActive) return;
@@ -1583,10 +1575,20 @@
     function start() {
       tick();
       tryClickContinueWithFree();
-      setInterval(() => { tick(); tryClickContinueWithFree(); }, 1500);
+      /* NATIVE timer + observer on purpose. This is optimhire.com-only UI
+         hiding (upgrade / referral / credit-limit prompts) and must keep
+         working while no automation runs; through the idle governor it
+         stopped about a second after the page loaded, so those prompts came
+         back whenever the user simply browsed optimhire.com. Observer
+         bursts are coalesced so a React re-render costs one pass. */
+      _nativeSetInterval(() => { tick(); tryClickContinueWithFree(); }, 3000);
       try {
-        new MutationObserver(() => { tick(); tryClickContinueWithFree(); })
-          .observe(document.body, { childList: true, subtree: true });
+        let pending = false;
+        new _NativeMO(() => {
+          if (pending) return;
+          pending = true;
+          setTimeout(() => { pending = false; tick(); tryClickContinueWithFree(); }, 300);
+        }).observe(document.body, { childList: true, subtree: true });
       } catch (_) {}
     }
     if (document.body) start();
@@ -1866,23 +1868,10 @@
    * official extension reads this via a page-world script + postMessage.
    * We reproduce the same bridge so Paylocity country/state selects fill.
    * ────────────────────────────────────────────────────────────────── */
-  let _pagePageData = null;
-  window.addEventListener('message', (ev) => {
-    if (ev.source !== window) return;
-    const d = ev.data;
-    if (d && d.type === 'PAGE_DATA' && d.payload) {
-      _pagePageData = d.payload;
-      LOG('Received PAGE_DATA from page world');
-    }
-  });
-  (function injectPageDataBridge() {
-    try {
-      const s = document.createElement('script');
-      s.textContent = `;(function(){if(window&&window.pageData){window.postMessage({type:"PAGE_DATA",payload:window.pageData||null},"*");}})();`;
-      (document.head || document.documentElement).appendChild(s);
-      s.remove();
-    } catch (_) {}
-  })();
+  /* (Removed: page-data bridge.) It injected an inline <script> on every
+   * page load to post window.pageData back to us. The MV3 content-script
+   * CSP blocks inline scripts, so it never delivered anything, and nothing
+   * ever read the value it would have stored. */
 
   /* ── T34: cleanQuestionText (ported from v2.5.0) ────────────────────
    * Strip leading/trailing punctuation, asterisks (required markers),
@@ -2383,6 +2372,18 @@
     if (/notice.?period|period.?of.?notice/.test(l))       return p.notice_period || DEFAULTS.notice;
     if (/availab|start.?date|when.*start|when.*begin|earliest.*start/.test(l))
                                                           return p.availability || DEFAULTS.availability;
+
+    // ── Sponsorship NEED — must run BEFORE the generic authorization rule ──
+    // The generic rule below matches any label containing "sponsorship",
+    // "visa" or "permit" and returns 'authorized', which the dropdown mapper
+    // turns into "Yes". That made "Will you require visa sponsorship?" come
+    // out as "Yes, I require sponsorship" — the dedicated rules further
+    // down were unreachable for exactly these questions. Answer "do you
+    // NEED sponsorship/a visa/a permit" first, with DEFAULTS.sponsorship.
+    // (Phrasings like "authorized to work WITHOUT sponsorship" contain none
+    // of these need-patterns and still fall through to 'authorized'.)
+    if (/require.*sponsor|need.*sponsor|sponsorship.*(required|needed)|require.*visa|need.*visa|visa.*sponsor|future.*visa|need.*permit|require.*permit|will.*sponsor|currently.*sponsor|now.*or.*(in.*)?future|h.?1b.?sponsor|immigration.*support/i.test(l))
+                                                          return DEFAULTS.sponsorship;
 
     // ── Work Authorization Status ─────────────────────────────────────────
     // Label: (work AND authorization) OR sponsorship OR visa OR permit
@@ -3215,7 +3216,13 @@
           else if (inputType === 'tel') val = p.phone || '';
           else if (inputType === 'number') val = '1';
           else if (inputType === 'date') val = new Date().toISOString().slice(0,10);
-          else val = (p.first_name || 'N/A');
+          /* A URL field cannot take free text — leave it for OptimHire / the
+             user rather than inject an invalid value. */
+          else if (inputType === 'url') val = '';
+          /* Neutral filler. This used to be p.first_name, which answered an
+             arbitrary required question ("Describe a project you're proud
+             of") with the applicant's first name. */
+          else val = 'N/A';
         }
         if (val) {
           el.focus(); nativeSet(el, val); await sleep(40);
@@ -4259,6 +4266,7 @@
     const T43_TERMINAL_RE = /^(submit\s+application|submit\s+your\s+application|send\s+application|send\s+my\s+application|submit\s+my\s+application|complete\s+application|finish\s+application|submit\s+&\s+apply|submit\s+and\s+apply|submit\s+profile|send\s+profile|submit)$/i;
 
     async function tickGenericSubmit() {
+      if (autoSubmitBlockedHere()) return;   // user asked for fill-only here
       if (!await automationActive()) return;
       if (!fillStable() || submitSuppressed()) return;
 
@@ -5611,7 +5619,14 @@
       LOG(`CSV bridge: reported ${status} for job ${csvActiveJobId}`);
     };
 
-    chrome.runtime.onMessage.addListener(async msg => {
+    /* Deliberately NOT an async listener. An async function returns a
+       Promise for EVERY message, and Chrome treats a returned Promise as
+       "a response is coming later" — so every sender messaging this tab
+       (including our own "Autofill this page" button) got "the message
+       channel closed before a response was received", and the sidepanel
+       then wrongly reported "page not ready". Do the work in a detached
+       async task and return nothing. */
+    chrome.runtime.onMessage.addListener(msg => { (async () => {
       if (msg?.type === 'COMPLEX_FORM_SUCCESS') { report('done'); return; }
       if (msg?.type === 'APPLICATION_SUCCESS' || msg?.type === 'JOB_APPLIED') { report('done'); return; }
       if (msg?.type === 'ALREADY_APPLIED_SKIP') { report('duplicate'); return; }
@@ -5643,7 +5658,7 @@
           report('failed', errType);
         }
       }
-    });
+    })().catch(() => {}); });
 
     const successPatterns = [
       '/thanks', '/thank-you', '/success', '/confirmation',

@@ -1400,7 +1400,10 @@
         }
       } catch (_) {}
     }
-    setInterval(tick, 2000);
+    /* Native timer: this button is for MANUAL use, i.e. exactly when no
+       automation is running — through the idle governor it stayed locked
+       in the only situation where anyone would click it. */
+    _spNativeSetInterval(tick, 3000);
   })();
 
   /* ── "Loading your Job" stall watchdog ───────────────────────────────
@@ -1499,6 +1502,16 @@
     chrome.storage.local.get([KEY_ENGAGED], function (d) {
       _engaged = !!(d && d[KEY_ENGAGED]);
     });
+    /* Stay in sync with storage. Previously this cached the value once at
+       load, so when the master switch, a fresh-open reset or the content
+       script cleared engagement, this loop kept its stale "engaged" and could
+       press "Start Auto-Applying" on its own (e.g. right after automation was
+       switched back on). */
+    try {
+      chrome.storage.onChanged.addListener(function (c, a) {
+        if (a === 'local' && c[KEY_ENGAGED]) _engaged = !!c[KEY_ENGAGED].newValue;
+      });
+    } catch (_) {}
     function setEngaged(v) {
       if (_engaged === v) return;
       _engaged = v;
@@ -1537,9 +1550,10 @@
     function tick() {
       try {
         chrome.storage.local.get(
-          ['isAutoProcessStartJob', 'autoApplyStateUpdate', 'ohJobQueueActive'],
+          ['isAutoProcessStartJob', 'autoApplyStateUpdate', 'ohJobQueueActive', 'ohAutomationDisabled'],
           function (d) {
             try {
+              if (d.ohAutomationDisabled === true) return;   // master switch OFF
               /* MUTUAL EXCLUSION: while the CSV Job Queue is running, do
                  NOT re-engage OptimHire's native auto-apply. Running both
                  at once made the native flow navigate/reload the queue's
@@ -1566,77 +1580,10 @@
     setInterval(tick, 5000);
   })();
 
-  /* ── "Please fill the missing details" DOM-driven skip ───────────────────
-   * The sidepanel-bundle's own onMessage listener was registered BEFORE
-   * our wrap, so the autoSkipSeconds interception doesn't always fire
-   * scheduleForceSkip(). Watch the sidepanel DOM directly for the warning
-   * card, then click its Skip button after MISSING_DETAILS_TIMEOUT_MS so
-   * the queue advances reliably regardless of message-interception. */
-  var MISSING_DETAILS_TIMEOUT_MS = 7_000;
-  var _missingTimer = null;
-  var _missingShownAt = 0;
-
-  function findSkipButton() {
-    /* Look for a visible <button> (or role=button) whose own text is
-       exactly "Skip" — the sidepanel renders it as a plain Skip button.
-       Avoid our own #aapBtnSkip (that one belongs to the Auto-Apply
-       Status Panel and may be hidden). */
-    var btns = document.querySelectorAll('button, [role="button"]');
-    for (var i = 0; i < btns.length; i++) {
-      var b = btns[i];
-      if (!b || b.id === 'aapBtnSkip') continue;
-      if (b.disabled) continue;
-      var r = b.getBoundingClientRect();
-      if (r.width === 0 || r.height === 0) continue;
-      var t = ((b.innerText || b.textContent || '') + '').replace(/\s+/g, ' ').trim();
-      if (t === 'Skip') return b;
-    }
-    return null;
-  }
-
-  function ownTextLower(el) {
-    if (!el) return '';
-    var s = '';
-    for (var i = 0; i < el.childNodes.length; i++) {
-      var n = el.childNodes[i];
-      if (n.nodeType === 3) s += n.nodeValue;
-    }
-    return s.toLowerCase();
-  }
-
-  var MISSING_PATTERNS = [
-    'please fill the missing details',
-    'fill the missing details and submit',
-    'job auto-applier needs your preferences'
-  ];
-
-  function isMissingDetailsVisible() {
-    var nodes = document.querySelectorAll('h1,h2,h3,h4,p,span,div');
-    for (var i = 0; i < nodes.length; i++) {
-      var n = nodes[i];
-      if (!n) continue;
-      var t = ownTextLower(n);
-      if (!t || t.length > 300) continue;
-      for (var j = 0; j < MISSING_PATTERNS.length; j++) {
-        if (t.indexOf(MISSING_PATTERNS[j]) !== -1) return true;
-      }
-    }
-    return false;
-  }
-
-  /* ── NOTE: the duplicate `checkMissingDetails` handler that used to live
-   * here has been removed. It was a SECOND function with the same name as
-   * the countdown-based handler above; because function declarations hoist,
-   * this one silently overrode the good one — and it had NO per-skip
-   * cooldown, so it re-armed immediately every tick. When OptimHire got
-   * stuck on a broken job, that caused back-to-back skips that inflated the
-   * "X of Y applied" counter (185→186→187…) while the page never changed.
-   * The single surviving handler above keeps the countdown UI, the 12s
-   * cooldown, and the stuck-loop circuit breaker. Its unique phrase
-   * ("job auto-applier needs your preferences") was merged into
-   * MD_WARNING_PATTERNS so no coverage was lost. The helper functions
-   * findSkipButton / isMissingDetailsVisible / MISSING_PATTERNS remain
-   * defined above but are now unused. */
+  /* (A second, cooldown-less missing-details handler and its helpers used
+   * to live here. It shadowed the countdown handler above via function
+   * hoisting and caused back-to-back skips; it and its now-unused helpers
+   * have been removed. The countdown handler above is the only one.) */
 
   chrome.runtime.onMessage.addListener(function (msg) {
     if (!msg) return;
@@ -2069,6 +2016,10 @@
   /* CSV-escape a single field. */
   function _csvCell(s) {
     var v = String(s == null ? '' : s);
+    /* Neutralise spreadsheet formulas: a harvested job title such as
+       =HYPERLINK(...) would otherwise execute when the CSV is opened in
+       Excel / Sheets. */
+    if (/^[=+\-@\t\r]/.test(v)) v = "'" + v;
     if (/[",\n]/.test(v)) return '"' + v.replace(/"/g, '""') + '"';
     return v;
   }
@@ -2239,8 +2190,16 @@
             try {
               chrome.tabs.sendMessage(t.id, {
                 type: 'OH_AUTOFILL_THIS_PAGE', submit: !!withSubmit
-              }).catch(function () {
-                addLog('Autofill this page: page not ready — reload it and retry', 'error');
+              }).catch(function (err) {
+                /* Only "no receiver" means our script is not on the page.
+                   Another extension/OptimHire listener on the page can claim
+                   an async reply and never send it ("message channel closed
+                   before a response was received") — the fill still ran, so
+                   that must not be reported as a failure. */
+                var m = String((err && err.message) || err || '');
+                if (/receiving end does not exist|could not establish connection/i.test(m)) {
+                  addLog('Autofill this page: page not ready — reload it and retry', 'error');
+                }
               });
             } catch (_) {}
           });
