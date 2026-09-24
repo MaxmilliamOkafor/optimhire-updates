@@ -906,7 +906,7 @@
   }
   if (btnSkip) {
     btnSkip.addEventListener('click', function () {
-      chrome.runtime.sendMessage({ action: 'skipCurrent' }).catch(function () {});
+      sendOhSkip('Skip pressed');
       addLog('Skipping current job...', '');
     });
   }
@@ -939,7 +939,7 @@
    *   - SUBMIT_ATTEMPTED was received (content script just clicked submit)
    *   - The current status is "submitting" (from SIDEBAR_STATUS event)
    * ─────────────────────────────────────────────────────────────────────── */
-  const AUTO_SKIP_MAX = 15;
+  const AUTO_SKIP_MAX = 10;         // seconds (was 15); OptimHire's own 180s is cut to 10s in oh-bg.js
   let _forceSkipTimer  = null;
   let _forceSkipJobKey = '';
   let _submitAttemptedTs = 0; // timestamp of last SUBMIT_ATTEMPTED message
@@ -1027,7 +1027,7 @@
    *   4. Aborted if the warning disappears OR a submit was just
    *      attempted (30-second submit-suppression window).
    * ─────────────────────────────────────────────────────────────────── */
-  var MD_TIMEOUT_MS = 15_000;
+  var MD_TIMEOUT_MS = 10_000;       // was 15s
   var _mdStartAt = 0;
   var _mdTimerId = null;
   var _mdCountdownEl = null;
@@ -1164,6 +1164,32 @@
      timer (the freeze the user kept hitting). Clicking the REAL Skip
      button in the sidepanel DOES advance it. So we click the button
      first and only fall back to the message if no button is present. */
+  /* Skip the current job the way OptimHire 2.9.0 actually understands.
+     Its background has NO handler for {action:'skipCurrent'} any more —
+     every "sent skipCurrent" (stall recovery, watchdogs, our Skip button)
+     was silently ignored, which is why a stuck "Loading your Job" never
+     recovered. AUTO_APPLY_SKIP records the skip and loads the next job
+     (or, for a job started from the optimhire.com page, ends it and goes
+     back to the page); the one-job-at-a-time mode takes a skip flag on
+     OPEN_MANUAL_APPLICATION. */
+  function sendOhSkip(reason) {
+    try {
+      chrome.storage.local.get(['autoApplyState', 'isAutoProcessStartJob', 'isManuallyStartJob', 'isSingleManualApplication'], function (d) {
+        d = d || {};
+        var st = d.autoApplyState;
+        var msg;
+        if (d.isManuallyStartJob && !d.isSingleManualApplication && !(st && st.isActive)) {
+          msg = { action: 'OPEN_MANUAL_APPLICATION', isSkipped: true, error: { reason: 'auto_' + (reason || 'skip') } };
+        } else {
+          msg = { action: 'AUTO_APPLY_SKIP', skipReason: 'auto_skip', status: '4',
+                  status_message: 'Skipped automatically: ' + (reason || 'stuck'),
+                  applicationDetails: (st && st.applicationDetails) || undefined };
+        }
+        Promise.resolve(chrome.runtime.sendMessage(msg)).catch(function () {});
+      });
+    } catch (_) {}
+  }
+
   function forceAdvanceSkip(reason) {
     var btn = findVisibleSkipButton();
     if (btn) {
@@ -1176,8 +1202,8 @@
       addLog((reason ? reason + ' — ' : '') + 'clicked Skip to advance', '');
       return true;
     }
-    try { chrome.runtime.sendMessage({ action: 'skipCurrent' }).catch(function () {}); } catch (_) {}
-    addLog((reason ? reason + ' — ' : '') + 'sent skipCurrent (no Skip button found)', '');
+    sendOhSkip(reason);
+    addLog((reason ? reason + ' — ' : '') + 'told OptimHire to skip (no Skip button showing)', '');
     return false;
   }
 
@@ -1259,9 +1285,8 @@
         } catch (_) { try { btn.click(); } catch (__) {} }
         addLog('Missing-details: countdown reached 0, clicked Skip', '');
       } else {
-        try { chrome.runtime.sendMessage({ action: 'skipCurrent' }).catch(function(){}); }
-        catch (_) {}
-        addLog('Missing-details: countdown reached 0, sent skipCurrent', '');
+        sendOhSkip('missing details');
+        addLog('Missing-details: countdown reached 0, told OptimHire to skip', '');
       }
     }
   }
@@ -2139,8 +2164,7 @@
           _lastNudgeTs = now;
           addLog('Throughput monitor: no progress for ' +
                  fmtDuration(now - _lastProgressTs) + ' — nudging queue', '');
-          try { chrome.runtime.sendMessage({ action: 'skipCurrent' }).catch(function(){}); }
-          catch (_) {}
+          sendOhSkip('no progress');
         }
       } catch (_) {}
     }

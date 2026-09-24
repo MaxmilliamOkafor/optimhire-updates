@@ -219,23 +219,95 @@
   }
   /* First job from these jobsite tiers (ATS, then boards…), skipping sites
      known to be empty and `excludeId`. Returns {res, tier, site},
-     {auth:true} on a login error, or null. */
+     {auth:true} on a login error, or null (nothing, or out of time).
+
+     Must be FAST: this runs while the panel shows "Loading your Job". The
+     first version asked one site at a time with no time limit — up to 25
+     slow requests in a row — and a run could sit on "Loading your Job"
+     for minutes. Now: the site that last had jobs is asked alone first
+     (1 request per job in steady state); otherwise the remaining sites are
+     asked IN PARALLEL, each capped at PROBE_TIMEOUT_MS, and the whole
+     search at BUDGET_MS — after which OptimHire's normal request runs. */
+  var PROBE_TIMEOUT_MS = 5000;
+  var BUDGET_MS = 10000;               // browsers run ~6 requests per host at once, so allow two waves
+  var FAIL_TTL_MS = 5 * 60 * 1000;     // a site that timed out/errored is left alone this long
+  function probe(url, init, site, handle) {
+    var ctl = typeof AbortController === 'function' ? new AbortController() : null;
+    var cancelled = false, timedOut = false;
+    /* The pool can cancel a probe it no longer needs (a job was found) —
+       that frees the connection and says nothing about the site. */
+    if (handle) handle.cancel = function () { cancelled = true; try { if (ctl) ctl.abort(); } catch (_) {} };
+    var timer = setTimeout(function () { timedOut = true; try { if (ctl) ctl.abort(); } catch (_) {} }, PROBE_TIMEOUT_MS);
+    var opts = Object.assign({}, init || {});
+    if (ctl) opts.signal = ctl.signal;
+    return _fetch(withSite(url, site), opts).then(function (res) {
+      if (res.status === 401 || res.status === 403) { clearTimeout(timer); return { site: site, auth: true }; }
+      return jobOf(res).then(function (j) {
+        clearTimeout(timer);
+        /* Aborted while the body was being read: that is NOT "no jobs". */
+        if (cancelled) return { site: site, cancelled: true };
+        if (!j && timedOut) return { site: site, failed: true };
+        return { site: site, res: j ? res : null, job: j };
+      });
+    }, function () { clearTimeout(timer); return cancelled ? { site: site, cancelled: true } : { site: site, failed: true }; }).then(function (r) {
+      /* Learn from every answer — also ones that arrive after the search
+         gave up — so the next lookup goes straight to a site with jobs. */
+      if (r.res) { if (!_sticky) _sticky = site; }
+      else if (!r.auth && !r.cancelled) _emptyUntil[site] = Date.now() + (r.failed ? FAIL_TTL_MS : EMPTY_TTL_MS);
+      return r;
+    });
+  }
+  /* At most `limit` requests in flight (a browser queues the rest itself,
+     and a queued request's timeout would run out before it is even sent).
+     Results come back per site, in the given order; stop() ends launching. */
+  function probePool(sites, url, init, limit) {
+    var slots = sites.map(function () { var o = {}; o.p = new Promise(function (r) { o.done = r; }); return o; });
+    var next = 0, stopped = false, handles = [];
+    function launch() {
+      if (stopped || next >= sites.length) return;
+      var i = next++;
+      handles[i] = {};
+      probe(url, init, sites[i], handles[i]).then(function (r) { handles[i] = null; slots[i].done(r); launch(); });
+    }
+    for (var k = 0; k < Math.min(limit, sites.length); k++) launch();
+    return { results: slots.map(function (o) { return o.p; }),
+             stop: function () { stopped = true; handles.forEach(function (h) { if (h && h.cancel) h.cancel(); }); } };
+  }
+  function within(p, ms) {
+    return Promise.race([p, new Promise(function (r) { setTimeout(function () { r(null); }, Math.max(0, ms)); })]);
+  }
   async function firstJobFrom(tiers, url, init, excludeId) {
+    var deadline = Date.now() + BUDGET_MS;
+    function take(r, tier) {
+      if (!r) return 'timeout';
+      if (r.auth) return { auth: true };
+      if (r.cancelled) return null;
+      if (r.res && !(excludeId && String((r.job && r.job.copilot_job_id) || '') === excludeId)) {
+        _sticky = r.site;
+        return { res: r.res, tier: tier, site: r.site };
+      }
+      _emptyUntil[r.site] = Date.now() + (r.failed ? FAIL_TTL_MS : EMPTY_TTL_MS);
+      if (_sticky === r.site) _sticky = null;
+      return null;
+    }
     for (var t = 0; t < tiers.length; t++) {
       var now = Date.now();
       var order = tiers[t][1].filter(function (k) { return !(_emptyUntil[k] > now); });
-      if (_sticky && order.indexOf(_sticky) > 0) { order.splice(order.indexOf(_sticky), 1); order.unshift(_sticky); }
+      if (!order.length) continue;
+      /* Steady state: the site that just had jobs, on its own. */
+      if (_sticky && order.indexOf(_sticky) !== -1) {
+        var first = take(await within(probe(url, init, _sticky), deadline - Date.now()), tiers[t][0]);
+        if (first === 'timeout') return null;
+        if (first) return first;
+        order = order.filter(function (k) { return k !== _sticky && !(_emptyUntil[k] > Date.now()); });
+      }
+      /* Otherwise the remaining sites in parallel (6 at a time); take the
+         best-ranked hit. */
+      var pool = probePool(order, url, init, 6);
       for (var i = 0; i < order.length; i++) {
-        var site = order[i], res = null;
-        try { res = await _fetch(withSite(url, site), init); } catch (_) { continue; }   // network: don't mark empty
-        if (res && (res.status === 401 || res.status === 403)) return { auth: true };
-        var j = await jobOf(res);
-        if (j && !(excludeId && String(j.copilot_job_id || '') === excludeId)) {
-          _sticky = site;
-          return { res: res, tier: tiers[t][0], site: site };
-        }
-        _emptyUntil[site] = Date.now() + EMPTY_TTL_MS;
-        if (_sticky === site) _sticky = null;
+        var hit = take(await within(pool.results[i], deadline - Date.now()), tiers[t][0]);
+        if (hit === 'timeout') { pool.stop(); return null; }
+        if (hit) { pool.stop(); return hit; }
       }
     }
     return null;
@@ -305,3 +377,28 @@
 })();
 
 importScripts('index.js');
+
+/* 5. Shorter auto-skip waits. OptimHire counts down autoSkipDuration (180s)
+   on a problem job — shown as "Auto skip in N Sec." — and loginWaitDuration
+   (600s) when a site wants a login, before moving on. With nobody at the
+   PC those minutes are just dead time on a large queue. Its config object
+   lives in the bundle's module registry (globalThis.parcelRequire*), found
+   by shape so this survives OptimHire updates. */
+(function tuneOptimHireTimers() {
+  var AUTO_SKIP_S = 10, LOGIN_WAIT_S = 10;
+  try {
+    Object.getOwnPropertyNames(self).forEach(function (name) {
+      var req = /^parcelRequire/.test(name) ? self[name] : null;
+      if (typeof req !== 'function' || !req.cache) return;
+      Object.keys(req.cache).forEach(function (id) {
+        var ex = req.cache[id] && req.cache[id].exports;
+        var cfg = null;
+        try { cfg = ex && ex.OPTIMHIRE_CONFIG; } catch (_) {}
+        var aa = cfg && cfg.autoApply;
+        if (!aa || typeof aa.autoSkipDuration !== 'number') return;
+        aa.autoSkipDuration = Math.min(aa.autoSkipDuration, AUTO_SKIP_S);
+        if (typeof aa.loginWaitDuration === 'number') aa.loginWaitDuration = Math.min(aa.loginWaitDuration, LOGIN_WAIT_S);
+      });
+    });
+  } catch (_) {}
+})();

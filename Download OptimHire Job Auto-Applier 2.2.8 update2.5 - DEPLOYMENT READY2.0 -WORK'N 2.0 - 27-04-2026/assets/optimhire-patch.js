@@ -419,6 +419,97 @@
     return false;
   }
 
+  /* ── Dropdown widgets (react-select & co.) ──────────────────────────
+   * Greenhouse, Ashby, Lever and many others render dropdowns as a text
+   * <input role="combobox"> that only FILTERS a menu — typing into it
+   * selects nothing. The generic fillers used to type answers (even the
+   * "N/A" filler) straight into that search box: the field showed "N/A /
+   * No options", stayed invalid, and the form could never be submitted —
+   * the run sat on "Review and submit the form". These inputs are now left
+   * to chooseComboOption(), which opens the menu and clicks a real option. */
+  const COMBO_WRAP_SEL = '[class*="select__control" i],[class*="react-select" i],[class*="Select__control"],' +
+                         '[class*="select2-selection" i],[class*="-control" i][class*="select" i]';
+  function isComboInput(el) {
+    if (!el || el.tagName !== 'INPUT') return false;
+    if (el.getAttribute('role') === 'combobox') return true;
+    const ac = (el.getAttribute('aria-autocomplete') || '').toLowerCase();
+    if (ac && ac !== 'none') return true;
+    return !!(el.closest && el.closest(COMBO_WRAP_SEL));
+  }
+  function comboControl(input) {
+    return (input.closest && (input.closest('[class*="control" i]') || input.closest(COMBO_WRAP_SEL))) || input.parentElement;
+  }
+  /* The option currently chosen in the widget ('' when nothing is). A plain
+     typeahead (no react-select value container, e.g. a location field)
+     keeps its answer in the input itself. */
+  function comboSelectedText(input) {
+    const ctl = comboControl(input);
+    if (!ctl || !ctl.querySelector('[class*="placeholder" i],[class*="single-value" i],[class*="singleValue"],[class*="value-container" i],[class*="multi-value" i],.select2-selection__rendered')) {
+      return input.getAttribute('aria-invalid') === 'true' ? '' : (input.value || '').trim();
+    }
+    const v = ctl && ctl.querySelector('[class*="single-value" i],[class*="singleValue"],[class*="multi-value" i],[class*="multiValue"],.select2-selection__rendered');
+    if (!v || /placeholder/i.test(v.className || '') || v.querySelector('[class*="placeholder" i]')) return '';
+    return (v.textContent || '').trim();
+  }
+  function comboOptions() {
+    return $$('[role="option"],[id*="-option-"],[class*="__option" i],.select2-results__option')
+      .filter(o => isVisible(o) && !/disabled|no-?options|notice|group-heading|placeholder/i.test(o.className || '') &&
+                   !o.querySelector('[role="option"],[class*="__option" i]'));
+  }
+  /* Open the widget and click the option that best matches `answer`.
+     `fallbackFirst` picks the first real option when nothing matches (for
+     required questions no rule could answer). Returns the chosen text. */
+  async function chooseComboOption(input, answer, fallbackFirst) {
+    const norm = s => String(s || '').toLowerCase().replace(/\s+/g, ' ').trim();
+    const want = norm(answer);
+    const ctl = comboControl(input);
+    const keyDown = key => { try { input.dispatchEvent(new KeyboardEvent('keydown', { key, code: key, bubbles: true, cancelable: true })); } catch (_) {} };
+    try { realClick(ctl || input); } catch (_) {}
+    try { input.focus(); } catch (_) {}
+    let opts = [];
+    if (want) { nativeSet(input, answer); await sleep(450); opts = comboOptions(); }
+    if (!opts.length) { nativeSet(input, ''); keyDown('ArrowDown'); await sleep(450); opts = comboOptions(); }
+    const txt = o => norm(o.textContent);
+    let best = null;
+    if (want && opts.length) {
+      best = opts.find(o => txt(o) === want) ||
+             opts.find(o => txt(o).startsWith(want + ' ') || txt(o).startsWith(want + ',')) ||
+             opts.find(o => txt(o).startsWith(want)) ||
+             opts.find(o => txt(o).includes(want));
+      if (!best && /^(yes|no)\b/.test(want)) best = opts.find(o => new RegExp('^' + want.split(' ')[0] + '\\b').test(txt(o)));
+    }
+    if (!best && fallbackFirst) best = opts[0] || null;
+    if (!best) { keyDown('Escape'); try { input.blur(); } catch (_) {} return ''; }
+    const chosen = (best.textContent || '').trim();
+    try { realClick(best); } catch (_) { try { best.click(); } catch (__) {} }
+    await sleep(250);
+    return chosen;
+  }
+  /* Answer every dropdown in `scope` that is required-but-empty, or has
+     junk typed into its search box with nothing chosen. */
+  async function answerComboDropdowns(scope, p) {
+    const LOC_LBL = /location|city|residence|where.*(based|live|located)/i;
+    let n = 0;
+    for (const input of $$('input', scope || document)) {
+      if (!isComboInput(input)) continue;
+      const ctl = comboControl(input);
+      if (!isVisible(ctl || input) || isPageChromeField(input)) continue;
+      if (comboSelectedText(input)) continue;                     // already answered
+      const lbl = (getLabel(input) || getLabel(ctl) || '').trim();
+      if (!lbl || LOC_LBL.test(lbl)) continue;                    // location typeaheads have their own rescue
+      const required = /\*\s*$/.test(lbl) || input.required || input.getAttribute('aria-required') === 'true' ||
+                       !!(ctl && ctl.closest('[class*="required" i]'));
+      const junk = !!(input.value && input.value.trim());
+      if (!required && !junk) continue;
+      let ans = String(guessValue(lbl, p || {}) || '');
+      if (/^(n\/?a|none)$/i.test(ans)) ans = '';
+      const picked = await chooseComboOption(input, ans, required);
+      if (picked) { n++; LOG(`Dropdown: "${lbl.slice(0, 60)}" → "${picked.slice(0, 40)}"`); }
+      else if (junk) nativeSet(input, '');                        // at least clear the junk text
+    }
+    return n;
+  }
+
   /* ── optimHireBusy: is OptimHire's own autofill actively working? ──
    * Shared by the stuck watchdog and the missing-fields skip so neither
    * skips a job while OptimHire is mid-flow (loading details, analysing,
@@ -626,6 +717,24 @@
     } catch (_) { return false; }
   }
 
+  /* Skip the current job the way OptimHire 2.9.0 understands. Its
+     background no longer handles {action:'skipCurrent'} — every skip this
+     file sent was silently ignored. AUTO_APPLY_SKIP records the skip and
+     loads the next job (or ends a job started from the optimhire.com page
+     and goes back to it); the one-job-at-a-time mode takes a skip flag. */
+  async function sendOptimHireSkip(reason) {
+    try {
+      const d = await ST.get(['autoApplyState', 'isAutoProcessStartJob', 'isManuallyStartJob', 'isSingleManualApplication']);
+      const st = d.autoApplyState;
+      const msg = (d.isManuallyStartJob && !d.isSingleManualApplication && !(st && st.isActive))
+        ? { action: 'OPEN_MANUAL_APPLICATION', isSkipped: true, error: { reason: 'auto_' + (reason || 'skip') } }
+        : { action: 'AUTO_APPLY_SKIP', skipReason: 'auto_skip', status: '4',
+            status_message: 'Skipped automatically: ' + String(reason || 'stuck').slice(0, 120),
+            applicationDetails: (st && st.applicationDetails) || undefined };
+      chrome.runtime.sendMessage(msg).catch(() => {});
+    } catch (_) {}
+  }
+
   /* The ONLY way this file may ask the queue to advance. Silently drops
      the request unless this tab is the active job. */
   async function requestSkipCurrent(reason) {
@@ -633,8 +742,8 @@
       LOG(`skipCurrent suppressed (not the active job tab): ${reason || ''}`);
       return false;
     }
-    try { chrome.runtime.sendMessage({ action: 'skipCurrent' }).catch(() => {}); } catch (_) {}
-    LOG(`skipCurrent sent: ${reason || ''}`);
+    await sendOptimHireSkip(reason);
+    LOG(`skip sent: ${reason || ''}`);
     return true;
   }
 
@@ -774,7 +883,7 @@
    * The autofill script (autofill.73df3a6d.js) exposes its config as a
    * module-internal object. We intercept chrome.runtime.sendMessage here
    * so any AUTO_APPLY_STATE_UPDATE with autoSkipSeconds > 5 is clamped.   */
-  const AUTO_SKIP_MAX_SECONDS = 15;
+  const AUTO_SKIP_MAX_SECONDS = 10;   // was 15
 
   /* ── T22: Global fill-active + submit-attempted guards ─────────────────
    * _fillActive  = true while any autofill pass is running.
@@ -1184,6 +1293,7 @@
    * Runs on a timer so it also rescues fields the main fill pass missed,
    * and retries a bounded number of times per URL.
    * ────────────────────────────────────────────────────────────────── */
+  let rescueLocationNow = null;   // set below; lets a fill pass pick the location suggestion straight away
   (function installLocationTypeaheadRescue() {
     if (window.top !== window.self) return;
     if (/(^|\.)optimhire\.com$/i.test(location.hostname)) return;
@@ -1195,13 +1305,24 @@
     function isEmptyInput(el) {
       return !el.value || !el.value.trim();
     }
+    /* Text typed but no suggestion chosen: the site flags the field
+       (aria-invalid or an error message next to it). Greenhouse's
+       "Location (City)" sat like this — filled-looking, never accepted. */
+    function looksInvalid(el) {
+      if (el.getAttribute('aria-invalid') === 'true') return true;
+      const box = el.closest('.field,[class*="field" i],.form-group,fieldset,[class*="question" i]');
+      if (!box) return false;
+      return [...box.querySelectorAll('[class*="error" i],[role="alert"]')]
+        .some(e => isVisible(e) && (e.textContent || '').trim().length > 0 && !e.contains(el));
+    }
+    const _retriedInvalid = new WeakSet();
     /* Candidate typeahead inputs: required, visible, empty, location-ish. */
     function findLocationInputs() {
       const out = [];
       const inputs = $$('input[type=text],input:not([type]),input[type=search],[role="combobox"] input')
         .filter(isVisible);
       for (const el of inputs) {
-        if (!isEmptyInput(el)) continue;
+        if (!isEmptyInput(el) && !looksInvalid(el)) continue;
         const req = el.required || el.getAttribute('aria-required') === 'true' ||
                     !!el.closest('[class*="required"]');
         const lbl = (getLabel(el) || '') + ' ' + (el.placeholder || '') + ' ' +
@@ -1273,13 +1394,19 @@
       if (_busy) return;
       try {
         if (location.href !== _forUrl) { _forUrl = location.href; _tries = 0; }
-        if (_tries >= MAX_TRIES) return;
         if (_fillActive) return;
         if (!(await isAutomationActive())) return;
         /* Only rescue fields on the tab that is actually the current job. */
         if (!(await isActiveJobTab())) return;
-        const targets = findLocationInputs();
+        let targets = findLocationInputs();
         if (!targets.length) return;
+        if (_tries >= MAX_TRIES) {
+          /* Out of tries — but a field the site has since flagged invalid
+             gets one more go (once per field). */
+          targets = targets.filter(t => !isEmptyInput(t.el) && !_retriedInvalid.has(t.el));
+          if (!targets.length) return;
+          targets.forEach(t => _retriedInvalid.add(t.el));
+        }
         _busy = true;
         _tries++;
         const p = await getProfile();
@@ -1293,6 +1420,7 @@
       } finally { _busy = false; }
     }
     setInterval(tick, 4000);
+    rescueLocationNow = tick;
   })();
 
   /* ── Auto-submit when OptimHire says "Review and submit the form" ────
@@ -1339,10 +1467,11 @@
        finish before submitting despite our own "unfilled" reading. */
     const FILL_GRACE_MS = 3_000;
     const SUBMIT_SETTLE_MS = 8_000;   // let a submit land before trying again
+    const GIVE_UP_MS = 25_000;        // form still invalid this long after "ready" → skip the job
     const SIGNAL_FRESH_MS = 10_000;
     const REPORT_AFTER_MS = 8_000;
     let _tries = 0, _launches = 0, _fills = 0, _forUrl = '', _lastTry = 0, _readySince = 0;
-    let _signalTs = 0, _busy = false, _confirmedTs = 0, _reportedFor = '', _noLaunchLoggedFor = '';
+    let _signalTs = 0, _busy = false, _confirmedTs = 0, _reportedFor = '', _noLaunchLoggedFor = '', _gaveUpFor = '';
 
     function ohSaysReady(st) {
       if (!st || st.isActive !== true) return false;
@@ -1359,6 +1488,7 @@
       ).filter(el => isVisible(el) && !isPageChromeField(el));
     }
     function isFilled(el) {
+      if (isComboInput(el)) return !!comboSelectedText(el);   // the search box is empty even when answered
       if (el.type === 'radio' && el.name) return [...document.getElementsByName(el.name)].some(r => r.checked);
       if (el.type === 'checkbox') return el.checked;
       if (el.tagName === 'SELECT') return !!el.value;
@@ -1447,14 +1577,23 @@
       return null;
     }
 
-    /* A form WE opened (or a page OptimHire never filled) — run our engine. */
-    async function fillOpenApplication() {
+    /* A form WE opened (or a page OptimHire never filled) — run our engine,
+       then answer required dropdowns with real options. */
+    async function fillOpenApplication(scope) {
       if (_fillActive) return;
       try {
         await runAtsAutofill();
         try { await detectAndFixValidationErrors(); } catch (_) {}
         try { await sanitizeBadFills(); } catch (_) {}
+        try { await answerComboDropdowns(scope || document, await getProfile()); } catch (_) {}
       } catch (_) {} finally { _fillActive = false; }
+      /* Location typeaheads need a suggestion PICKED — do it now rather than
+         submitting first and having the site reject it. */
+      if (typeof rescueLocationNow === 'function') { try { await rescueLocationNow(); } catch (_) {} }
+    }
+    function visibleErrors(scope) {
+      return $$('[aria-invalid="true"],.error,.is-invalid,[class*="field-error"],[class*="fieldError"]', scope)
+        .filter(el => isVisible(el) && !isPageChromeField(el));
     }
 
     /* We saw the confirmation, but OptimHire's own success check missed it
@@ -1537,22 +1676,29 @@
         return;
       }
 
-      /* Required fields still empty — typically a form we just opened that
-         OptimHire never saw. Fill it (bounded), then submit next tick. */
+      /* Required fields still empty or flagged invalid — typically a form we
+         just opened that OptimHire never saw, or a dropdown left unanswered.
+         Fill it (bounded), then submit next tick. */
       const reqs = requiredInputs(scope);
-      if (reqs.length && !reqs.every(isFilled)) {
-        if (_fills < MAX_FILLS) { _fills++; await fillOpenApplication(); return; }
-        /* Our reading cannot see custom widgets, so it must never be a
+      const missing = reqs.filter(el => !isFilled(el));
+      const errs = visibleErrors(scope);
+      if (missing.length || errs.length) {
+        if (_fills < MAX_FILLS) { _fills++; await fillOpenApplication(scope); return; }
+        /* Our reading cannot see every custom widget, so it must never be a
            permanent veto — after a short grace, submit anyway. */
         if (now - _readySince < FILL_GRACE_MS) return;
-      }
-
-      /* A visible validation error means the site rejected something —
-         clicking submit again would only re-trigger it. */
-      if ($$('[aria-invalid="true"],.error,.is-invalid,[class*="field-error"],[class*="fieldError"]', scope)
-            .some(el => isVisible(el) && !isPageChromeField(el))) {
-        if (_fills < MAX_FILLS) { _fills++; await fillOpenApplication(); }
-        return;
+        /* Nothing left we can fill and the site still rejects the form:
+           skip the job instead of sitting on "Review and submit" forever. */
+        if (errs.length && now - _readySince > GIVE_UP_MS) {
+          if (_gaveUpFor !== location.href && !IN_FRAME) {
+            _gaveUpFor = location.href;
+            const what = missing.concat(errs).map(el => (getLabel(el) || el.name || '').trim()).filter(Boolean).slice(0, 3).join(', ');
+            LOG(`Review-and-submit: form still invalid after ${Math.round(GIVE_UP_MS / 1000)}s (${what || 'unknown field'}) — skipping this job`);
+            await sendOptimHireSkip('form could not be completed' + (what ? ': ' + what : ''));
+          }
+          return;
+        }
+        if (errs.length && _tries >= 1) return;     // one submit attempt against a flagged form
       }
 
       if (_tries >= MAX_TRIES || now - _lastTry < RETRY_MS) return;
@@ -2163,7 +2309,15 @@
     if (!zones.length) return 0;
     let attached = 0;
     const fname = (p.first_name || 'resume') + '_' + (p.last_name || 'file') + '.pdf';
+    /* Only a CV/résumé box gets the CV. This used to fill EVERY dropzone —
+       so the CV also landed in "Cover Letter" (and any other upload box). */
+    const zoneText = z => [z.getAttribute && z.getAttribute('aria-label'), z.id, z.getAttribute && z.getAttribute('data-testid'),
+                           (z.closest && (z.closest('.field,[class*="field" i],fieldset,[class*="upload" i]') || z).innerText || '').slice(0, 200)]
+                          .filter(Boolean).join(' ');
     for (const zone of zones) {
+      const zt = zoneText(zone);
+      if (NOT_RESUME_RE.test(zt)) continue;
+      if (zones.length > 1 && !RESUME_INPUT_RE.test(zt)) continue;
       let inp = zone.querySelector('input[type="file"]');
       if (!inp) {
         // Try clicking once to materialise the input
@@ -2748,7 +2902,9 @@
    * If the profile has a resume URL, fetch it as a Blob, create a File,
    * and attach to any empty file input that looks like a resume/CV.
    * ────────────────────────────────────────────────────────────────── */
-  const RESUME_INPUT_RE = /resume|cv\b|curriculum|upload.*resume|attach.*resume/i;
+  const RESUME_INPUT_RE = /resume|r[ée]sum[ée]|cv\b|curriculum|upload.*resume|attach.*resume/i;
+  /* Upload boxes that must never receive the CV. */
+  const NOT_RESUME_RE = /cover\s*letter|motivation|portfolio|transcript|certificat|photo|headshot|writing\s*sample|other\s*(documents?|attachments?)|additional\s*(documents?|files?)/i;
 
   async function fetchResumeFile(url, filename = 'resume.pdf') {
     if (!url) return null;
@@ -2775,7 +2931,10 @@
         inp.closest('label')?.innerText || '',
         inp.parentElement?.innerText?.slice(0, 200) || '',
       ].join(' ');
-      if (!RESUME_INPUT_RE.test(hint) && fileInputs.length > 1) continue;
+      /* The input's OWN identity (not the surrounding text, which may
+         mention "Resume/CV" for a neighbouring box). */
+      const own = [inp.name, inp.id, inp.getAttribute('aria-label') || '', getLabel(inp) || ''].join(' ');
+      if (NOT_RESUME_RE.test(own) || (!RESUME_INPUT_RE.test(hint) && fileInputs.length > 1)) continue;
       const file = await fetchResumeFile(url, fname);
       if (!file) break;
       try {
@@ -2811,6 +2970,20 @@
     // application wins over the generic rules below.
     const remembered = rememberedAnswer(label, inputType);
     if (remembered != null) return remembered;
+
+    /* "Are you currently an employee of <company/agency>?", "Have you
+       worked for us before?", relatives employed there… → No. (A yes-bias
+       answered "Yes" and then filled a fake "current agency".) */
+    if (/\b(are|were) you (currently |presently |now |a )?(an? )?(current |former |existing )?(employee|employed|staff|contractor|working)\b.{0,40}\b(of|by|at|for|with|within)\b|\bdo you (currently )?work (for|at|within)\b|\bhave you (ever |previously |already )?(worked|been employed|interned) (for|at|with|by)\b|\b(relatives?|family member)s?\b.{0,40}\b(employ|work)/.test(l))
+      return 'No';
+
+    /* Sponsorship FIRST: long wordings such as "…require sponsorship for
+       employment visa status to work legally for our company?" also match
+       the company/employer rule further down, which answered them with the
+       applicant's current employer (or nothing → "N/A" typed into the
+       dropdown). Sponsorship stays "No" (DEFAULTS.sponsorship). */
+    if (/require.*sponsor|need.*sponsor|sponsorship.*(required|needed)|require.*visa|need.*visa|visa.*sponsor|future.*visa|need.*permit|require.*permit|will.*sponsor|currently.*sponsor|now.*or.*(in.*)?future|h.?1b.?sponsor|immigration.*support/i.test(l))
+                                                          return DEFAULTS.sponsorship;
 
     // Type-based direct fill (most reliable, survives label changes)
     if (inputType === 'email')  return p.email || '';
@@ -2889,7 +3062,10 @@
                                                           return p.current_company || p.company || '';
     if (/previously.?work|worked.?before|work.?for.?before|prior.?employ/.test(l))
                                                           return 'No';
-    if (/company|employer|current.*org/.test(l))          return p.current_company || p.company || '';
+    /* Asking for the NAME of the current employer — never a yes/no
+       question that merely mentions "our company". */
+    if (/company|employer|current.*org/.test(l) && !/^\s*(do|does|are|is|will|would|have|has|can|could|did|were|was|should)\b/.test(l))
+                                                          return p.current_company || p.company || '';
     if (/email.*future|job.*alert|receive.*update|notify.*me/.test(l)) return 'Yes';
     if (/salary|compensation|pay\b|remun|ctc|lpa/.test(l))
                                                           return p.expected_salary || DEFAULTS.salary;
@@ -2919,8 +3095,7 @@
     // NEED sponsorship/a visa/a permit" first, with DEFAULTS.sponsorship.
     // (Phrasings like "authorized to work WITHOUT sponsorship" contain none
     // of these need-patterns and still fall through to 'authorized'.)
-    if (/require.*sponsor|need.*sponsor|sponsorship.*(required|needed)|require.*visa|need.*visa|visa.*sponsor|future.*visa|need.*permit|require.*permit|will.*sponsor|currently.*sponsor|now.*or.*(in.*)?future|h.?1b.?sponsor|immigration.*support/i.test(l))
-                                                          return DEFAULTS.sponsorship;
+/* (sponsorship rule moved to the top of guessValue) */
 
     // ── Work Authorization Status ─────────────────────────────────────────
     // Label: (work AND authorization) OR sponsorship OR visa OR permit
@@ -3258,6 +3433,10 @@
           el.dispatchEvent(new Event('change', { bubbles: true }));
           fixed++;
         }
+      } else if (isComboInput(el)) {
+        /* A dropdown: pick a real option instead of typing into its search. */
+        if (comboSelectedText(el)) continue;
+        if (await chooseComboOption(el, String(guessValue(lbl, p) || '').replace(/^n\/?a$/i, ''), true)) fixed++;
       } else {
         const val = guessValue(lbl, p, inputType) || (inputType === 'email' ? p.email : '') || (inputType === 'tel' ? p.phone : '');
         if (val) {
@@ -3285,6 +3464,7 @@
       );
       if (!inp || !isVisible(inp)) continue;
       if (inp.tagName === 'SELECT') continue; // handled above
+      if (isComboInput(inp)) continue;        // dropdowns: handled above / answerComboDropdowns
       const lbl = getLabel(inp) || inp.name || '';
       const inputType = (inp.type || '').toLowerCase();
       const val = guessValue(lbl, p, inputType);
@@ -3478,8 +3658,9 @@
       }).catch(() => {});
     } catch (_) {}
 
-    /* Inputs + textareas — only unfilled */
-    const inputs = allInputs.filter(el => !el.value?.trim());
+    /* Inputs + textareas — only unfilled. Dropdown search boxes are not
+       text fields: answerComboDropdowns() handles those below. */
+    const inputs = allInputs.filter(el => !el.value?.trim() && !isComboInput(el));
 
     for (const inp of inputs) {
       const lbl = getLabel(inp);
@@ -3627,6 +3808,9 @@
     ).filter(isVisible);
 
     for (const combo of customCombos) {
+      /* A bare <input role=combobox> is handled by answerComboDropdowns(),
+         which can tell a chosen value from typed text. */
+      if (combo.tagName === 'INPUT') continue;
       // Only process if it looks unfilled
       const valueEl = combo.querySelector(
         '[class*="singleValue"],[class*="single-value"],[class*="placeholder"],[class*="Select__placeholder"]'
@@ -3723,12 +3907,14 @@
        reveal new inputs after a parent dropdown changes. A second pass
        catches those. */
     await sleep(800);
+    /* Required dropdowns first (never typed into — see chooseComboOption). */
+    try { await answerComboDropdowns(document, p); } catch (_) {}
     const stillEmpty = $$(
       'input[required]:not([type=hidden]):not([type=file]):not([type=submit]):not([type=button]),' +
       'input[aria-required="true"]:not([type=hidden]):not([type=file]),' +
       'textarea[required],textarea[aria-required="true"],' +
       'select[required],select[aria-required="true"]'
-    ).filter(el => isVisible(el) && !(el.value && el.value.trim()));
+    ).filter(el => isVisible(el) && !(el.value && el.value.trim()) && !isComboInput(el));
 
     for (const el of stillEmpty) {
       const lbl = getLabel(el);
@@ -4030,6 +4216,7 @@
       let answered = 0;
       for (const inp of $$('input:not([type=hidden]):not([type=checkbox]):not([type=radio]):not([type=submit]):not([type=button]),textarea', modal).filter(isVisible)) {
         if (inp.value && inp.value.trim()) continue;
+        if (isComboInput(inp)) continue;      // dropdown search box, not a text field
         const lbl = getLabel(inp) || '';
         const v = guessValue(lbl, (p), (inp.type || '').toLowerCase());
         if (v) { inp.focus(); nativeSet(inp, v); answered++; await sleep(60); }
@@ -4687,6 +4874,9 @@
           }
         } else if (el.tagName === 'SELECT') {
           if (!el.value) return false;
+        } else if (isComboInput(el)) {
+          /* A dropdown's search box is empty even when an option is chosen. */
+          if (!comboSelectedText(el)) return false;
         } else if (!el.value || !el.value.trim()) {
           return false;
         }
@@ -4841,7 +5031,7 @@
        knockout question with no profile data, etc.) we don't need to
        wait the full window — fire the skip MISSING_SKIP_MS after fill
        completes if required-fields-satisfied is still false. */
-    const MISSING_SKIP_MS = 12_000;
+    const MISSING_SKIP_MS = 20_000;
     let _missingSkipFiredForUrl = '';
     async function tickMissingSkip() {
       if (!await automationActive()) return;
@@ -4864,6 +5054,12 @@
       ).filter(isVisible).length;
       if (reqCount === 0) return;
       if (requiredFieldsSatisfied()) return;
+      /* Skips are real now (OptimHire 2.9.0 ignored the old skipCurrent),
+         so only skip when the SITE itself flags the form — our own reading
+         can miss custom widgets, and a good job must never be skipped. */
+      const siteFlagsForm = $$('[aria-invalid="true"],.error,.is-invalid,[class*="field-error"],[class*="fieldError"]')
+        .some(el => isVisible(el) && !isPageChromeField(el));
+      if (!siteFlagsForm) return;
       _missingSkipFiredForUrl = location.href;
       LOG(`Flow: missing required fields ${MISSING_SKIP_MS/1000}s after fill — skipCurrent`);
       requestSkipCurrent('required fields unsatisfied after fill');
