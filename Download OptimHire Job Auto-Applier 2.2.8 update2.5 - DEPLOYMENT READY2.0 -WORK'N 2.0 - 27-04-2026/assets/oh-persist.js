@@ -144,4 +144,24 @@
   });
 
   sync('page open');
+
+  /* Housekeeping: the Q&A-memory learner keeps a pending answer snapshot
+     per tab (ohQaPend_*) until the application is confirmed. A tab closed
+     before that leaves its snapshot behind; drop any older than 30 min.
+     Needs storage.getKeys() (Chrome 130+) so we never load everything. */
+  try {
+    if (typeof chrome.storage.local.getKeys === 'function') {
+      chrome.storage.local.getKeys().then(function (keys) {
+        var pend = (keys || []).filter(function (k) { return k.indexOf('ohQaPend_') === 0; });
+        if (!pend.length) return;
+        chrome.storage.local.get(pend, function (d) {
+          var stale = pend.filter(function (k) {
+            var v = d && d[k];
+            return !v || !v.ts || Date.now() - v.ts > 30 * 60000;
+          });
+          if (stale.length) chrome.storage.local.remove(stale);
+        });
+      }).catch(function () {});
+    }
+  } catch (_) {}
 })();

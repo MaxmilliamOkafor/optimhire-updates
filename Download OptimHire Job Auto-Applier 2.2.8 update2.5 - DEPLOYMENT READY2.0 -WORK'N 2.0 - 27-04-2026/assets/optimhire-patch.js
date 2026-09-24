@@ -704,6 +704,7 @@
   function markSubmitAttempted() {
     _submitAttempted = true;
     _submitAttemptTs = Date.now();
+    qaSnapshot('auto-submit');   // Q&A memory: capture the answers being sent
     try {
       chrome.runtime.sendMessage({ type: 'SUBMIT_ATTEMPTED', ts: _submitAttemptTs }).catch(() => {});
     } catch (_) {}
@@ -2030,14 +2031,56 @@
     return exactIdx !== -1 ? exactIdx : (bestIdx !== -1 ? bestIdx : null);
   }
 
-  /* ── T25: Q&A memory persistence ─────────────────────────────────────
-   * Store question→answer pairs keyed by normalised label, so repeat
-   * knockout questions across applications get the same answer that
-   * previously succeeded.
+  /* ── T25: Q&A memory — remember answers that worked ──────────────────
+   * Question → answer pairs keyed by the normalised question label, so a
+   * question the rules below can't answer (or answer wrongly) gets the
+   * answer that went through last time.
+   *
+   * How an answer gets in (installQaMemoryLearner, end of file):
+   *   1. When a Submit / Next / Continue button is clicked (by the user or
+   *      by our automation) the answers currently on the form are
+   *      snapshotted into a PENDING record for this tab.
+   *   2. Only when the application is CONFIRMED (a thank-you /
+   *      confirmation page, or OptimHire's own success message) is the
+   *      pending snapshot committed into memory. An application that
+   *      failed or was abandoned teaches nothing.
+   *   3. Only informative answers are kept: identity / contact fields,
+   *      links, dates, salary, sponsorship / work-authorisation (these
+   *      depend on the job's country — sponsorship stays "No" by rule),
+   *      essays, filler like "N/A", and answers that repeat the company or
+   *      job title are never stored. Nor are answers the built-in rules
+   *      would give anyway — memory only records what the rules got wrong
+   *      or could not produce.
+   * The remembered answers can be viewed, deleted and cleared from the
+   * Queue Manager page.
    * ────────────────────────────────────────────────────────────────── */
   const QA_MEMORY_KEY = 'ohQaMemory';
-  const QA_MAX_ENTRIES = 2000;
+  const QA_MAX_ENTRIES = 500;
+  const QA_PENDING_PREFIX = 'ohQaPend_';
+  const QA_PENDING_TTL_MS = 30 * 60_000;
   let _qaCache = null;
+  let _qaBypass = false;     // true while computing the rule-only answer
+
+  /* Questions whose answers must come from the profile / rules, never from
+     memory. Matched against the NORMALISED label (lowercase, punctuation
+     turned into spaces). */
+  const QA_NEVER_RE = new RegExp([
+    '\\b(first|last|middle|full|given|family|preferred|legal|sur)\\s?name\\b', '^name$', '^your name', '\\bname of\\b',
+    '\\be\\s?mail\\b', 'phone', '\\bmobile( number| no\\b|$)', '\\bcell\\b', 'telephone', '\\bfax\\b',
+    'address', 'street', '\\bcity\\b', '\\btown\\b', '\\bzip\\b', 'postal', 'post ?code', '^(state|county|province|region)( |$)', 'state province', 'country', '\\blocation',
+    'linkedin', 'github', 'twitter', 'website', 'portfolio', '\\burl\\b', '\\blink\\b',
+    'password', 'passcode', 'user ?name', '\\bssn\\b', 'social security', 'national (insurance|id)', '\\bpps\\b', 'passport', '\\btax\\b',
+    'birth', '\\bdob\\b', 'signature', 'sign here', '\\binitials?\\b', '\\btoday\\b', '\\bdate\\b', 'captcha', 'verification', '\\botp\\b', '\\bcode\\b',
+    'salary', 'compensation', '\\bpay\\b', '(hourly|daily|day) ?rate', '\\bctc\\b', 'remuneration',
+    '\\bsearch\\b', 'keyword', '\\bfilter', '\\bsort\\b',
+    'cover letter', '\\bresume', '\\bcv\\b', '\\breferr', 'recruiter',
+    'sponsor', '\\bvisas?\\b', 'authori[sz]', 'right to work', 'work permit', 'eligib', 'legally', 'citizen', 'immigration'
+  ].join('|'), 'i');
+  const QA_ESSAY_RE = /\bwhy\b|describe|tell us|explain|about yourself|motivat|interested in|what (excites|interests|attracts)|cover|additional information|anything else/i;
+  const QA_FILLER_RE = /^(n\/?a|na|none|nil|null|undefined|-+|\.+|x+|test|asdf|select|choose|please select|select\.\.\.)$/i;
+  const QA_GENERIC_KEYS = new Set(['yes', 'no', 'answer', 'response', 'select', 'choose', 'please select', 'other',
+    'option', 'value', 'text', 'input', 'field', 'question', 'required', 'optional', 'none', 'search', 'type here',
+    'your answer', 'enter your answer', 'true', 'false']);
 
   function normalizeQa(label) {
     // Use the v2.5.0-compatible cleanQuestionText so keys match the official
@@ -2054,27 +2097,301 @@
     return _qaCache;
   }
 
-  async function getSavedQA(label) {
+  /* Memory lookup used at the top of guessValue(). */
+  const _qaUsedLogged = new Set();
+  function rememberedAnswer(label, inputType) {
+    if (_qaBypass || !_qaCache) return null;
+    if (/^(email|tel|password|url|date|datetime-local|month|week|time|file|hidden)$/.test(inputType || '')) return null;
     const k = normalizeQa(label);
-    if (!k) return null;
-    const mem = await loadQaMemory();
-    const entry = mem[k];
-    return entry && entry.answer != null ? entry.answer : null;
+    if (!k || QA_NEVER_RE.test(k)) return null;
+    const e = _qaCache[k];
+    if (!e || !e.success || e.answer == null || e.answer === '') return null;
+    if (!_qaUsedLogged.has(k)) { _qaUsedLogged.add(k); LOG(`Q&A memory: using remembered answer for "${e.q || k}"`); }
+    return String(e.answer);
   }
 
-  async function saveQA(label, answer, success = true) {
-    const k = normalizeQa(label);
-    if (!k || answer == null || answer === '') return;
-    const mem = await loadQaMemory();
-    const prev = mem[k];
-    if (prev && prev.success && !success) return; // don't overwrite successes with failures
-    mem[k] = { answer: String(answer).slice(0, 500), success: !!success, ts: Date.now() };
+  /* Is this snapshotted answer worth remembering? `a` = {label, answer,
+     kind, type}; `p` = profile; `ctx` = {title, company} of the job. */
+  function qaWorthRemembering(k, a, p, ctx) {
+    if (!k || k.length < 3 || k.length > 200 || QA_GENERIC_KEYS.has(k)) return false;
+    if (QA_NEVER_RE.test(k)) return false;
+    const ans = String(a.answer || '').trim();
+    if (!ans || ans.length > 200 || QA_FILLER_RE.test(ans)) return false;
+    if (normalizeQa(ans) === k) return false;                       // "answer" is just the label
+    if (a.kind === 'textarea' && (QA_ESSAY_RE.test(k) || ans.length > 120)) return false;
+    if (QA_ESSAY_RE.test(k) && ans.split(/\s+/).length > 12) return false;
+    if (a.type === 'number' && ans === '1') return false;          // our required-field filler
+    if (/https?:\/\/|www\.|@/.test(ans)) return false;            // links / e-mail addresses
+    const low = ans.toLowerCase();
+    const has = (s) => { s = String(s || '').trim().toLowerCase(); return s.length >= 3 && low.includes(s); };
+    if (ctx && (has(ctx.company) || has(ctx.title))) return false;  // job-specific
+    if (p) {
+      if (has(p.email) || (has(p.first_name) && has(p.last_name))) return false;
+      const digits = String(p.phone || '').replace(/\D/g, '');
+      if (digits.length >= 6 && ans.replace(/\D/g, '').includes(digits.slice(-6))) return false;
+    }
+    /* What would the rules answer without memory? Same → nothing to learn. */
+    let rule = '';
+    _qaBypass = true;
+    try { rule = String(guessValue(a.label || '', p || {}, a.type || '') || ''); } catch (_) { rule = ''; }
+    finally { _qaBypass = false; }
+    if (rule) {
+      const r = normalizeQa(rule), v = normalizeQa(ans);
+      if (r && (r === v || v.startsWith(r + ' '))) return false;
+    }
+    return true;
+  }
+
+  /* Merge a confirmed application's answers into memory. */
+  function mergeIntoQaMemory(mem, answers, p, ctx, host) {
+    let n = 0;
+    const now = Date.now();
+    for (const [k, a] of Object.entries(answers || {})) {
+      if (!a || !qaWorthRemembering(k, a, p, ctx)) continue;
+      const prev = mem[k];
+      mem[k] = {
+        q: String(a.label || k).replace(/\s+/g, ' ').trim().slice(0, 160),
+        answer: String(a.answer).trim().slice(0, 200),
+        success: true,
+        ts: now,
+        n: ((prev && prev.answer === a.answer && prev.n) || 0) + 1,
+        host: String(host || '').slice(0, 80),
+      };
+      n++;
+    }
     const keys = Object.keys(mem);
     if (keys.length > QA_MAX_ENTRIES) {
-      keys.sort((a, b) => (mem[a].ts || 0) - (mem[b].ts || 0));
+      keys.sort((x, y) => (mem[x].ts || 0) - (mem[y].ts || 0));
       keys.slice(0, keys.length - QA_MAX_ENTRIES).forEach(k2 => delete mem[k2]);
     }
-    try { await ST.set({ [QA_MEMORY_KEY]: mem }); } catch (_) {}
+    return n;
+  }
+
+  /* Question text of a radio group. getLabel() on the first radio often
+     returns that radio's OWN option text ("Yes") when each radio is
+     wrapped in its label — useless as a question and dangerous as a memory
+     key. Fall back to the group's legend / aria label / nearest preceding
+     question text. */
+  function radioOptionText(r) {
+    try {
+      const byFor = r.id ? document.querySelector(`label[for="${CSS.escape(r.id)}"]`) : null;
+      const wrap = r.closest && r.closest('label');
+      return ((byFor && byFor.textContent) || (wrap && wrap.textContent) || r.value || '').replace(/\s+/g, ' ').trim();
+    } catch (_) { return (r && r.value) || ''; }
+  }
+  function radioGroupLabel(radios) {
+    const first = radios && radios[0];
+    if (!first) return '';
+    const opts = new Set(radios.map(r => normalizeQa(radioOptionText(r))).filter(Boolean));
+    const ok = (t) => {
+      t = (t || '').replace(/\s+/g, ' ').trim();
+      const k = normalizeQa(t);
+      return t && t.length < 300 && k.length >= 3 && !opts.has(k) && !QA_GENERIC_KEYS.has(k) ? t : '';
+    };
+    const own = getLabel(first) || '';
+    if (ok(own)) return own;
+    const grp = first.closest && first.closest('fieldset,[role="radiogroup"],[role="group"]');
+    if (grp) {
+      const legend = grp.querySelector(':scope > legend');
+      if (legend && ok(legend.textContent)) return ok(legend.textContent);
+      if (ok(grp.getAttribute('aria-label'))) return ok(grp.getAttribute('aria-label'));
+      const lb = grp.getAttribute('aria-labelledby');
+      if (lb) {
+        const t = lb.split(/\s+/).map(id => (document.getElementById(id) || {}).textContent || '').join(' ');
+        if (ok(t)) return ok(t);
+      }
+    }
+    /* Closest text that PRECEDES the group, preferring label-like elements
+       over generic p/span/div, walking a few ancestors up. */
+    let node = first.parentElement;
+    for (let i = 0; i < 5 && node && node !== document.body; i++, node = node.parentElement) {
+      let strong = '', weak = '';
+      for (const c of node.querySelectorAll('legend,label,[class*="label" i],[class*="question" i],h2,h3,h4,h5,p,span,div')) {
+        if (c.querySelector('input,select,textarea')) continue;
+        if (!(c.compareDocumentPosition(first) & Node.DOCUMENT_POSITION_FOLLOWING)) continue;
+        const t = ok(c.textContent);
+        if (!t) continue;
+        if (/^(LEGEND|LABEL|H2|H3|H4|H5)$/.test(c.tagName) || /label|question/i.test(c.className || '')) strong = t;
+        else weak = t;
+      }
+      if (strong || weak) return strong || weak;
+    }
+    return own;
+  }
+
+  /* ── T25b: Q&A memory learner — snapshot on submit, commit on success ──
+   * The pending snapshot lives in storage under a per-tab flow id (kept in
+   * the site's sessionStorage), so a multi-step form accumulates answers
+   * across page loads, and the confirmation page that loads AFTER the
+   * submit can still commit them. Parallel tabs never mix their answers. */
+  let _qaFlowId = '';
+  let _qaPending = null;        // { ts, url, host, ctx, answers }
+  let _qaLastSnapTs = 0;
+  let _qaWatchTimer = null;
+  let _qaWatchUntil = 0;
+  let _qaCommitP = null;
+
+  const QA_STEP_BTN_RE = /\b(submit|send|apply|finish|complete|next|continue|review|proceed|save\s*(&|and)\s*(continue|next))\b/i;
+  const QA_NOT_STEP_RE = /\b(sign\s*(in|up)|log\s*in|register|search|filters?|upload|attach|cancel|back|previous|close|delete|remove|add\s+(another|more)|apply\s+(filters?|with|using)|autofill|subscribe|save\s+(job|for\s+later|draft)|alerts?|share)\b/i;
+  const QA_SUCCESS_TEXT_RE = /application\s+(was\s+|has\s+been\s+)?(submitted|received|completed|sent)\b|thank\s+you\s+for\s+(applying|your\s+application|submitting)|thanks\s+for\s+applying|we['’]ve\s+received\s+your\s+application|we\s+have\s+received\s+your\s+application|application\s+successful|successfully\s+(applied|submitted)/i;
+  const QA_SUCCESS_SEL = '#application_confirmation,.application-confirmation,.confirmation-text,.posting-confirmation,' +
+    '[data-automation-id="congratulationsMessage"],[data-automation-id="confirmationMessage"]';
+
+  function qaFlowKey(create) {
+    if (!_qaFlowId) {
+      try { _qaFlowId = sessionStorage.getItem('__ohQaFlow') || ''; } catch (_) {}
+      if (!_qaFlowId && create) {
+        _qaFlowId = Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+        try { sessionStorage.setItem('__ohQaFlow', _qaFlowId); } catch (_) {}
+      }
+    }
+    return _qaFlowId ? QA_PENDING_PREFIX + _qaFlowId : '';
+  }
+
+  function qaLooksLikeApplication() {
+    if (_IS_OH_PAGE) return false;
+    /* A visible password box means a sign-in / account form. */
+    if ([...document.querySelectorAll('input[type=password]')].some(isVisible)) return false;
+    if (CURRENT_ATS || _engagedNow) return true;
+    if (document.querySelector('input[type=file]')) return true;
+    if (/apply|application|career|\bjobs?\b|recruit|hiring|talent|vacanc|position/i.test(location.href + ' ' + document.title)) return true;
+    /* Unknown site with neutral URL/title: look at the page's own wording
+       (e.g. a "Submit Application" button, "Upload your CV"). */
+    const t = (document.body && document.body.innerText || '').slice(0, 5000);
+    return /\b(apply|application|applicant|candidate|r[eé]sum[eé]|curriculum vitae|cover letter)\b/i.test(t);
+  }
+
+  /* Read the answers currently on the form. Keys are derived exactly the
+     way the fill code derives them, so a remembered answer is found again. */
+  function qaCollectAnswers(scope) {
+    const root = scope && scope.querySelectorAll ? scope : document;
+    const out = {};
+    const put = (label, answer, kind, type) => {
+      const k = normalizeQa(label);
+      if (!k || k.length < 3) return;
+      const ans = String(answer == null ? '' : answer).replace(/\s+/g, ' ').trim();
+      if (!ans) return;
+      out[k] = { label: String(label).replace(/\s+/g, ' ').trim().slice(0, 160), answer: ans.slice(0, 300), kind, type: type || '' };
+    };
+    const inWidget = el => !!(el.closest && el.closest(
+      '[class*="react-select" i],[class*="Select__control"],[class*="select2" i],[role="combobox"],[role="search"],header,nav'));
+
+    for (const el of root.querySelectorAll('input,textarea')) {
+      const type = (el.getAttribute('type') || 'text').toLowerCase();
+      if (el.tagName === 'INPUT' && !/^(text|number)$/.test(type)) continue;
+      if (el.disabled || !isVisible(el)) continue;
+      if (el.getAttribute('role') === 'combobox' || el.getAttribute('aria-autocomplete') || inWidget(el)) continue;
+      if (/captcha|token|csrf/i.test((el.name || '') + ' ' + (el.id || ''))) continue;
+      put(getLabel(el), el.value, el.tagName === 'TEXTAREA' ? 'textarea' : 'text', el.tagName === 'TEXTAREA' ? '' : type);
+    }
+    for (const sel of root.querySelectorAll('select')) {
+      if (sel.disabled || sel.multiple || !isVisible(sel)) continue;
+      const o = sel.options[sel.selectedIndex];
+      if (!o || !o.value) continue;
+      put(getLabel(sel), (o.text || '').trim(), 'select', '');
+    }
+    const groups = new Map();
+    for (const r of root.querySelectorAll('input[type=radio]')) {
+      const g = r.name || r.id;
+      if (!g) continue;
+      if (!groups.has(g)) groups.set(g, []);
+      groups.get(g).push(r);
+    }
+    for (const radios of groups.values()) {
+      const on = radios.find(r => r.checked);
+      if (!on || !radios.some(r => isVisible(r) || isVisible(r.parentElement))) continue;
+      put(radioGroupLabel(radios.filter(r => isVisible(r) || isVisible(r.parentElement))), radioOptionText(on), 'radio', '');
+    }
+    for (const combo of root.querySelectorAll('[class*="react-select__control"],[class*="Select__control"],[class*="select2-selection"]')) {
+      if (!isVisible(combo)) continue;
+      const v = combo.querySelector('[class*="singleValue"],[class*="single-value"],[class*="select2-selection__rendered"]');
+      if (!v || /placeholder/i.test(v.className || '') || v.querySelector('[class*="placeholder"]')) continue;
+      const lbl = getLabel(combo) || getLabel(combo.closest('[class*="field"],[class*="Field"],[class*="form-group"]') || combo) || '';
+      put(lbl, (v.textContent || '').trim(), 'combo', '');
+    }
+    return out;
+  }
+
+  /* Called on every Submit / Next / Continue (user click, form submit
+     event, or our own auto-submit). Must write synchronously: the page is
+     usually about to navigate away. */
+  function qaSnapshot(why, scope) {
+    try {
+      const now = Date.now();
+      if (now - _qaLastSnapTs < 400) return;
+      if (!qaLooksLikeApplication()) return;
+      const answers = qaCollectAnswers(scope);
+      if (!Object.keys(answers).length) return;
+      _qaLastSnapTs = now;
+      const key = qaFlowKey(true);
+      const prev = (_qaPending && now - (_qaPending.ts || 0) < QA_PENDING_TTL_MS) ? _qaPending : null;
+      const ctx = extractJobContext();
+      _qaPending = {
+        ts: now,
+        url: location.href.slice(0, 300),
+        host: location.hostname,
+        ctx: (ctx.title || ctx.company) ? ctx : ((prev && prev.ctx) || ctx),
+        answers: Object.assign({}, prev ? prev.answers : {}, answers),
+      };
+      Promise.resolve(ST.set({ [key]: _qaPending })).catch(() => {});
+      LOG(`Q&A memory: captured ${Object.keys(answers).length} answer(s) on ${why} — kept until the application is confirmed`);
+      qaWatchForSuccess(60_000);
+    } catch (_) {}
+  }
+
+  function qaPageConfirmsSuccess() {
+    try {
+      if (document.querySelector(QA_SUCCESS_SEL)) return true;
+      const t = (document.body && document.body.innerText || '').slice(0, 6000);
+      if (!QA_SUCCESS_TEXT_RE.test(t)) return false;
+      /* Success wording next to a still-open form is usually help text
+         ("once your application has been submitted…"), not a confirmation. */
+      let fields = 0;
+      for (const el of document.querySelectorAll('input:not([type=hidden]):not([type=submit]):not([type=button]),textarea,select')) {
+        if (isVisible(el) && ++fields >= 3) return false;
+      }
+      return true;
+    } catch (_) { return false; }
+  }
+
+  function qaWatchForSuccess(ms) {
+    _qaWatchUntil = Math.max(_qaWatchUntil, Date.now() + ms);
+    if (_qaWatchTimer) return;
+    const step = () => {
+      _qaWatchTimer = null;
+      if (!_qaPending) return;
+      if (qaPageConfirmsSuccess()) { qaCommit('confirmation page'); return; }
+      if (Date.now() < _qaWatchUntil) _qaWatchTimer = setTimeout(step, 2000);
+    };
+    _qaWatchTimer = setTimeout(step, 1500);
+  }
+
+  /* The application went through: move the pending answers into memory.
+     Returns the in-flight commit so callers can wait for it. */
+  function qaCommit(reason) {
+    if (_qaCommitP) return _qaCommitP;
+    const key = qaFlowKey(false);
+    const pend = _qaPending;
+    if (!pend || !key) return Promise.resolve();
+    _qaPending = null;
+    if (Date.now() - (pend.ts || 0) > QA_PENDING_TTL_MS) {
+      return Promise.resolve(ST.remove(key)).catch(() => {});
+    }
+    _qaCommitP = (async () => {
+      try {
+        const p = await getProfile();
+        const { [QA_MEMORY_KEY]: raw } = await ST.get(QA_MEMORY_KEY);
+        const mem = raw && typeof raw === 'object' ? raw : {};
+        const n = mergeIntoQaMemory(mem, pend.answers, p, pend.ctx, pend.host);
+        if (n) await ST.set({ [QA_MEMORY_KEY]: mem });
+        await ST.remove(key);
+        _qaCache = mem;
+        LOG(`Q&A memory: application confirmed (${reason}) — learned ${n} answer(s)`);
+      } catch (e) {
+        LOG('Q&A memory: commit failed', e);
+      }
+    })().finally(() => { _qaCommitP = null; });
+    return _qaCommitP;
   }
 
   /* ── T26: Cookie banner + modal dismisser ───────────────────────────
@@ -2260,20 +2577,26 @@
     return attached;
   }
 
-  // Prime Q&A cache once at startup so guessValue() can do sync lookups
+  // Prime Q&A cache once at startup so guessValue() can do sync lookups,
+  // and keep it current when another tab learns something (or it is cleared).
   loadQaMemory().catch(() => {});
+  try {
+    chrome.storage.onChanged.addListener((c, area) => {
+      if (area !== 'local' || !c[QA_MEMORY_KEY]) return;
+      const nv = c[QA_MEMORY_KEY].newValue;
+      _qaCache = nv && typeof nv === 'object' ? nv : {};
+    });
+  } catch (_) {}
 
   function guessValue(label, p = {}, inputType = '') {
+    label = label == null ? '' : String(label);
     const l = label.toLowerCase().replace(/[^a-z0-9 ]/g, ' ');
     const fullName = `${p.first_name||''} ${p.last_name||''}`.trim();
 
-    // T25: Q&A memory — prefer a previously-successful answer for this exact label
-    if (_qaCache) {
-      const k = normalizeQa(label);
-      if (k && _qaCache[k] && _qaCache[k].success && _qaCache[k].answer != null) {
-        return _qaCache[k].answer;
-      }
-    }
+    // T25: Q&A memory — an answer that went through on a confirmed
+    // application wins over the generic rules below.
+    const remembered = rememberedAnswer(label, inputType);
+    if (remembered != null) return remembered;
 
     // Type-based direct fill (most reliable, survives label changes)
     if (inputType === 'email')  return p.email || '';
@@ -3149,12 +3472,12 @@
     });
     for (const [, radios] of Object.entries(groups)) {
       if (radios.some(r => r.checked)) continue;
-      const lbl = getLabel(radios[0]);
-      const guess = guessValue(lbl, p);
-      const match = radios.find(r => {
-        const t = ($(`label[for="${CSS.escape(r.id)}"]`)?.textContent || r.value || '').toLowerCase();
-        return guess && t.includes(guess.toLowerCase());
-      });
+      /* The group's QUESTION, not the first radio's own "Yes" label. */
+      const lbl = radioGroupLabel(radios);
+      const guess = String(guessValue(lbl, p) || '').toLowerCase().trim();
+      const optText = r => radioOptionText(r).toLowerCase();
+      const match = guess ? (radios.find(r => optText(r) === guess) ||
+                             radios.find(r => optText(r).includes(guess))) : null;
       if (match) { realClick(match); reportFieldFilled(lbl, 'filled'); filledCount++; continue; }
       /* Default: pick Yes for yes/no questions */
       const yes = radios.find(r => {
@@ -3444,10 +3767,12 @@
       for (const key in groups) {
         const radios = groups[key];
         if (radios.some(r => r.checked)) continue;
-        const lbl = getLabel(radios[0]) || '';
-        const v = (guessValue(lbl, p) || 'yes').toLowerCase();
+        const lbl = radioGroupLabel(radios) || '';
+        const v = String(guessValue(lbl, p) || 'yes').toLowerCase().trim();
         /* Pick the radio whose own label matches our value, else "Yes". */
-        let pick = radios.find(r => (getLabel(r) || '').toLowerCase().includes(v)) ||
+        const optText = r => (radioOptionText(r) || getLabel(r) || '').toLowerCase();
+        let pick = radios.find(r => optText(r) === v) ||
+                   radios.find(r => optText(r).includes(v)) ||
                    radios.find(r => /^yes\b/i.test((getLabel(r) || '').trim())) ||
                    radios[0];
         if (pick) { realClick(pick); answered++; await sleep(80); }
@@ -7028,6 +7353,7 @@
            settling, and when it never comes we still advance but record
            confirmed:false so the Queue Manager can show the truth. */
         if (pageHasSuccess()) {
+          await qaCommit('queue job confirmed');   // before the manager closes this tab
           return advance(job, 'applied', '', { confirmed: true, confirmedBy: 'confirmation page detected' });
         }
         if (_submitSeenAt && !pageHasValidationError()) {
@@ -7062,6 +7388,47 @@
 
     setInterval(tick, POLL_MS);
     setTimeout(tick, 1500); // first kick after page settles
+  })();
+
+  /* ── T25b: Q&A memory learner — wiring ──────────────────────────────
+   * Passive: two capture-phase listeners that only look at the clicked
+   * button's text, and a storage read ONLY on pages of a tab that has a
+   * pending snapshot. Works whether the user or the automation applies. */
+  (function installQaMemoryLearner() {
+    if (_IS_OH_PAGE) return;
+    document.addEventListener('click', (ev) => {
+      try {
+        const t = ev.target && ev.target.closest &&
+                  ev.target.closest('button,[role="button"],input[type=submit],input[type=button],a');
+        if (!t) return;
+        const txt = ((t.innerText || t.value || t.getAttribute('aria-label') || t.textContent || '') + '')
+          .replace(/\s+/g, ' ').trim();
+        if (!txt || txt.length > 60 || !QA_STEP_BTN_RE.test(txt) || QA_NOT_STEP_RE.test(txt)) return;
+        qaSnapshot(`"${txt}"`, t.closest('form,[role="dialog"]'));
+      } catch (_) {}
+    }, true);
+    document.addEventListener('submit', (ev) => qaSnapshot('form submit', ev.target), true);
+
+    chrome.runtime.onMessage.addListener((msg) => {
+      if (msg && (msg.type === 'COMPLEX_FORM_SUCCESS' || msg.type === 'APPLICATION_SUCCESS' ||
+                  msg.type === 'JOB_APPLIED') && _qaPending) {
+        qaCommit('OptimHire reported success');
+      }
+    });
+
+    /* A multi-step form or the confirmation page after a submit: pick up
+       this tab's pending snapshot and look for the confirmation. */
+    const key = qaFlowKey(false);
+    if (!key) return;
+    Promise.resolve(ST.get(key)).then((d) => {
+      const pend = d && d[key];
+      if (!pend || typeof pend !== 'object') return;
+      if (Date.now() - (pend.ts || 0) > QA_PENDING_TTL_MS) { Promise.resolve(ST.remove(key)).catch(() => {}); return; }
+      _qaPending = _qaPending
+        ? Object.assign({}, pend, _qaPending, { answers: Object.assign({}, pend.answers, _qaPending.answers) })
+        : pend;
+      qaWatchForSuccess(20_000);
+    }).catch(() => {});
   })();
 
   LOG(`v5.0 loaded | ${CURRENT_ATS || HOST}`);

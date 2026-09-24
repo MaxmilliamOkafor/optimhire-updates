@@ -2156,7 +2156,10 @@
           '■ Automation: ON (click to disable)</button>' +
         '<div id="oh-qc-truth" title="OptimHire’s ‘X applied’ counter also counts SKIPS. This shows how many actually got a real submission confirmation." ' +
           'style="margin-top:7px;font-size:10.5px;color:#94a3b8;line-height:1.5;text-align:center">' +
-          'Real outcome: — submitted · — skipped</div>';
+          'Real outcome: — submitted · — skipped</div>' +
+        '<div id="oh-qc-qamem" title="Answers learned from applications that were confirmed as submitted. Click to review or forget them." ' +
+          'style="margin-top:3px;font-size:10.5px;color:#94a3b8;text-align:center;cursor:pointer">' +
+          '🧠 Remembered answers: —</div>';
       /* Always append to <body> as a fixed overlay — never insert as a
          sibling of #__plasmo (that risked disturbing React). */
       document.body.appendChild(card);
@@ -2172,6 +2175,11 @@
       var exportBtn = document.getElementById('oh-qc-export');
       if (exportBtn) exportBtn.addEventListener('click', function () {
         exportHarvestedJobs();
+      });
+      var qaLine = document.getElementById('oh-qc-qamem');
+      if (qaLine) qaLine.addEventListener('click', function () {
+        try { chrome.tabs.create({ url: chrome.runtime.getURL('tabs/jobQueue.html#answers'), active: true }); }
+        catch (_) {}
       });
 
       /* "Autofill this page" — run our fill engine on whatever tab the
@@ -2255,9 +2263,22 @@
       return card;
     }
 
+    /* Q&A-memory size. Kept in a variable (updated on change) so the 5s
+       refresh never has to read the whole memory object. */
+    var _qaCount = null;
+    function paintQaCount() {
+      var el = document.getElementById('oh-qc-qamem');
+      if (el && _qaCount != null) el.textContent = '🧠 Remembered answers: ' + _qaCount;
+    }
+    function setQaCount(mem) {
+      _qaCount = (mem && typeof mem === 'object') ? Object.keys(mem).length : 0;
+      paintQaCount();
+    }
+
     function refresh() {
       try {
         ensureCard();
+        paintQaCount();
         chrome.storage.local.get([KEY_QUEUE, KEY_ACTIVE], function (d) {
           var q = Array.isArray(d[KEY_QUEUE]) ? d[KEY_QUEUE] : [];
           var c = { pending: 0, applied: 0, failed: 0 };
@@ -2313,9 +2334,12 @@
       /* Native interval on purpose: refresh() creates the card and drives
          the master ON/OFF switch, so it must keep working while idle. */
       _spNativeSetInterval(refresh, 5000);
+      try { chrome.storage.local.get(['ohQaMemory'], function (d) { setQaCount(d && d.ohQaMemory); }); } catch (_) {}
       try {
         chrome.storage.onChanged.addListener(function (changes, area) {
-          if (area === 'local' && (changes[KEY_QUEUE] || changes[KEY_ACTIVE] || changes.ohHarvestedJobs)) refresh();
+          if (area !== 'local') return;
+          if (changes.ohQaMemory) setQaCount(changes.ohQaMemory.newValue);
+          if (changes[KEY_QUEUE] || changes[KEY_ACTIVE] || changes.ohHarvestedJobs) refresh();
         });
       } catch (_) {}
     }
