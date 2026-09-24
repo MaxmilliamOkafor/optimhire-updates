@@ -31,7 +31,9 @@
 
   var KEY         = 'ohDebugLog';
   var KEY_ENABLED = 'ohDebugEnabled';
+  var KEY_UNTIL   = 'ohDebugUntil';  // capture switches itself off at this time
   var KEY_PAUSED  = 'ohDebugPaused';
+  var IS_EXT_PAGE = location.protocol === 'chrome-extension:';
   var MAX         = 1500;          // ring-buffer cap (5000 made every flush rewrite a multi-MB array)
   var FLUSH_MS    = 2000;          // debounce writes (was 500ms — constant storage churn during automation)
   var MAX_STR     = 4000;          // truncate long strings
@@ -42,7 +44,10 @@
      writes batches to storage. That is real per-tab cost paid all day for
      a diagnostic that is only needed when investigating a problem. It is
      now opt-in — enable it from the Debug Log viewer when you need it. */
+  /* It also switches itself OFF after 30 minutes (ohDebugUntil, set by the
+     viewer): left on after a diagnosis it quietly taxed every tab for days. */
   var _enabled   = false;
+  var _until     = 0;
   var _paused    = false;
   var _buf       = [];
   var _flushTimer = null;
@@ -50,9 +55,14 @@
 
   /* Load initial enable/pause state from storage. */
   try {
-    ST.get([KEY_ENABLED, KEY_PAUSED], function (d) {
+    ST.get([KEY_ENABLED, KEY_UNTIL, KEY_PAUSED], function (d) {
       _enabled = !!(d && d[KEY_ENABLED] === true);   // opt-in
+      _until = (d && +d[KEY_UNTIL]) || 0;
       if (d && d[KEY_PAUSED]  === true)  _paused  = true;
+      /* An old "on" with no expiry, or an expired one: switch it off. */
+      if (_enabled && Date.now() >= _until && IS_EXT_PAGE) {
+        try { ST.set({ ohDebugEnabled: false }); } catch (_) {}
+      }
     });
   } catch (_) {}
 
@@ -62,6 +72,7 @@
     chrome.storage.onChanged.addListener(function (changes, area) {
       if (area !== 'local') return;
       if (changes[KEY_ENABLED]) _enabled = changes[KEY_ENABLED].newValue === true;
+      if (changes[KEY_UNTIL])   _until   = +changes[KEY_UNTIL].newValue || 0;
       if (changes[KEY_PAUSED])  _paused  = !!changes[KEY_PAUSED].newValue;
     });
   } catch (_) {}
@@ -120,8 +131,16 @@
   }
 
   /* Core log function — the API surface. */
+  function on() {
+    if (!_enabled || _paused) return false;
+    if (Date.now() < _until) return true;
+    _enabled = false;                                   // expired
+    if (IS_EXT_PAGE) { try { ST.set({ ohDebugEnabled: false }); } catch (_) {} }
+    return false;
+  }
+
   function log(category, message, data, level) {
-    if (!_enabled || _paused) return;
+    if (!on()) return;
     var entry = {
       ts:  Date.now(),
       seq: ++_seq,
@@ -187,7 +206,7 @@
       console[lvl] = function () {
         try {
           var first = arguments[0];
-          if (_enabled && !_paused && typeof first === 'string' && TAG_RE.test(first)) {
+          if (typeof first === 'string' && TAG_RE.test(first) && on()) {
             var args = [];
             for (var i = 0; i < arguments.length; i++) args.push(arguments[i]);
             log('console', args.length === 1 ? String(args[0]) : args.map(function (a) {
@@ -200,7 +219,10 @@
     } catch (_) {}
   });
 
-  /* ── Auto-capture: storage changes (skip our own keys to avoid loop) */
+  /* ── Auto-capture: storage changes (skip our own keys to avoid loop)
+     Extension pages only. Every open tab used to record every change, so
+     each change was logged once PER TAB and every tab rewrote the log —
+     the recorder's cost grew with the square of the number of tabs. */
   var SELF_KEYS = { ohDebugLog: 1, ohDebugEnabled: 1, ohDebugPaused: 1, ohTabOwner: 1 };
   /* High-frequency keys change every second during automation; logging
      each change made the logger itself a CPU/storage hog. Record at most
@@ -208,10 +230,10 @@
   var THROTTLED_KEYS = { autoApplyState: 1, appliedCount: 1, autoApplyStateUpdate: 1, pageQuestions: 1, ohHarvestedJobs: 1, complexFormData: 1 };
   var THROTTLE_MS = 5000;
   var _lastKeyLog = {};
-  try {
+  if (IS_EXT_PAGE) try {
     chrome.storage.onChanged.addListener(function (changes, area) {
       if (area !== 'local') return;
-      if (!_enabled || _paused) return;   // opt-in: zero work when off
+      if (!on()) return;                  // opt-in: zero work when off
       var keys = Object.keys(changes);
       for (var i = 0; i < keys.length; i++) {
         var k = keys[i];
@@ -232,7 +254,7 @@
     chrome.runtime.onMessage.addListener(function (msg, sender) {
       /* Bail BEFORE serializing: safe(msg) deep-walks the payload, and this
          listener runs in every tab for every message even with capture off. */
-      if (!_enabled || _paused) return;
+      if (!on()) return;
       try {
         var label = (msg && (msg.type || msg.action)) || '(message)';
         log('message', String(label), {
@@ -249,7 +271,10 @@
   window.OH_DEBUG = {
     log: log,
     flush: flush,
-    enable:  function () { _enabled = true;  try { ST.set({ ohDebugEnabled: true  }); } catch (_) {} },
+    enable:  function () {
+      _enabled = true; _until = Date.now() + 30 * 60 * 1000;
+      try { ST.set({ ohDebugEnabled: true, ohDebugUntil: _until }); } catch (_) {}
+    },
     disable: function () { flush(); _enabled = false; try { ST.set({ ohDebugEnabled: false }); } catch (_) {} },
     pause:   function () { _paused = true;   try { ST.set({ ohDebugPaused: true  }); } catch (_) {} },
     resume:  function () { _paused = false;  try { ST.set({ ohDebugPaused: false }); } catch (_) {} },

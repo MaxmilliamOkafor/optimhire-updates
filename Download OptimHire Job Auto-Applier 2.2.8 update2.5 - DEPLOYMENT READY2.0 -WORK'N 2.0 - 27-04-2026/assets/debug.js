@@ -163,8 +163,10 @@
 
   /* ── Capture / Pause toggles ─────────────────────────────────── */
   document.getElementById('toggleEnabled').addEventListener('change', function (e) {
-    ST.set({ ohDebugEnabled: e.target.checked });
-    toast(e.target.checked ? 'Capture ON — every event will be logged' : 'Capture OFF — new events ignored');
+    var on = e.target.checked;
+    /* Capture costs CPU in every tab, so it switches itself off again. */
+    ST.set({ ohDebugEnabled: on, ohDebugUntil: on ? Date.now() + 30 * 60 * 1000 : 0 });
+    toast(on ? 'Capture ON for 30 minutes — every event will be logged' : 'Capture OFF — new events ignored');
   });
   document.getElementById('togglePaused').addEventListener('change', function (e) {
     ST.set({ ohDebugPaused: e.target.checked });

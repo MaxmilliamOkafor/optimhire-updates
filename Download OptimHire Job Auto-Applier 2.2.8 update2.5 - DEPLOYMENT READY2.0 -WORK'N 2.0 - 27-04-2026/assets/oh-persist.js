@@ -37,7 +37,6 @@
     'ohAutomationDisabled',   // master ON/OFF switch
     'ohAutoTrigger',          // "Auto-fill on supported ATS pages" toggle
     'ohFreshBadges',          // freshness badges opt-in
-    'ohDebugEnabled',         // debug capture opt-in
     'ohAutoFilledUrls',       // already-filled URL de-dupe list
     'ohQaMemory'              // remembered answers
   ];

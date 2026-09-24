@@ -21,7 +21,7 @@
     "name": "OptimHire Job Auto-Applier",
     "description": "Autofill job applications in 1 click, track every job, and apply faster with your OptimHire Job Auto-Applier.",
     "background": {
-        "service_worker": "static/background/index.js"
+        "service_worker": "static/background/oh-bg.js"
     },
     "options_ui": {
         "page": "options.html",
