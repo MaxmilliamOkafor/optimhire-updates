@@ -28,7 +28,7 @@
   var _SpNativeMO = window.MutationObserver;
   var _spEngaged = false;
   var _spObservers = new Set();
-  var _SP_KEYS = ['autoApplyState', 'isAutoProcessStartJob', 'ohJobQueueActive',
+  var _SP_KEYS = ['autoApplyState', 'isAutoProcessStartJob', 'isManuallyStartJob', 'ohJobQueueActive',
                   'ohAutoApplyEngaged', 'ohAutoApplyEngagedTs', 'ohAutomationDisabled'];
   function _spRefreshEngaged() {
     try {
@@ -38,7 +38,7 @@
           if (!d || d.ohAutomationDisabled !== true) {
             var st = d && d.autoApplyState;
             on = !!(st && st.isActive === true) || !!(d && d.isAutoProcessStartJob) ||
-                 !!(d && d.ohJobQueueActive);
+                 !!(d && d.isManuallyStartJob) || !!(d && d.ohJobQueueActive);
             if (!on && d && d.ohAutoApplyEngaged) {
               var ts = d.ohAutoApplyEngagedTs || 0;
               on = !!ts && (Date.now() - ts < 10 * 60 * 1000);
@@ -78,6 +78,251 @@
       takeRecords: function () { return g.obs.takeRecords(); }
     };
   }
+
+  /* ════════════════════════════════════════════════════════════
+     ONE JOB TAB — the run never touches the tab you are using
+     ════════════════════════════════════════════════════════════
+     OptimHire decides "the job tab" by asking Chrome for whichever tab
+     is ACTIVE at that instant, in several places:
+       - Start / Resume from this panel sends the active tab's id as
+         activeTabId → the background navigates THAT tab to job-apply
+         and focuses it;
+       - "Back to Main" calls tabs.update({url}) with NO tab id, which
+         navigates whatever tab is in front;
+       - when copilotTabId is missing (it is removed every time a run
+         stops, completes or is auto-resumed) the background adopts the
+         active tab as the new job tab.
+     So anything that happened while the user was on another tab (their
+     LinkedIn, say) — including our own auto-resume and stall recovery —
+     dragged that tab into the run: "it uses OptimHire on both tabs".
+
+     Fix, without touching OptimHire's code:
+       - PIN the job tab (ohJobTab {id, ts}) when a run starts;
+       - in this panel, "active tab" queries resolve to the pinned tab and
+         tab updates without an id go to it; automation never steals
+         focus (active:true is dropped unless the user just clicked);
+       - keep OptimHire's copilotTabId on the pinned tab;
+       - ping the pinned tab so content scripts know which tab is the job
+         tab, and every other tab stands down (optimhire-patch.js).
+     The pin is released on Stop, when the master switch goes OFF, or
+     when the job tab is closed. */
+  var _realTabsQuery = chrome.tabs.query;
+  var _realTabsUpdate = chrome.tabs.update;
+  var _realSendMessage = chrome.runtime.sendMessage;
+  /* The tab the user is actually looking at — for OUR "Autofill this
+     page", which must target the visible tab, never the pinned one. */
+  function realActiveTabs(q, cb) { return _realTabsQuery.call(chrome.tabs, q, cb); }
+  var _jobTabPin = null;              // pinned job tab id
+  var _lastUserGestureTs = 0;
+  var releaseJobTab = function () {};  // replaced by the guard below
+  (function installJobTabGuard() {
+    var PIN_KEY = 'ohJobTab';
+    var GESTURE_MS = 2500;
+    var JOB_APPLY_URL = 'https://optimhire.com/d/job-apply';
+    var START_ACTIONS = { START_COPILOT_WEB: 1, OPEN_MANUAL_APPLICATION: 1,
+                          START_SINGLE_MANUAL_APPLICATION: 1, START_TEST_AUTO_APPLICATION: 1 };
+
+    ['pointerdown', 'keydown'].forEach(function (ev) {
+      document.addEventListener(ev, function (e) { if (e.isTrusted) _lastUserGestureTs = Date.now(); }, true);
+    });
+    function userJustActed() { return Date.now() - _lastUserGestureTs < GESTURE_MS; }
+    function note(msg) { try { if (typeof addLog === 'function') addLog(msg, ''); } catch (_) {} }
+
+    function writePin(id) {
+      _jobTabPin = id;
+      try { chrome.storage.local.set({ ohJobTab: id == null ? null : { id: id, ts: Date.now() } }); } catch (_) {}
+    }
+    function pin(id, why) {
+      if (id == null || id === _jobTabPin) return;
+      writePin(id);
+      note('Job tab pinned — the run stays in this one tab (' + why + ')');
+    }
+    releaseJobTab = function (why) {
+      if (_jobTabPin == null) return;
+      writePin(null);
+      note('Job tab released (' + why + ')');
+    };
+    function withLiveTab(id, cb) {
+      try {
+        chrome.tabs.get(id, function (t) {
+          var ok = !chrome.runtime.lastError && !!t;
+          cb(ok ? t : null);
+        });
+      } catch (_) { cb(null); }
+    }
+    /* Keep OptimHire's own notion of the job tab on the pinned tab. */
+    function syncCopilotTab() {
+      if (_jobTabPin == null) return;
+      chrome.storage.local.get(['copilotTabId', 'ohAutomationDisabled'], function (d) {
+        if (!d || d.ohAutomationDisabled === true || _jobTabPin == null) return;
+        if (d.copilotTabId === _jobTabPin) return;
+        var id = _jobTabPin;
+        withLiveTab(id, function (t) {
+          if (!t) { releaseJobTab('job tab closed'); return; }
+          chrome.storage.local.set({ copilotTabId: id });
+        });
+      });
+    }
+
+    /* Start state. */
+    chrome.storage.local.get([PIN_KEY, 'copilotTabId', 'isAutoProcessStartJob', 'isManuallyStartJob',
+                              'autoApplyState', 'ohAutomationDisabled'], function (d) {
+      d = d || {};
+      if (d.ohAutomationDisabled === true) return;
+      var p = d[PIN_KEY];
+      if (p && p.id != null) {
+        withLiveTab(p.id, function (t) { if (t) { _jobTabPin = p.id; syncCopilotTab(); } else writePin(null); });
+        return;
+      }
+      var live = d.isAutoProcessStartJob || d.isManuallyStartJob || (d.autoApplyState && d.autoApplyState.isActive);
+      if (live && d.copilotTabId != null) {
+        withLiveTab(d.copilotTabId, function (t) { if (t) pin(d.copilotTabId, 'running job tab'); });
+      }
+    });
+
+    chrome.storage.onChanged.addListener(function (c, area) {
+      if (area !== 'local') return;
+      if (c[PIN_KEY]) {
+        var nv = c[PIN_KEY].newValue;
+        _jobTabPin = nv && nv.id != null ? nv.id : null;
+      }
+      if (c.ohAutomationDisabled && c.ohAutomationDisabled.newValue === true) releaseJobTab('automation switched OFF');
+      if (c.copilotTabId) {
+        var id = c.copilotTabId.newValue;
+        if (id != null && _jobTabPin == null) {
+          withLiveTab(id, function (t) { if (t) pin(id, 'run started'); });
+        } else if (_jobTabPin != null && id !== _jobTabPin) {
+          /* OptimHire moved (or dropped) its job tab. Put it back — after a
+             beat for a removal, so a genuine stop can clear the pin first. */
+          setTimeout(syncCopilotTab, id == null ? 600 : 0);
+          if (id != null) note('Kept the run in its own tab (OptimHire tried to switch to another tab)');
+        }
+      }
+    });
+    try {
+      chrome.tabs.onRemoved.addListener(function (tabId) {
+        if (tabId !== _jobTabPin) return;
+        releaseJobTab('job tab closed');
+        /* OptimHire ends the run when its tab closes. Disengage too, so
+           auto-resume can't restart it in whatever tab is in front. */
+        try { chrome.storage.local.set({ ohAutoApplyEngaged: false, ohAutoApplyEngagedTs: 0 }); } catch (_) {}
+      });
+    } catch (_) {}
+
+    /* "Active tab" = the pinned job tab, unless the user just clicked. */
+    chrome.tabs.query = function (q, cb) {
+      try {
+        if (_jobTabPin != null && q && q.active === true && (q.currentWindow || q.lastFocusedWindow) &&
+            !q.url && !userJustActed()) {
+          var id = _jobTabPin;
+          var p = new Promise(function (res) {
+            withLiveTab(id, function (t) {
+              if (t) { res([t]); return; }
+              Promise.resolve(_realTabsQuery.call(chrome.tabs, q)).then(res, function () { res([]); });
+            });
+          });
+          if (typeof cb === 'function') { p.then(cb); return undefined; }
+          return p;
+        }
+      } catch (_) {}
+      return _realTabsQuery.apply(chrome.tabs, arguments);
+    };
+
+    /* No focus stealing by automation; id-less updates go to the job tab. */
+    chrome.tabs.update = function () {
+      var args = Array.prototype.slice.call(arguments);
+      try {
+        var hasId = typeof args[0] === 'number';
+        var props = hasId ? args[1] : args[0];
+        if (props && typeof props === 'object' && !userJustActed()) {
+          if (props.active === true) {
+            props = Object.assign({}, props);
+            delete props.active;
+          }
+          if (!hasId && _jobTabPin != null) args = [_jobTabPin, props].concat(args.slice(1));
+          else if (hasId) args[1] = props;
+          else args[0] = props;
+        }
+      } catch (_) {}
+      return _realTabsUpdate.apply(chrome.tabs, args);
+    };
+
+    /* Start messages: pin first, keep OptimHire on the pinned tab, and
+       start the web run in the job tab WITHOUT pulling it to the front. */
+    function whenPinned(msg) {
+      return new Promise(function (res) {
+        if (_jobTabPin != null) {
+          var id = _jobTabPin;
+          withLiveTab(id, function (t) {
+            if (!t) { releaseJobTab('job tab closed'); res(null); return; }
+            chrome.storage.local.set({ copilotTabId: id }, function () { res(id); });
+          });
+          return;
+        }
+        var cand = msg && typeof msg.activeTabId === 'number' ? msg.activeTabId : null;
+        var finish = function (id) {
+          if (id == null) { res(null); return; }
+          pin(id, 'run started');
+          chrome.storage.local.set({ copilotTabId: id }, function () { res(id); });
+        };
+        if (cand != null) { finish(cand); return; }
+        Promise.resolve(_realTabsQuery.call(chrome.tabs, { active: true, currentWindow: true }))
+          .then(function (tabs) { finish(tabs && tabs[0] && tabs[0].id != null ? tabs[0].id : null); },
+                function () { res(null); });
+      });
+    }
+    chrome.runtime.sendMessage = function () {
+      var args = Array.prototype.slice.call(arguments);
+      var msg = args[0];
+      if (!msg || typeof msg !== 'object' || !START_ACTIONS[msg.action]) {
+        return _realSendMessage.apply(chrome.runtime, args);
+      }
+      var cb = typeof args[args.length - 1] === 'function' ? args[args.length - 1] : null;
+      var gesture = userJustActed();
+      var p = whenPinned(msg).then(function (id) {
+        if (id != null && typeof msg.activeTabId === 'number') msg.activeTabId = id;
+        if (msg.action === 'START_COPILOT_WEB' && id != null && !gesture) {
+          /* The background would do tabs.update(id, {url, active:true}).
+             Same navigation, minus the focus grab. */
+          return Promise.resolve(_realTabsUpdate.call(chrome.tabs, id, { url: JOB_APPLY_URL }))
+            .then(function () { return { success: true }; }, function () { return { success: false }; });
+        }
+        return _realSendMessage.call(chrome.runtime, msg);
+      });
+      if (cb) { p.then(function (r) { try { cb(r); } catch (_) {} }, function () { try { cb(); } catch (_) {} }); return undefined; }
+      return p;
+    };
+
+    /* Tell the job tab it is the job tab (content scripts in every other
+       tab stand down), refresh the pin's heartbeat, answer "am I it?". */
+    var _lastBeat = 0, _lastHeal = 0;
+    _spNativeSetInterval(function () {
+      /* Self-heal: panel opened mid-run, or the start went unseen — adopt
+         OptimHire's running job tab. */
+      if (_jobTabPin == null) {
+        if (Date.now() - _lastHeal < 6000) return;
+        _lastHeal = Date.now();
+        chrome.storage.local.get(['copilotTabId', 'isAutoProcessStartJob', 'isManuallyStartJob',
+                                  'autoApplyState', 'ohAutomationDisabled'], function (d) {
+          d = d || {};
+          if (_jobTabPin != null || d.ohAutomationDisabled === true || d.copilotTabId == null) return;
+          if (!(d.isAutoProcessStartJob || d.isManuallyStartJob || (d.autoApplyState && d.autoApplyState.isActive))) return;
+          var id = d.copilotTabId;
+          withLiveTab(id, function (t) { if (t) pin(id, 'running job tab'); });
+        });
+        return;
+      }
+      try { Promise.resolve(chrome.tabs.sendMessage(_jobTabPin, { type: 'OH_JOB_TAB_PING' })).catch(function () {}); } catch (_) {}
+      if (Date.now() - _lastBeat > 20000) {
+        _lastBeat = Date.now();
+        try { chrome.storage.local.set({ ohJobTab: { id: _jobTabPin, ts: _lastBeat } }); } catch (_) {}
+      }
+    }, 3000);
+    chrome.runtime.onMessage.addListener(function (msg, sender, sendResponse) {
+      if (!msg || msg.type !== 'OH_JOB_TAB_WHO') return;
+      sendResponse({ job: !!(sender && sender.tab && _jobTabPin != null && sender.tab.id === _jobTabPin) });
+    });
+  })();
 
   /* ════════════════════════════════════════════════════════════
      ZERO LIMITATION — DOM hide + safe storage WRITE-wrap
@@ -1223,12 +1468,17 @@
    * ohAutomationDisabled vetoes everything.
    * ────────────────────────────────────────────────────────────────── */
   var OH_ENGAGE_TTL_MS = 10 * 60 * 1000;
-  var OH_AUTOMATION_KEYS = ['autoApplyState', 'isAutoProcessStartJob', 'ohJobQueueActive',
+  var OH_AUTOMATION_KEYS = ['autoApplyState', 'isAutoProcessStartJob', 'isManuallyStartJob', 'ohJobQueueActive',
                             'ohAutoApplyEngaged', 'ohAutoApplyEngagedTs', 'ohAutomationDisabled'];
+  /* isManuallyStartJob = OptimHire's one-job-at-a-time mode ("Start
+     Manually Applying"). It is a real run too: it loads job after job and
+     only stops at "Review and submit the form" waiting for a click — which
+     we now make for it. */
   function ohLiveSession(d) {
     if (!d) return false;
     var st = d.autoApplyState;
-    return !!(st && st.isActive === true) || !!d.isAutoProcessStartJob || !!d.ohJobQueueActive;
+    return !!(st && st.isActive === true) || !!d.isAutoProcessStartJob ||
+           !!d.isManuallyStartJob || !!d.ohJobQueueActive;
   }
   function mayAutomateSP(d) {
     if (!d) return false;
@@ -1279,7 +1529,7 @@
    *     cooldown, so a re-render can't produce a burst of clicks.
    * ─────────────────────────────────────────────────────────────────── */
   (function installAutoApplyClicker() {
-    var COOLDOWN_MS = 4000;
+    var COOLDOWN_MS = 2000;         // was 4s — one press per job is still enforced below
     var NOKEY_COOLDOWN_MS = 20000;  // much slower when we can't identify the job
     var MAX_PER_MIN = 6;            // hard ceiling on presses per minute
     var NO_KEY = ' nokey';
@@ -1418,7 +1668,7 @@
    * a fresh batch. Rate-limited so it can never loop.
    * ─────────────────────────────────────────────────────────────────── */
   (function installLoadingStallWatchdog() {
-    var STALL_MS = 45_000;        // spinner must persist this long
+    var STALL_MS = 30_000;        // spinner must persist this long (was 45s)
     var COOLDOWN_MS = 60_000;     // min gap between recovery attempts
     var LOADING_RE = /loading your job|loading job|fetching your job/i;
     var _since = 0, _lastRecoveryTs = 0, _escalated = false;
@@ -1495,7 +1745,7 @@
    * ─────────────────────────────────────────────────────────────────── */
   (function installAutoApplyResume() {
     var KEY_ENGAGED = 'ohAutoApplyEngaged';
-    var COOLDOWN_MS = 60_000;
+    var COOLDOWN_MS = 20_000;       // was 60s — resume a stopped run faster
     var _lastResumeTs = 0;
     var _engaged = false;
 
@@ -1531,7 +1781,10 @@
         var b = e.target && (e.target.closest && e.target.closest('button,[role="button"]'));
         if (!b) return;
         if (isStartButton(b)) setEngaged(true);   // user started → stay engaged
-        else if (isStopButton(b)) setEngaged(false); // user stopped → disengage
+        else if (isStopButton(b)) {                  // user stopped → disengage
+          setEngaged(false);
+          releaseJobTab('stopped');
+        }
       } catch (_) {}
     }, true);
 
@@ -1550,7 +1803,7 @@
     function tick() {
       try {
         chrome.storage.local.get(
-          ['isAutoProcessStartJob', 'autoApplyStateUpdate', 'ohJobQueueActive', 'ohAutomationDisabled'],
+          ['isAutoProcessStartJob', 'isManuallyStartJob', 'autoApplyStateUpdate', 'ohJobQueueActive', 'ohAutomationDisabled'],
           function (d) {
             try {
               if (d.ohAutomationDisabled === true) return;   // master switch OFF
@@ -1560,7 +1813,7 @@
                  job tab in a loop and stopped the queue's autofill from
                  ever firing. The queue owns the tabs while it's active. */
               if (d.ohJobQueueActive) return;
-              var running = !!d.isAutoProcessStartJob ||
+              var running = !!d.isAutoProcessStartJob || !!d.isManuallyStartJob ||
                             (d.autoApplyStateUpdate && d.autoApplyStateUpdate.isRunning);
               if (running) { setEngaged(true); return; } // running → engaged, let it work
               if (!_engaged) return;                     // never started / user stopped
@@ -1578,6 +1831,40 @@
       } catch (_) {}
     }
     setInterval(tick, 5000);
+  })();
+
+  /* ── "Review and submit the form" → the job tab submits it ───────────
+   * OptimHire fills the form, then parks on "Review and submit the form"
+   * waiting for a human to press the site's submit button (in its
+   * one-job-at-a-time mode this happens on EVERY job, and on job boards
+   * like Reed the application is still behind an "Apply now" button).
+   * That state exists only here in the panel — the job page cannot see
+   * it — so the moment it appears we tell the job tab, and only the job
+   * tab, to finish the application (optimhire-patch.js
+   * installReviewAndSubmit). Event-driven: no waiting on a poll. */
+  (function installReviewSubmitRelay() {
+    var RE = /review and submit the form/i;
+    var _lastSend = 0;
+    function check() {
+      try {
+        if (Date.now() - _lastSend < 1500) return;
+        var root = document.getElementById('__plasmo') || document.body;
+        if (!root || !RE.test(root.innerText || '')) return;
+        chrome.storage.local.get(OH_AUTOMATION_KEYS.concat(['copilotTabId']), function (d) {
+          try {
+            if (!mayAutomateSP(d)) return;
+            var tab = _jobTabPin != null ? _jobTabPin : d.copilotTabId;
+            if (tab == null) return;
+            _lastSend = Date.now();
+            Promise.resolve(chrome.tabs.sendMessage(tab, { type: 'OH_REVIEW_AND_SUBMIT' })).catch(function () {});
+          } catch (_) {}
+        });
+      } catch (_) {}
+    }
+    var mo = new MutationObserver(check);
+    function start() { mo.observe(document.body, { childList: true, subtree: true, characterData: true }); }
+    if (document.body) start(); else document.addEventListener('DOMContentLoaded', start);
+    setInterval(check, 3000);
   })();
 
   /* (A second, cooldown-less missing-details handler and its helpers used
@@ -2187,7 +2474,8 @@
          2.8.2's "Autofill Application", which sits behind an unlock modal. */
       function autofillActiveTab(withSubmit) {
         try {
-          chrome.tabs.query({ active: true, currentWindow: true }, function (tabs) {
+          /* The tab the user is LOOKING at — not the pinned job tab. */
+          realActiveTabs({ active: true, currentWindow: true }, function (tabs) {
             var t = tabs && tabs[0];
             if (!t || t.id == null) { addLog('Autofill this page: no active tab', 'error'); return; }
             if (/^chrome(-extension)?:\/\//i.test(t.url || '')) {
