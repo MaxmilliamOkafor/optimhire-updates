@@ -1376,6 +1376,34 @@
     setInterval(tick, 2500);
   })();
 
+  /* ── Paylocity: ask the Queue Manager to bring this tab forward ───────
+   * OptimHire 2.9.0's autofill waits `while (document.hidden)` on
+   * Paylocity, so a Paylocity queue job stalls in a background tab. The
+   * Queue Manager already activates tabs whose URL is Paylocity; this
+   * covers jobs that only REDIRECT to Paylocity after opening. The manager
+   * checks that the sender is a tab it opened, so a Paylocity page the user
+   * is simply browsing can never take the front.
+   * ────────────────────────────────────────────────────────────────── */
+  (function installPaylocityFocusRequest() {
+    if (window.top !== window.self) return;
+    if (!/(^|\.)paylocity\.com$/i.test(location.hostname)) return;   // zero cost on other sites
+    let _lastAsk = 0;
+    async function ask(reason) {
+      try {
+        if (!document.hidden) return;
+        if (Date.now() - _lastAsk < 5000) return;
+        const d = await ST.get(['ohJobQueueActive', 'ohAutomationDisabled']);
+        if (!d || !d.ohJobQueueActive || d.ohAutomationDisabled === true) return;   // CSV queue runs only
+        _lastAsk = Date.now();
+        chrome.runtime.sendMessage({ type: 'OH_QUEUE_REQUEST_FOCUS', reason }).catch(() => {});
+        LOG(`Paylocity: tab hidden during queue run — asked Queue Manager to focus it (${reason})`);
+      } catch (_) {}
+    }
+    document.addEventListener('visibilitychange', () => ask('visibilitychange'));
+    setInterval(() => ask('poll'), 3000);
+    setTimeout(() => ask('load'), 1500);
+  })();
+
   /* ── T16: Hide referral / upgrade / credit-count UI ───────── */
   (function hideReferral() {
     /* SCOPE GUARD: this only ever needs to hide OptimHire's own referral

@@ -619,6 +619,8 @@
         if (tab && tab.id != null) {
           _tabMap.set(jobId, tab.id);
           opened = true;
+          /* Paylocity stalls while hidden (2.9.0) — bring it to the front. */
+          if (isPaylocityUrl(jobUrl)) await focusJobTab(tab.id, 'paylocity-url');
         } else {
           /* Tab creation failed — release the reservation and mark the job
              failed so the loop cannot retry it indefinitely. */
@@ -636,12 +638,100 @@
     } catch (_) {} finally { _orchestrating = false; }
   }
 
+  /* ── Paylocity auto-focus ────────────────────────────────────────────
+   * OptimHire 2.9.0's autofill does `while (document.hidden) sleep(1s)` for
+   * Paylocity — an unbounded wait. Queue tabs open in the background, so a
+   * Paylocity job sat paused until the user clicked its tab, then hit the
+   * job timeout. Such tabs are now brought to the front:
+   *   - a Paylocity URL is activated as soon as its tab is created;
+   *   - a job that only REDIRECTS to Paylocity asks from the content script
+   *     (OH_QUEUE_REQUEST_FOCUS), honoured only for tabs this queue opened.
+   * Only the tab is activated inside its Chrome window — the window is never
+   * raised, un-minimised or given OS focus. One Paylocity tab holds the front
+   * at a time, and when it finishes the user is put back on the tab they
+   * were on, unless they had already moved away themselves.
+   * ────────────────────────────────────────────────────────────────── */
+  const PAYLOCITY_RE = /(^|\.)paylocity\.com$/i;
+  const FOCUS_COOLDOWN_MS = 15000;   // never re-take the front more often than this
+  const FOCUS_MAX_PER_JOB = 4;       // then stop fighting the user for that job
+  let _focusedJobTab = null;         // job tab currently holding the front
+  let _focusReturn = null;           // { tabId, windowId } the user was on before
+  let _pendingRestore = false;
+  const _focusLog = new Map();       // tabId -> { last, count }
+
+  function isPaylocityUrl(u) {
+    try { return PAYLOCITY_RE.test(new URL(u).hostname); } catch (_) { return false; }
+  }
+  function isOurJobTab(tabId) {
+    for (const [, tid] of _tabMap) if (tid === tabId) return true;
+    return false;
+  }
+  function tabGet(tabId) {
+    return new Promise(res => {
+      try { chrome.tabs.get(tabId, t => res(chrome.runtime.lastError ? null : t)); }
+      catch (_) { res(null); }
+    });
+  }
+  function activeTabIn(windowId) {
+    return new Promise(res => {
+      try { chrome.tabs.query({ active: true, windowId }, ts => res((ts && ts[0]) || null)); }
+      catch (_) { res(null); }
+    });
+  }
+
+  async function focusJobTab(tabId, reason) {
+    if (tabId == null || tabId === -1 || !isOurJobTab(tabId)) return false;
+    /* One at a time: while another open job tab holds the front, this one
+       waits its turn (Paylocity is paused anyway until it is visible). */
+    if (_focusedJobTab != null && _focusedJobTab !== tabId && isOurJobTab(_focusedJobTab)) return false;
+    const now = Date.now();
+    const rec = _focusLog.get(tabId) || { last: 0, count: 0 };
+    if (now - rec.last < FOCUS_COOLDOWN_MS || rec.count >= FOCUS_MAX_PER_JOB) return false;
+    const t = await tabGet(tabId);
+    if (!t) return false;
+    if (t.active) { _focusedJobTab = tabId; return true; }   // already in front
+    /* Remember where the user was — unless that is one of our job tabs, or
+       an earlier Paylocity job already recorded the real starting point. */
+    if (!_focusReturn) {
+      const cur = await activeTabIn(t.windowId);
+      if (cur && cur.id !== tabId && !isOurJobTab(cur.id)) {
+        _focusReturn = { tabId: cur.id, windowId: cur.windowId };
+      }
+    }
+    rec.last = now; rec.count++;
+    _focusLog.set(tabId, rec);
+    _focusedJobTab = tabId;
+    try { chrome.tabs.update(tabId, { active: true }, () => void chrome.runtime.lastError); } catch (_) {}
+    dbg('focused job tab', { tabId, reason, attempt: rec.count });
+    return true;
+  }
+
+  /* Hand the front back once no Paylocity job needs it. */
+  async function maybeRestoreFocus() {
+    if (!_pendingRestore) return;
+    if (_focusedJobTab != null && isOurJobTab(_focusedJobTab)) return;   // the next job took over
+    _pendingRestore = false;
+    const back = _focusReturn;
+    _focusReturn = null;
+    if (!back || !(await tabGet(back.tabId))) return;
+    try { chrome.tabs.update(back.tabId, { active: true }, () => void chrome.runtime.lastError); } catch (_) {}
+  }
+
   /* Close the tab we opened for a finished job. */
-  function closeJobTab(jobId) {
+  async function closeJobTab(jobId) {
     const tabId = _tabMap.get(jobId);
     if (tabId == null) return;
     _tabMap.delete(jobId);
+    _focusLog.delete(tabId);
     if (tabId === -1) return;   // reservation only — no real tab yet
+    if (tabId === _focusedJobTab) {
+      /* Only return the user to their tab if they were still looking at the
+         job; if they had moved away on their own, leave them there. */
+      const t = await tabGet(tabId);
+      _pendingRestore = !!(t && t.active);
+      if (!_pendingRestore) _focusReturn = null;
+      _focusedJobTab = null;
+    }
     try { chrome.tabs.remove(tabId, () => void chrome.runtime.lastError); } catch (_) {}
   }
 
@@ -651,7 +741,7 @@
     if (!req || !req.ts || req.ts === _lastAdvanceTs) return;
     _lastAdvanceTs = req.ts;
     dbg('advance request', { jobId: req.jobId, status: req.status });
-    closeJobTab(req.jobId);
+    await closeJobTab(req.jobId);
     /* Clear the request so the content-script self-navigate fallback
        knows the manager handled it. */
     await new Promise(res => ST.set({ [KEY_ADVANCE_REQ]: null }, res));
@@ -661,6 +751,9 @@
     } else if (runningWithTab() === 0) {
       await finishQueue();
     }
+    /* If the finished job held the front and the next one does not need
+       it, put the user back where they were. */
+    await maybeRestoreFocus();
   }
 
   async function finishQueue() {
@@ -704,6 +797,11 @@
 
   async function stopQueue() {
     const openTabs = _tabMap.size;
+    let wasFront = false;
+    if (_focusedJobTab != null) {
+      const ft = await tabGet(_focusedJobTab);
+      wasFront = !!(ft && ft.active);
+    }
     await new Promise(res => ST.set({
       [KEY_ACTIVE]: false, [KEY_CURRENT]: null, [KEY_ADVANCE_REQ]: null,
     }, res));
@@ -713,6 +811,11 @@
       try { chrome.tabs.remove(tabId, () => void chrome.runtime.lastError); } catch (_) {}
     }
     _tabMap.clear();
+    _focusLog.clear();
+    _focusedJobTab = null;
+    _pendingRestore = wasFront;
+    if (!wasFront) _focusReturn = null;
+    await maybeRestoreFocus();
     for (const j of queue) if (j.status === 'running') j.status = 'pending';
     await saveQueue();
     render();
@@ -730,6 +833,12 @@
         for (const [jid, tid] of _tabMap) if (tid === tabId) { jobId = jid; break; }
         if (jobId == null) return;
         _tabMap.delete(jobId);
+        _focusLog.delete(tabId);
+        if (tabId === _focusedJobTab) {   // user closed it — they chose; don't restore
+          _focusedJobTab = null;
+          _focusReturn = null;
+          _pendingRestore = false;
+        }
         const d = await new Promise(r => ST.get([KEY_ACTIVE], r));
         if (!d[KEY_ACTIVE]) return; // queue stopped; ignore
         const j = queue.find(x => x.id === jobId);
@@ -739,6 +848,23 @@
       });
     } catch (_) {}
   }
+  /* A queue job that REDIRECTED to Paylocity asks to be brought forward.
+     Honoured only for tabs this queue opened, and only by the orchestrating
+     manager instance, so no other page can use it to steal focus. */
+  function wireFocusRequests() {
+    try {
+      chrome.runtime.onMessage.addListener((msg, sender) => {
+        if (!msg || msg.type !== 'OH_QUEUE_REQUEST_FOCUS') return;
+        const tabId = sender && sender.tab && sender.tab.id;
+        if (tabId == null || !isOurJobTab(tabId)) return;
+        (async () => {
+          if (!(await claimOwnership())) return;
+          await focusJobTab(tabId, msg.reason || 'content-request');
+        })();
+      });
+    } catch (_) {}
+  }
+
   function setRunnerIndicator(on) {
     const el = document.getElementById('runnerIndicator');
     const start = document.getElementById('btnStart');
@@ -897,6 +1023,7 @@
     });
 
     wireTabClose();
+    wireFocusRequests();
   }
 
   load()
