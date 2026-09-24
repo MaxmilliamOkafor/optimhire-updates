@@ -159,6 +159,9 @@
             <option value="5">5</option>
           </select>
         </label>
+        <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted)" title="Apply to jobs on company ATS sites (Greenhouse, Lever, Workday…) first, then company career sites, then job boards, and Reed last. Also applies to OptimHire's own auto-apply queue.">
+          <input type="checkbox" id="preferAts" checked> ATS first, Reed last
+        </label>
         <button id="btnStart" class="btn-primary">▶ Start Queue</button>
         <button id="btnStop" class="btn-danger" disabled>■ Stop</button>
         <button id="btnQaMemory" title="Answers learned from applications that were confirmed as submitted — review or forget them">🧠 Remembered answers <span id="qaMemCount"></span></button>

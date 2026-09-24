@@ -180,14 +180,56 @@
    * ────────────────────────────────────────────────────────────────── */
   const ENGAGE_TTL_MS = 10 * 60_000;   // sticky engagement lapses after 10 idle minutes
 
+  /* ── One job tab ─────────────────────────────────────────────────────
+   * The side panel pins the tab a native run works in (ohJobTab {id, ts},
+   * heartbeat every 20s) and pings that tab every 3s. Content scripts
+   * cannot read their own tab id, so "am I the job tab?" = "was I pinged
+   * recently?". While a fresh pin exists, every OTHER tab stands down
+   * completely — no autofill, no clicks, no submits, idle governor — so
+   * the run can never spill into the tab the user is working in.
+   * Without a fresh pin (panel closed) the old URL-based checks apply. */
+  let _jobTabPingTs = 0;
+  const JOB_TAB_PING_FRESH_MS = 12_000;
+  const JOB_TAB_PIN_FRESH_MS = 45_000;
+  function isPingedJobTab() { return Date.now() - _jobTabPingTs < JOB_TAB_PING_FRESH_MS; }
+  function jobTabPinned(d) {
+    const j = d && d.ohJobTab;
+    return !!(j && j.id != null && Date.now() - (j.ts || 0) < JOB_TAB_PIN_FRESH_MS);
+  }
+  function notTheJobTab(d) {
+    if (!jobTabPinned(d) || d.ohJobQueueActive) return false;   // CSV queue tabs follow their own rules
+    if (Date.now() - _manualTriggerTs < 30_000) return false;  // the user asked for a fill here
+    return !isPingedJobTab();
+  }
+  function markJobTab() {
+    const wasJobTab = isPingedJobTab();
+    _jobTabPingTs = Date.now();
+    if (!wasJobTab) setTimeout(_refreshEngaged, 0);   // wake the governor now, not in 5s
+  }
+  try {
+    chrome.runtime.onMessage.addListener((msg) => {
+      if (msg && msg.type === 'OH_JOB_TAB_PING') markJobTab();
+    });
+    /* A freshly loaded job page asks straight away instead of waiting for
+       the next ping. */
+    ST.get('ohJobTab').then((d) => {
+      if (!jobTabPinned(d)) return;
+      chrome.runtime.sendMessage({ type: 'OH_JOB_TAB_WHO' })
+        .then((r) => { if (r && r.job) markJobTab(); })
+        .catch(() => {});
+    }).catch(() => {});
+  } catch (_) {}
+
   /* May we take ACTION (click Apply, submit a form, skip a job)?
      `d` is a storage snapshot containing the keys below. */
   function mayAutomate(d) {
     if (!d) return false;
     if (d.ohAutomationDisabled === true) return false;          // master OFF
+    if (notTheJobTab(d)) return false;                          // another tab is the job tab
     const st = d.autoApplyState;
     if (st && st.isActive === true) return true;                // live session
     if (d.isAutoProcessStartJob) return true;                   // live session
+    if (d.isManuallyStartJob) return true;                      // live one-job-at-a-time session
     if (d.ohJobQueueActive) return true;                        // our CSV queue
     if (Date.now() - _manualTriggerTs < 30_000) return true;    // user just acted here
     if (d.ohAutoApplyEngaged) {                                 // sticky — only while fresh
@@ -196,8 +238,8 @@
     }
     return false;
   }
-  const AUTOMATION_KEYS = ['autoApplyState', 'isAutoProcessStartJob', 'ohJobQueueActive',
-                           'ohAutoApplyEngaged', 'ohAutoApplyEngagedTs', 'ohAutomationDisabled'];
+  const AUTOMATION_KEYS = ['autoApplyState', 'isAutoProcessStartJob', 'isManuallyStartJob', 'ohJobQueueActive',
+                           'ohAutoApplyEngaged', 'ohAutoApplyEngagedTs', 'ohAutomationDisabled', 'ohJobTab'];
 
   /* ── Idle governor (CRITICAL for CPU) ────────────────────────────────
    * This file installs ~22 polling loops and ~14 subtree
@@ -357,6 +399,26 @@
     } catch (_) { return false; }
   }
 
+  /* Site chrome — header / nav / footer, and search or newsletter forms
+     (Reed's "What / Where" bar, say) — is never part of an application. */
+  function isPageChromeField(el) {
+    try {
+      if (!el || !el.closest) return false;
+      if ((el.getAttribute('type') || '').toLowerCase() === 'search') return true;
+      if (el.closest('header,nav,footer,[role="search"],[role="navigation"],[role="banner"],[role="contentinfo"]')) return true;
+      const f = el.form || el.closest('form');
+      if (f) {
+        if (f.getAttribute('role') === 'search' || f.querySelector('input[type=search]')) return true;
+        if (/search/i.test((f.id || '') + ' ' + (typeof f.className === 'string' ? f.className : '') +
+                           ' ' + (f.getAttribute('action') || ''))) return true;
+        for (const b of f.querySelectorAll('button,input[type=submit]')) {
+          if (/\b(search|find jobs|subscribe|sign up)\b/i.test((b.innerText || b.value || '') + '')) return true;
+        }
+      }
+    } catch (_) {}
+    return false;
+  }
+
   /* ── optimHireBusy: is OptimHire's own autofill actively working? ──
    * Shared by the stuck watchdog and the missing-fields skip so neither
    * skips a job while OptimHire is mid-flow (loading details, analysing,
@@ -482,7 +544,7 @@
          terminal-submit (T43) bails on its very first line when
          automation is inactive, the run sat on "Review and submit the
          form" waiting for a human click. */
-      const active = !!csvActiveJobId || isRunning || mayAutomate(d);
+      const active = (!!csvActiveJobId || isRunning || mayAutomate(d)) && !notTheJobTab(d);
       _automationCache = { active, ts: Date.now() };
       return active;
     } catch (_) {
@@ -516,11 +578,30 @@
     } catch (_) { return false; }
   }
 
+  /* Stricter match for the CURRENT job's URL `jobUrl`: same host, and
+     this page's path equals or extends the job's path (…/jobs/123 →
+     …/jobs/123/apply), or lacks only a trailing apply step. The loose
+     host + first-segment match made any linkedin.com/jobs/… page the user
+     was browsing count as "the job". */
+  function _urlsMatchJob(here, jobUrl) {
+    try {
+      const ua = new URL(here), ub = new URL(jobUrl);
+      if (ua.hostname.toLowerCase().replace(/^www\./, '') !== ub.hostname.toLowerCase().replace(/^www\./, '')) return false;
+      const pa = ua.pathname.split('/').filter(Boolean), pb = ub.pathname.split('/').filter(Boolean);
+      for (let i = 0; i < Math.min(pa.length, pb.length); i++) if (pa[i] !== pb[i]) return false;
+      if (pa.length >= pb.length) return true;
+      return pb.length - pa.length === 1 && pa.length > 0 &&
+             /^(apply|application|apply-now|start|submit)$/i.test(pb[pb.length - 1]);
+    } catch (_) { return false; }
+  }
+
   async function isActiveJobTab() {
     try {
       if (window.top !== window.self) return false;   // never from sub-frames
       if (Date.now() - _manualTriggerTs < 30_000) return true;  // user acted here
-      const d = await ST.get(AUTOMATION_KEYS.concat(['ohJobQueue']));
+      if (isPingedJobTab()) return true;               // the side panel's pinned job tab
+      const d = await ST.get(AUTOMATION_KEYS.concat(['ohJobQueue', 'manualApplicationDetail']));
+      if (notTheJobTab(d)) return false;               // another tab is pinned
       const here = location.href;
       /* optimhire.com's own copilot page is the automation's CONTROL
          SURFACE, not a job page, so its URL never matches apply_now_url.
@@ -532,7 +613,11 @@
       if (/(^|\.)optimhire\.com$/i.test(location.hostname) && mayAutomate(d)) return true;
       const ad = d.autoApplyState && d.autoApplyState.applicationDetails;
       const applyUrl = ad && ad.source && ad.source.apply_now_url;
-      if (applyUrl && _urlsMatchLoose(here, applyUrl)) return true;
+      if (applyUrl && _urlsMatchJob(here, applyUrl)) return true;
+      /* One-job-at-a-time mode keeps its job here instead. */
+      const md = d.manualApplicationDetail;
+      const manualUrl = md && md.source && md.source.apply_now_url;
+      if (d.isManuallyStartJob && manualUrl && _urlsMatchJob(here, manualUrl)) return true;
       if (d.ohJobQueueActive && Array.isArray(d.ohJobQueue)) {
         if (d.ohJobQueue.some(j => j && j.status === 'running' &&
                                    j.url && _urlsMatchLoose(here, j.url))) return true;
@@ -544,7 +629,7 @@
   /* The ONLY way this file may ask the queue to advance. Silently drops
      the request unless this tab is the active job. */
   async function requestSkipCurrent(reason) {
-    if (!(await isActiveJobTab())) {
+    if (window.top !== window.self || !(await isActiveJobTab())) {
       LOG(`skipCurrent suppressed (not the active job tab): ${reason || ''}`);
       return false;
     }
@@ -1022,7 +1107,7 @@
     if (!/(^|\.)optimhire\.com$/i.test(location.hostname)) return;
     if (window.top !== window.self) return;
 
-    const COOLDOWN_MS = 4000;
+    const COOLDOWN_MS = 2500;        // was 4s — still once per job (see jobKey)
     let _lastClickTs = 0;
     let _lastKey = '';
 
@@ -1060,10 +1145,17 @@
         /* Only while the user has actually engaged auto-apply (or a
            session/queue is running) — never while they are just browsing
            jobs by hand. */
-        const d = await ST.get(AUTOMATION_KEYS);
+        const d = await ST.get(AUTOMATION_KEYS.concat(['copilotTabId']));
         if (!mayAutomate(d)) return;
-        /* Only one tab may drive applications. */
-        if (!(await isAutomationOwnerTab())) return;
+        /* Only one tab may drive applications: the pinned job tab, or —
+           when no side panel is pinning — the elected owner. */
+        if (!isPingedJobTab() && !(await isAutomationOwnerTab())) return;
+        /* OptimHire drops copilotTabId whenever a run stops or completes;
+           pressing Apply then makes it adopt whatever tab is in FRONT as
+           the job tab (the user's LinkedIn, say). Put the pin back first. */
+        if (jobTabPinned(d) && d.copilotTabId == null) {
+          await ST.set({ copilotTabId: d.ohJobTab.id });
+        }
         if (_submitAttempted && Date.now() - _submitAttemptTs < 30_000) return;
         const btn = findApplyButton();
         if (!btn) return;
@@ -1075,7 +1167,7 @@
         try { realClick(btn); } catch (_) { try { btn.click(); } catch (__) {} }
       } catch (_) {}
     }
-    setInterval(tick, 2000);
+    setInterval(tick, 1000);
   })();
 
   /* ── Location typeahead rescue ───────────────────────────────────────
@@ -1203,7 +1295,19 @@
   /* ── Auto-submit when OptimHire says "Review and submit the form" ────
    * OptimHire fills the form with its own engine and then stops, showing
    * "Review and submit the form" / "Form filled", waiting for a human to
-   * press the ATS's submit button.
+   * press the ATS's submit button. In its one-job-at-a-time mode that is
+   * EVERY job, and the state lives only in the side panel — which now
+   * relays it to the job tab (OH_REVIEW_AND_SUBMIT) the moment it shows.
+   *
+   * On a job board (Reed, LinkedIn…) the application is often not even
+   * open yet: the page still shows "Apply now". So, in order:
+   *   1. no form open → press the page's Apply button (same tab), then
+   *      fill what opens with our engine;
+   *   2. required fields still empty → fill them (bounded);
+   *   3. press the submit button — inside the application dialog if one
+   *      is open — by ranked match;
+   *   4. confirmation seen but OptimHire missed it → tell OptimHire, so
+   *      the run moves on instead of stalling.
    *
    * This runs INDEPENDENTLY of the T41/T43 flow controller on purpose.
    * T43 is gated behind fillStable() (which historically only tracked OUR
@@ -1212,18 +1316,30 @@
    * handler watches for the ready condition directly and retries.
    * ────────────────────────────────────────────────────────────────── */
   (function installReviewAndSubmit() {
-    if (window.top !== window.self) return;
+    /* Top frame — or an ATS form iframe (Greenhouse, Lever… embedded in a
+       company site) inside the pinned job tab. */
+    const IN_FRAME = window.top !== window.self;
     /* optimhire.com drives submit through its own overlay (T39/T40). */
     if (/(^|\.)optimhire\.com$/i.test(location.hostname)) return;
 
-    const READY_RE = /review and submit|form ready for submission|form filled|ready to submit/i;
+    const READY_RE = /review and submit|form ready for submission|form filled|ready to submit|click on submit/i;
     const SUBMIT_RE = /^(submit\s+application|submit\s+your\s+application|send\s+application|send\s+my\s+application|submit\s+my\s+application|complete\s+application|finish\s+application|submit\s+&\s+apply|submit\s+and\s+apply|submit\s+profile|send\s+profile|submit)$/i;
-    const RETRY_MS = 4000;
+    /* Buttons that OPEN an application on a job page / job board (Reed's
+       "Apply now", LinkedIn's "Easy Apply", …). */
+    const LAUNCH_RE = /^(apply|apply now|easy apply|quick apply|apply for (this )?(job|role|position|vacancy)|apply to (this )?(job|role|position)|start (your |my )?application|begin (your )?application|continue to apply|continue to application|i'?m interested)$/i;
+    const TICK_MS = 1500;
+    const RETRY_MS = 2500;
     const MAX_TRIES = 4;
+    const MAX_LAUNCH = 2;
+    const MAX_FILLS = 2;
     /* How long to let the fillers (incl. the location typeahead rescue)
        finish before submitting despite our own "unfilled" reading. */
-    const FILL_GRACE_MS = 5_000;
-    let _tries = 0, _forUrl = '', _lastTry = 0, _readySince = 0;
+    const FILL_GRACE_MS = 3_000;
+    const SUBMIT_SETTLE_MS = 8_000;   // let a submit land before trying again
+    const SIGNAL_FRESH_MS = 10_000;
+    const REPORT_AFTER_MS = 8_000;
+    let _tries = 0, _launches = 0, _fills = 0, _forUrl = '', _lastTry = 0, _readySince = 0;
+    let _signalTs = 0, _busy = false, _confirmedTs = 0, _reportedFor = '', _noLaunchLoggedFor = '';
 
     function ohSaysReady(st) {
       if (!st || st.isActive !== true) return false;
@@ -1231,25 +1347,19 @@
       return typeof st.progress === 'number' && st.progress >= 90 &&
              String(st.applicationState || '') !== 'missing-questions';
     }
-    function requiredInputs() {
+    function requiredInputs(root) {
       return $$(
         'input[required]:not([type=hidden]):not([type=submit]):not([type=button]),' +
         'input[aria-required="true"]:not([type=hidden]):not([type=submit]):not([type=button]),' +
         'textarea[required],textarea[aria-required="true"],' +
-        'select[required],select[aria-required="true"]'
-      ).filter(isVisible);
+        'select[required],select[aria-required="true"]', root
+      ).filter(el => isVisible(el) && !isPageChromeField(el));
     }
-    function allRequiredFilled(reqs) {
-      for (const el of reqs) {
-        if (el.type === 'radio' && el.name) {
-          if (![...document.getElementsByName(el.name)].some(r => r.checked)) return false;
-        } else if (el.type === 'checkbox') {
-          if (!el.checked) return false;
-        } else if (el.tagName === 'SELECT') {
-          if (!el.value) return false;
-        } else if (!el.value || !el.value.trim()) return false;
-      }
-      return true;
+    function isFilled(el) {
+      if (el.type === 'radio' && el.name) return [...document.getElementsByName(el.name)].some(r => r.checked);
+      if (el.type === 'checkbox') return el.checked;
+      if (el.tagName === 'SELECT') return !!el.value;
+      return !!(el.value && String(el.value).trim());
     }
     /* Submit-button discovery across ATSes. Wording differs everywhere
        ("Submit Application", "Submit", "Send application", "Apply now"
@@ -1260,14 +1370,15 @@
          3. the form's own submit control (button[type=submit] /
             input[type=submit]) — the ATS-agnostic fallback
        Anything that looks like a non-terminal step (save, next, back,
-       cancel, upload…) is always rejected. */
-    const NEGATIVE_RE = /\b(save|next|back|previous|cancel|close|clear|reset|upload|attach|add|remove|delete|sign in|log ?in|register|search|filter|skip)\b/i;
+       cancel, upload…) is always rejected, and so is the site's own
+       header / search / newsletter chrome. */
+    const NEGATIVE_RE = /\b(save|next|back|previous|cancel|close|clear|reset|upload|attach|add|remove|delete|sign in|log ?in|register|search|filter|skip|subscribe)\b/i;
     const CONTAINS_RE = /(submit|send)\b.*(application|profile|form)?|^apply now$/i;
 
     function usable(b) {
       if (!b || b.disabled) return false;
       if (b.getAttribute && b.getAttribute('aria-disabled') === 'true') return false;
-      return isVisible(b);
+      return isVisible(b) && !isPageChromeField(b);
     }
     function labelOfBtn(b) {
       let t = ((b.innerText || b.value || b.textContent || '') + '').replace(/\s+/g, ' ').trim();
@@ -1276,8 +1387,8 @@
       }
       return t;
     }
-    function findSubmitRanked() {
-      const all = [...document.querySelectorAll('button,[role="button"],input[type=submit],input[type=button]')]
+    function findSubmitRanked(root) {
+      const all = $$('button,[role="button"],input[type=submit],input[type=button]', root || document)
         .filter(usable);
       /* 1 — exact terminal label */
       for (const b of all) {
@@ -1304,69 +1415,168 @@
     }
 
     /* Publish for the on-demand "Autofill this page" action. */
-    findAnySubmitButton = findSubmitRanked;
+    findAnySubmitButton = () => findSubmitRanked(document);
 
+    /* An open application dialog (job boards apply in a modal). Cookie /
+       consent dialogs and OptimHire's own overlays are not it. */
+    function applicationDialog() {
+      const cands = $$('[role="dialog"],[aria-modal="true"],dialog[open]').filter(isVisible);
+      for (let i = cands.length - 1; i >= 0; i--) {
+        const c = cands[i];
+        const tag = ((c.id || '') + ' ' + (c.className || '') + ' ' + (c.getAttribute('aria-label') || '')).toLowerCase();
+        if (/cookie|consent|gdpr|onetrust|privacy|optimhire/.test(tag)) continue;
+        const hasField = $$('input:not([type=hidden]),textarea,select', c).some(isVisible);
+        if (hasField || findSubmitRanked(c)) return c;
+      }
+      return null;
+    }
+    function applicationFields(root) {
+      return $$('input:not([type=hidden]):not([type=submit]):not([type=button]):not([type=image]):not([type=reset]),textarea,select', root)
+        .filter(el => isVisible(el) && !isPageChromeField(el));
+    }
+    function findLauncher() {
+      for (const b of $$('button,a,[role="button"],input[type=button],input[type=submit]')) {
+        if (!usable(b)) continue;
+        const t = labelOfBtn(b);
+        if (!t || t.length > 40 || !LAUNCH_RE.test(t)) continue;
+        return b;
+      }
+      return null;
+    }
 
-    async function tick() {
+    /* A form WE opened (or a page OptimHire never filled) — run our engine. */
+    async function fillOpenApplication() {
+      if (_fillActive) return;
       try {
-        if (location.href !== _forUrl) { _forUrl = location.href; _tries = 0; }
-        if (_tries >= MAX_TRIES) return;
-        if (Date.now() - _lastTry < RETRY_MS) return;
-        if (autoSubmitBlockedHere()) return;   // user asked for fill-only here
-        /* Don't fight an in-flight submit. */
-        if (_submitAttempted && Date.now() - _submitAttemptTs < 30_000) return;
-        if (_fillActive) return;
+        await runAtsAutofill();
+        try { await detectAndFixValidationErrors(); } catch (_) {}
+        try { await sanitizeBadFills(); } catch (_) {}
+      } catch (_) {} finally { _fillActive = false; }
+    }
 
-        const d = await ST.get(AUTOMATION_KEYS);
-        if (!mayAutomate(d)) return;
-        /* Confine the heavy DOM work to the tab that IS the current job.
-           Previously this ran in every tab that had automation engaged,
-           and document.body.innerText forces a full layout — with several
-           tabs open that alone made the browser crawl. */
-        if (!(await isActiveJobTab())) return;
-
-        const pageReady = READY_RE.test((document.body && document.body.innerText || '').slice(0, 4000));
-        const ready = ohSaysReady(d && d.autoApplyState) || pageReady;
-        if (!ready) { _readySince = 0; return; }
-        if (!_readySince) _readySince = Date.now();
-
-        /* Prove this is a REAL, filled application form before submitting.
-           The old guard demanded native required/aria-required inputs,
-           but plenty of ATSes (Ashby among them) mark required fields
-           only with an asterisk in the label and validate themselves — so
-           requiredInputs() came back empty and the submit was skipped
-           entirely. That is why the run kept stopping at "Review and
-           submit the form". Judge the form by what is actually on the
-           page instead of by markup that may not exist. */
-        const fields = $$('input:not([type=hidden]):not([type=submit]):not([type=button]):not([type=search]),textarea,select')
-          .filter(isVisible);
-        if (fields.length < 2) return;                 // not an application form
-        const filled = fields.filter(el => (
-          el.type === 'checkbox' || el.type === 'radio' ? el.checked : (el.value && String(el.value).trim())
-        )).length;
-        if (!filled) return;                           // nothing filled yet — too early
-
-        /* If native required markup DOES exist and something is still
-           unmet, give the fillers a brief grace period, then submit
-           anyway once OptimHire says it is ready (our reading cannot see
-           custom widgets, so it must never be a permanent veto). */
-        const reqs = requiredInputs();
-        if (reqs.length && !allRequiredFilled(reqs) && Date.now() - _readySince < FILL_GRACE_MS) return;
-
-        /* A visible validation error means the ATS itself rejected
-           something — clicking submit again would just re-trigger it. */
-        if (document.querySelector('[aria-invalid="true"],.error,.is-invalid,[class*="field-error"],[class*="fieldError"]')) return;
-
-        const hit = findSubmitRanked();
-        if (!hit) { LOG('Review-and-submit: ready but no submit button found yet'); return; }
-        _tries++;
-        _lastTry = Date.now();
-        LOG(`Review-and-submit: clicking ${hit.why} (try ${_tries}/${MAX_TRIES})`);
-        markSubmitAttempted();
-        try { realClick(hit.btn); } catch (_) { try { hit.btn.click(); } catch (__) {} }
+    /* We saw the confirmation, but OptimHire's own success check missed it
+       and the panel still says "Review and submit". Tell it, so the run
+       moves on instead of stalling on an application that already went. */
+    async function reportSuccess() {
+      if (_reportedFor === location.href) return;
+      _reportedFor = location.href;
+      try {
+        const d = await ST.get(['isManuallyStartJob', 'manualApplicationDetail', 'autoApplyState']);
+        if (d.isManuallyStartJob) {
+          chrome.runtime.sendMessage({
+            type: 'MANUAL_FORM_ERROR_SUCCESS_MESSAGE', isSuccess: true,
+            message: 'Application submitted successfully', url: location.href,
+            applicationDetails: d.manualApplicationDetail || null,
+          }).catch(() => {});
+        } else if (d.autoApplyState && d.autoApplyState.isActive) {
+          chrome.runtime.sendMessage({
+            type: 'COMPLEX_FORM_SUCCESS', message: 'successMessage',
+            url: location.href, success_next_job: true,
+          }).catch(() => {});
+        } else return;
+        LOG('Review-and-submit: application confirmed on the page — told OptimHire so the run moves on');
       } catch (_) {}
     }
-    setInterval(tick, 2500);
+
+    async function step() {
+      if (location.href !== _forUrl) {
+        _forUrl = location.href;
+        _tries = 0; _launches = 0; _fills = 0; _confirmedTs = 0; _readySince = 0;
+      }
+      if (autoSubmitBlockedHere()) return;   // user asked for fill-only here
+      if (_fillActive) return;
+      const now = Date.now();
+      const signalled = now - _signalTs < SIGNAL_FRESH_MS;
+
+      /* After our submit: a confirmation means done. */
+      if (_tries > 0 && pageConfirmsApplication()) {
+        if (!_confirmedTs) { _confirmedTs = now; LOG('Review-and-submit: application confirmed on the page'); }
+        if (signalled && now - _confirmedTs > REPORT_AFTER_MS) await reportSuccess();
+        return;
+      }
+      /* Don't fight an in-flight submit. */
+      if (_submitAttempted && now - _submitAttemptTs < SUBMIT_SETTLE_MS) return;
+
+      const d = await ST.get(AUTOMATION_KEYS);
+      if (!mayAutomate(d)) return;
+      /* Confine the DOM work to the tab that IS the current job. */
+      if (IN_FRAME ? !isPingedJobTab() : !(await isActiveJobTab())) return;
+
+      const pageReady = !IN_FRAME && READY_RE.test((document.body && document.body.innerText || '').slice(0, 4000));
+      const ready = signalled || ohSaysReady(d && d.autoApplyState) || pageReady;
+      if (!ready) { _readySince = 0; return; }
+      if (!_readySince) _readySince = now;
+
+      const dlg = applicationDialog();
+      const scope = dlg || document;
+      const fields = applicationFields(scope);
+
+      /* No application open yet (Reed, LinkedIn, most job boards show a
+         job page first): press its Apply button, then fill what opens. */
+      if (!fields.length && !dlg) {
+        if (IN_FRAME || _launches >= MAX_LAUNCH || now - _lastTry < RETRY_MS) return;
+        const l = findLauncher();
+        if (!l) {
+          if (_noLaunchLoggedFor !== location.href) {
+            _noLaunchLoggedFor = location.href;
+            LOG('Review-and-submit: ready, but no form and no Apply button on this page');
+          }
+          return;
+        }
+        _launches++; _lastTry = now;
+        /* Stay in THIS tab — never spawn another one. */
+        if (l.tagName === 'A' && l.target && l.target !== '_self') { try { l.target = '_self'; } catch (_) {} }
+        LOG(`Review-and-submit: opening the application ("${labelOfBtn(l)}")`);
+        try { realClick(l); } catch (_) { try { l.click(); } catch (__) {} }
+        await sleep(1200);
+        _fills++;
+        await fillOpenApplication();
+        return;
+      }
+
+      /* Required fields still empty — typically a form we just opened that
+         OptimHire never saw. Fill it (bounded), then submit next tick. */
+      const reqs = requiredInputs(scope);
+      if (reqs.length && !reqs.every(isFilled)) {
+        if (_fills < MAX_FILLS) { _fills++; await fillOpenApplication(); return; }
+        /* Our reading cannot see custom widgets, so it must never be a
+           permanent veto — after a short grace, submit anyway. */
+        if (now - _readySince < FILL_GRACE_MS) return;
+      }
+
+      /* A visible validation error means the site rejected something —
+         clicking submit again would only re-trigger it. */
+      if ($$('[aria-invalid="true"],.error,.is-invalid,[class*="field-error"],[class*="fieldError"]', scope)
+            .some(el => isVisible(el) && !isPageChromeField(el))) {
+        if (_fills < MAX_FILLS) { _fills++; await fillOpenApplication(); }
+        return;
+      }
+
+      if (_tries >= MAX_TRIES || now - _lastTry < RETRY_MS) return;
+      const hit = findSubmitRanked(scope) || (dlg ? findSubmitRanked(document) : null);
+      if (!hit) { LOG('Review-and-submit: ready but no submit button found yet'); return; }
+      _tries++;
+      _lastTry = now;
+      LOG(`Review-and-submit: clicking ${hit.why} (try ${_tries}/${MAX_TRIES})`);
+      markSubmitAttempted();
+      try { realClick(hit.btn); } catch (_) { try { hit.btn.click(); } catch (__) {} }
+    }
+
+    async function tick() {
+      if (_busy) return;
+      _busy = true;
+      try { await step(); } catch (_) {} finally { _busy = false; }
+    }
+
+    /* The side panel says "Review and submit the form" — sent to the job
+       tab only, so this also proves this tab is the job tab. Act now. */
+    chrome.runtime.onMessage.addListener((msg) => {
+      if (!msg || msg.type !== 'OH_REVIEW_AND_SUBMIT') return;
+      _signalTs = Date.now();
+      markJobTab();
+      tick();
+    });
+    setInterval(tick, TICK_MS);
   })();
 
   /* ── Paylocity: ask the Queue Manager to bring this tab forward ───────
@@ -2339,16 +2549,17 @@
     } catch (_) {}
   }
 
-  function qaPageConfirmsSuccess() {
+  function pageConfirmsApplication() {
     try {
       if (document.querySelector(QA_SUCCESS_SEL)) return true;
       const t = (document.body && document.body.innerText || '').slice(0, 6000);
       if (!QA_SUCCESS_TEXT_RE.test(t)) return false;
       /* Success wording next to a still-open form is usually help text
-         ("once your application has been submitted…"), not a confirmation. */
+         ("once your application has been submitted…"), not a confirmation.
+         The site's own search / newsletter boxes don't count as a form. */
       let fields = 0;
       for (const el of document.querySelectorAll('input:not([type=hidden]):not([type=submit]):not([type=button]),textarea,select')) {
-        if (isVisible(el) && ++fields >= 3) return false;
+        if (isVisible(el) && !isPageChromeField(el) && ++fields >= 3) return false;
       }
       return true;
     } catch (_) { return false; }
@@ -2360,7 +2571,7 @@
     const step = () => {
       _qaWatchTimer = null;
       if (!_qaPending) return;
-      if (qaPageConfirmsSuccess()) { qaCommit('confirmation page'); return; }
+      if (pageConfirmsApplication()) { qaCommit('confirmation page'); return; }
       if (Date.now() < _qaWatchUntil) _qaWatchTimer = setTimeout(step, 2000);
     };
     _qaWatchTimer = setTimeout(step, 1500);
@@ -4032,10 +4243,11 @@
     async function checkStuck() {
       let active = false;
       try {
-        const { csvActiveJobId, isAutoProcessStartJob } = await ST.get([
-          'csvActiveJobId', 'isAutoProcessStartJob',
+        const d = await ST.get([
+          'csvActiveJobId', 'isAutoProcessStartJob', 'isManuallyStartJob', 'ohJobTab', 'ohJobQueueActive',
         ]);
-        active = !!csvActiveJobId || !!isAutoProcessStartJob;
+        active = (!!d.csvActiveJobId || !!d.isAutoProcessStartJob || !!d.isManuallyStartJob) &&
+                 !notTheJobTab(d);
       } catch (_) { return; }
 
       if (!active) { _lastProgressTs = Date.now(); return; }
@@ -7069,7 +7281,7 @@
     const SUBMIT_GRACE_MS = 8_000;    // wait this long after submit before declaring success
     const CONFIRM_WAIT_MS = 30_000;   // keep looking for a REAL confirmation this long after submit
     const VALIDATION_STUCK_MS = 50_000; // validation errors persisting this long → fail fast
-    const SUCCESS_TEXT_RE = /application\s+(was\s+)?(submitted|received|complete)|thank\s+you\s+for\s+(applying|your\s+application|your\s+interest)|we['’]ve\s+received\s+your\s+application|we\s+have\s+received\s+your\s+application|your\s+application\s+has\s+been\s+(received|submitted)|application\s+successful/i;
+    const SUCCESS_TEXT_RE = /application\s+(was\s+|has\s+been\s+)?(submitted|received|complete|sent)\b|thank\s+you\s+for\s+(applying|your\s+application|your\s+interest)|we['’]ve\s+received\s+your\s+application|we\s+have\s+received\s+your\s+application|your\s+application\s+has\s+been\s+(received|submitted)|application\s+successful/i;
     const SUCCESS_URL_RE  = /(thank|success|confirm|complete|received|submitted|done)/i;
     const FAILURE_TEXT_RE = /(already\s+applied|application\s+already\s+submitted|you\s+have\s+already\s+applied|no\s+application\s+(form|available)|job\s+is\s+no\s+longer\s+available|this\s+position\s+is\s+closed|posting\s+is\s+closed|application\s+window\s+has\s+closed|page\s+not\s+found|404)/i;
 
@@ -7217,12 +7429,22 @@
            never stalls. */
         setTimeout(async () => {
           try {
-            const dd = await ST.get(['ohJobQueueAdvanceReq', 'ohJobQueue', 'ohJobQueueActive']);
+            const dd = await ST.get(['ohJobQueueAdvanceReq', 'ohJobQueue', 'ohJobQueueActive', 'ohPreferAts']);
             const req = dd.ohJobQueueAdvanceReq;
             if (!req || req.ts !== reqTs) return;        // manager handled it
             if (!dd.ohJobQueueActive) return;            // queue stopped
             let qq = Array.isArray(dd.ohJobQueue) ? dd.ohJobQueue : [];
-            const nx = qq.find(j => j.status === 'pending');
+            /* Same order as the Queue Manager: ATS jobs first, Reed last. */
+            const tier = (u) => {
+              let h = ''; try { h = new URL(u).hostname.toLowerCase(); } catch (_) { return 1; }
+              if (/(^|\.)reed\.co\.uk$/.test(h)) return 3;
+              if (/(^|\.)(indeed|linkedin|ziprecruiter|adzuna|dice|glassdoor|monster|totaljobs|cv-library|simplyhired|hiring\.cafe)\./.test(h)) return 2;
+              if (/greenhouse|lever\.co|myworkdayjobs|workday|ashbyhq|icims|smartrecruiters|workable|breezy|jobvite|bamboohr|paylocity|jazzhr|teamtailor|recruitee|pinpoint|oraclecloud|taleo|successfactors|ultipro|avature|rippling|comeet|manatal/.test(h)) return 0;
+              return 1;
+            };
+            const pending = qq.filter(j => j.status === 'pending');
+            const nx = dd.ohPreferAts === false ? pending[0]
+              : pending.reduce((best, j) => (!best || tier(j.url) < tier(best.url) ? j : best), null);
             if (nx) {
               nx.status = 'running';
               nx.attempts = (nx.attempts || 0) + 1;
