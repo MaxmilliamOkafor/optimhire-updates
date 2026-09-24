@@ -2164,6 +2164,7 @@
        ohUrl    = https://optimhire.com/d/jv/{id}/?q=copilot-jobs — the
                   OptimHire job-view page.
      ────────────────────────────────────────────────────────── */
+  var _runStartTs = 0;       // start of the current OptimHire run (set by the queue card)
   (function installNativeQueueHarvester() {
     var HK = 'ohHarvestedJobs';
     var OH_JOB_BASE = 'https://optimhire.com/d/jv/';
@@ -2244,6 +2245,7 @@
         var applyUrl = src.apply_now_url || '';
         if (!jid && !applyUrl) return;            // nothing identifiable yet
         var key = String(jid || applyUrl);
+        var prevKey = _currentKey;
         _currentJobId = String(jid || '');
         _currentKey = key;
         /* Only write when the identifying job actually changes, so we
@@ -2254,7 +2256,19 @@
         chrome.storage.local.get([HK], function (store) {
           try {
             var map = (store && store[HK]) || {};
+            /* The run moved on from the previous job without any outcome
+               (a skip, a timeout) — it was NOT submitted; count it so. */
+            var prev = prevKey && prevKey !== key ? map[prevKey] : null;
+            if (prev && prev.outcome === 'pending') {
+              prev.outcome = 'skipped';
+              prev.reason = 'moved on without a confirmation';
+              prev.outcomeTs = Date.now();
+            }
             var rec = map[key] || { id: String(jid || ''), firstSeen: Date.now(), outcome: 'pending' };
+            /* Seen again in a new run: its old outcome belongs to that run. */
+            if (map[key] && (rec.lastSeen || 0) < (_runStartTs || 0)) {
+              rec.outcome = 'pending'; rec.reason = ''; rec.outcomeTs = 0;
+            }
             if (applyUrl) rec.applyUrl = applyUrl;
             if (jid) rec.ohUrl = OH_JOB_BASE + jid + '/?q=copilot-jobs';
             if (src.job_title) rec.title = src.job_title;
@@ -2285,16 +2299,27 @@
 
     try {
       chrome.storage.onChanged.addListener(function (c, a) {
-        if (a === 'local' && c.autoApplyState && c.autoApplyState.newValue) {
-          onState(c.autoApplyState.newValue);
-        }
+        if (a !== 'local') return;
+        if (c.autoApplyState && c.autoApplyState.newValue) onState(c.autoApplyState.newValue);
+        /* One-job-at-a-time mode keeps its current job here instead. */
+        if (c.manualApplicationDetail && c.manualApplicationDetail.newValue) upsert(c.manualApplicationDetail.newValue);
+      });
+    } catch (_) {}
+    /* One-job-at-a-time mode reports progress only as messages to this panel. */
+    try {
+      chrome.runtime.onMessage.addListener(function (msg) {
+        if (!msg || msg.type !== 'MANUALLY_APPLY_STATE_UPDATE') return;
+        if (msg.applicationDetails && msg.applicationDetails.source) upsert(msg.applicationDetails);
+        if (msg.manuallyApplyState) recordOutcome(msg.manuallyApplyState);
+        if (msg.isManualSubmited) recordOutcome({ applicationState: 'completed', statusMessage: 'Application submitted successfully' });
       });
     } catch (_) {}
     /* Poll too — covers a missed change event or a lingering state. */
     setInterval(function () {
       try {
-        chrome.storage.local.get(['autoApplyState'], function (d) {
+        chrome.storage.local.get(['autoApplyState', 'isManuallyStartJob', 'manualApplicationDetail'], function (d) {
           if (d && d.autoApplyState) onState(d.autoApplyState);
+          else if (d && d.isManuallyStartJob && d.manualApplicationDetail) upsert(d.manualApplicationDetail);
         });
       } catch (_) {}
     }, 3000);
@@ -2414,6 +2439,18 @@
           '<span style="background:#2d2f3a;padding:3px 8px;border-radius:6px;color:#94a3b8" id="oh-qc-pending">0 pending</span>' +
           '<span style="background:rgba(74,222,128,.15);padding:3px 8px;border-radius:6px;color:#4ade80" id="oh-qc-applied">0 applied</span>' +
           '<span style="background:rgba(239,68,68,.15);padding:3px 8px;border-radius:6px;color:#f87171" id="oh-qc-failed">0 failed</span>' +
+        '</div>' +
+        /* Live OptimHire run: where it is in its queue, as it applies. */
+        '<div id="oh-qc-run" style="display:none;margin:-4px 0 10px;padding:8px 10px;border:1px solid #2d2f3a;' +
+          'border-radius:8px;background:#0f1117">' +
+          '<div style="display:flex;justify-content:space-between;align-items:baseline;gap:8px">' +
+            '<span id="oh-qc-run-label" style="color:#c4b5fd;font-weight:600;font-size:11.5px">OptimHire queue</span>' +
+            '<span id="oh-qc-run-pos" style="color:#e2e8f0;font-weight:700;font-size:12.5px">—</span>' +
+          '</div>' +
+          '<div style="height:5px;background:#1e2030;border-radius:3px;overflow:hidden;margin:6px 0 5px">' +
+            '<div id="oh-qc-run-bar" style="height:100%;width:0%;background:linear-gradient(90deg,#6366f1,#8b5cf6);transition:width .4s"></div>' +
+          '</div>' +
+          '<div id="oh-qc-run-tally" style="font-size:10.5px;color:#94a3b8;line-height:1.5">—</div>' +
         '</div>' +
         '<div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:6px">' +
           '<button id="oh-qc-open" style="flex:1;background:linear-gradient(135deg,#6366f1,#8b5cf6);' +
@@ -2551,6 +2588,131 @@
       return card;
     }
 
+    /* ── Live OptimHire run counter ─────────────────────────────────────
+       OptimHire only says how many it applied to at the very END of a run
+       ("N jobs applied successfully"), and this card's numbers were our
+       CSV queue's — so a native run showed "0 of 0 applied" throughout.
+       A run = from Start until it stops; an auto-resume within 30 min
+       continues the same run. Its total is OptimHire's own
+       matchingJobCount ("We found N matching jobs"), extended when a
+       finished batch is followed by a fresh search. Outcomes come from
+       the harvester (ohHarvestedJobs). A compact summary is kept in
+       ohRunStats so the toolbar badge (static/background/oh-bg.js) can
+       show it even when this panel is closed. */
+    var RUN_KEY = 'ohRunStats';
+    var RUN_RESUME_MS = 30 * 60 * 1000;
+    var _userStartTs = 0;
+    var _lastRunJson = '';
+    document.addEventListener('click', function (e) {
+      try {
+        if (!e.isTrusted) return;
+        var b = e.target && e.target.closest && e.target.closest('button,[role="button"]');
+        var t = b ? ((b.innerText || b.textContent || '') + '').replace(/\s+/g, ' ').trim() : '';
+        if (/^start\s+(auto[-\s]?applying|manually\s+applying)$/i.test(t)) _userStartTs = Date.now();
+      } catch (_) {}
+    }, true);
+
+    function nativeLive(d) {
+      var st = d.autoApplyState;
+      return d.ohAutomationDisabled !== true &&
+             !!(d.isAutoProcessStartJob || d.isManuallyStartJob || (st && st.isActive === true));
+    }
+    function runCounts(map, start) {
+      var c = { seen: 0, submitted: 0, skipped: 0, closed: 0, error: 0, pending: 0, lastDoneTs: 0 };
+      for (var k in map) {
+        if (!Object.prototype.hasOwnProperty.call(map, k)) continue;
+        var r = map[k];
+        if (!r || (r.lastSeen || 0) < start) continue;
+        c.seen++;
+        var oc = r.outcome || 'pending';
+        if (c[oc] == null) oc = 'pending';
+        c[oc]++;
+        if (oc !== 'pending' && (r.outcomeTs || 0) > c.lastDoneTs) c.lastDoneTs = r.outcomeTs;
+      }
+      c.done = c.submitted + c.skipped + c.closed + c.error;
+      return c;
+    }
+    function fmtDur(ms) {
+      if (!isFinite(ms) || ms <= 0) return '';
+      var m = Math.round(ms / 60000);
+      if (m < 60) return m + 'm';
+      var h = Math.floor(m / 60);
+      return h < 24 ? h + 'h ' + (m % 60) + 'm' : Math.floor(h / 24) + 'd ' + (h % 24) + 'h';
+    }
+    function updateRun(d, map) {
+      var now = Date.now();
+      var live = nativeLive(d);
+      var mjc = parseInt(d.matchingJobCount, 10) || 0;
+      var run = (d[RUN_KEY] && typeof d[RUN_KEY] === 'object') ? Object.assign({}, d[RUN_KEY]) : null;
+      if (live) {
+        var userStarted = now - _userStartTs < 15000 && run && run.start < _userStartTs;
+        if (!run || userStarted || (run.endedAt && now - run.endedAt > RUN_RESUME_MS)) {
+          /* From the Start click if we saw it, else a few seconds back so a
+             first job that loaded just before this check still counts. */
+          var startAt = now - _userStartTs < 15000 ? Math.min(now, _userStartTs) : now - 5000;
+          run = { start: startAt, total: mjc, mjc: mjc };
+        } else if (run.endedAt) {
+          delete run.endedAt;                      // auto-resume: same run continues
+        }
+      } else if (run && !run.endedAt) {
+        run.endedAt = now;
+      }
+      if (!run) { _runStartTs = 0; paintRun(null); return; }
+      _runStartTs = run.start;
+      var c = runCounts(map, run.start);
+      /* Total: OptimHire's count at the start; if that batch is used up and
+         a new search brings more jobs, the queue grows by them. */
+      if (mjc && mjc !== run.mjc) {
+        if (!run.total || c.done >= run.total) run.total = c.done + mjc;
+        run.mjc = mjc;
+      }
+      var total = Math.max(run.total || 0, c.seen);
+      var position = live && c.pending > 0 ? c.done + 1 : c.done;
+      var left = total ? Math.max(0, total - c.done) : null;
+      var elapsed = (c.lastDoneTs || now) - run.start;
+      var ratePerHr = c.done >= 2 && elapsed > 0 ? c.done / elapsed * 3600000 : 0;
+      run.summary = { live: live, position: position, total: total, left: left,
+                      submitted: c.submitted, skipped: c.skipped, closed: c.closed, error: c.error,
+                      ratePerHr: Math.round(ratePerHr) };
+      var json = JSON.stringify(run);
+      if (json !== _lastRunJson) {
+        _lastRunJson = json;
+        var o = {}; o[RUN_KEY] = run;
+        try { chrome.storage.local.set(o); } catch (_) {}
+      }
+      paintRun(run);
+    }
+    function paintRun(run) {
+      var box = document.getElementById('oh-qc-run');
+      if (!box) return;
+      if (!run || !run.summary) { box.style.display = 'none'; return; }
+      var s = run.summary;
+      box.style.display = '';
+      var label = document.getElementById('oh-qc-run-label');
+      var pos = document.getElementById('oh-qc-run-pos');
+      var bar = document.getElementById('oh-qc-run-bar');
+      var tally = document.getElementById('oh-qc-run-tally');
+      if (label) label.textContent = s.live ? 'OptimHire queue' : 'Last OptimHire run';
+      if (pos) {
+        pos.textContent = s.live
+          ? (s.position ? 'Job ' + s.position + (s.total ? ' of ' + s.total : '') + (s.left != null ? ' · ' + s.left + ' left' : '')
+                        : 'Starting' + (s.total ? ' · ' + s.total + ' in queue' : ''))
+          : ((s.submitted + s.skipped + s.closed + s.error) + (s.total ? ' of ' + s.total : '') + ' done');
+      }
+      if (bar) bar.style.width = (s.total ? Math.min(100, Math.round(100 * (s.submitted + s.skipped + s.closed + s.error) / s.total)) : 0) + '%';
+      if (tally) {
+        var eta = s.live && s.ratePerHr > 0 && s.left ? ' · ~' + s.ratePerHr + '/hr, done in ' + fmtDur(s.left / s.ratePerHr * 3600000) : '';
+        tally.innerHTML =
+          '<b style="color:#4ade80">✅ ' + s.submitted + ' submitted</b> · ' +
+          '<span style="color:#fbbf24">⏭ ' + s.skipped + ' skipped</span> · ' +
+          '<span>🚫 ' + s.closed + ' closed</span>' +
+          (s.error ? ' · <span style="color:#f87171">⚠ ' + s.error + ' errors</span>' : '') + eta;
+      }
+      /* The Auto-Apply panel header showed our CSV queue's "0 of 0 applied". */
+      var hdr = document.getElementById('aapCounter');
+      if (hdr && s.live) hdr.textContent = s.submitted + ' submitted · job ' + (s.position || 0) + (s.total ? '/' + s.total : '');
+    }
+
     /* Q&A-memory size. Kept in a variable (updated on change) so the 5s
        refresh never has to read the whole memory object. */
     var _qaCount = null;
@@ -2582,8 +2744,10 @@
           var ind = document.getElementById('oh-qc-indicator');
           if (ind) ind.style.display = d[KEY_ACTIVE] ? '' : 'none';
         });
-        chrome.storage.local.get(['ohHarvestedJobs'], function (d) {
+        chrome.storage.local.get(['ohHarvestedJobs', RUN_KEY, 'matchingJobCount', 'isAutoProcessStartJob',
+                                  'isManuallyStartJob', 'autoApplyState', 'ohAutomationDisabled'], function (d) {
           var map = (d && d.ohHarvestedJobs) || {};
+          try { updateRun(d || {}, map); } catch (_) {}
           var n = 0, sub = 0, skip = 0, other = 0;
           for (var k in map) {
             if (!Object.prototype.hasOwnProperty.call(map, k)) continue;
@@ -2627,7 +2791,8 @@
         chrome.storage.onChanged.addListener(function (changes, area) {
           if (area !== 'local') return;
           if (changes.ohQaMemory) setQaCount(changes.ohQaMemory.newValue);
-          if (changes[KEY_QUEUE] || changes[KEY_ACTIVE] || changes.ohHarvestedJobs) refresh();
+          if (changes[KEY_QUEUE] || changes[KEY_ACTIVE] || changes.ohHarvestedJobs ||
+              changes.isAutoProcessStartJob || changes.isManuallyStartJob || changes.matchingJobCount) refresh();
         });
       } catch (_) {}
     }

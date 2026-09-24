@@ -20,6 +20,12 @@
  *    lifeline is kept while a run is live, and only in the job tab; when
  *    idle the service worker is allowed to sleep like any other extension.
  *
+ * 3. The toolbar badge shows how many jobs are LEFT in the queue while a
+ *    run is going — OptimHire's own run (summary kept by the side panel in
+ *    ohRunStats) or our CSV Job Queue — with the full breakdown on hover,
+ *    and clears when nothing is running. Done here so it stays correct
+ *    even when the side panel is closed.
+ *
  * Wiring: manifest.json background.service_worker points here. On an
  * OptimHire update, copy the new index.js in and keep this entry point.
  * Same directory as index.js on purpose, so nothing that resolves paths
@@ -28,7 +34,8 @@
 /* global importScripts */   // service-worker global
 (function () {
   'use strict';
-  var KEYS = ['copilotTabId', 'isAutoProcessStartJob', 'isManuallyStartJob', 'autoApplyState'];
+  var KEYS = ['copilotTabId', 'isAutoProcessStartJob', 'isManuallyStartJob', 'autoApplyState',
+              'ohRunStats', 'ohJobQueueActive', 'ohJobQueue', 'ohAutomationDisabled'];
   var state = { tab: null, live: false, loaded: false };
   var ohSuccessWatch = null;      // OptimHire's handler, once it registers it
   var registered = null;          // { fn, tab } currently registered with Chrome
@@ -95,7 +102,48 @@
     };
   }
 
+  /* ── Toolbar badge: jobs left in the queue ── */
+  var _badge = null;
+  var DEFAULT_TITLE = (function () {
+    try { var a = chrome.runtime.getManifest().action; return (a && a.default_title) || 'OptimHire Job Auto-Applier'; }
+    catch (_) { return 'OptimHire Job Auto-Applier'; }
+  })();
+  function short(n) { return n >= 10000 ? Math.floor(n / 1000) + 'k' : String(n); }
+  function paintBadge(d) {
+    if (!chrome.action) return;
+    var text = '', title = DEFAULT_TITLE;
+    var rs = d.ohRunStats && d.ohRunStats.summary;
+    if (d.ohAutomationDisabled === true) {
+      /* nothing runs */
+    } else if (d.ohJobQueueActive && Array.isArray(d.ohJobQueue)) {
+      var left = 0, applied = 0, failed = 0;
+      d.ohJobQueue.forEach(function (j) {
+        if (!j) return;
+        if (j.status === 'pending' || j.status === 'running') left++;
+        else if (j.status === 'applied') applied++;
+        else if (j.status === 'failed') failed++;
+      });
+      text = short(left);
+      title = 'Job Queue: ' + left + ' left · ' + applied + ' applied · ' + failed + ' failed';
+    } else if (isLive(d) && rs) {
+      text = rs.left != null ? short(rs.left) : short(rs.position || 0);
+      title = 'OptimHire queue: job ' + (rs.position || 0) + (rs.total ? ' of ' + rs.total : '') +
+              (rs.left != null ? ' · ' + rs.left + ' left' : '') + '\n' +
+              rs.submitted + ' submitted · ' + rs.skipped + ' skipped · ' + rs.closed + ' closed' +
+              (rs.error ? ' · ' + rs.error + ' errors' : '');
+    }
+    var sig = text + '|' + title;
+    if (sig === _badge) return;
+    _badge = sig;
+    try {
+      chrome.action.setBadgeBackgroundColor({ color: '#6366f1' });
+      chrome.action.setBadgeText({ text: text });
+      chrome.action.setTitle({ title: title });
+    } catch (_) {}
+  }
+
   function apply(d) {
+    try { paintBadge(d); } catch (_) {}
     var wasLive = state.live, wasTab = state.tab;
     state.tab = d.copilotTabId == null ? null : d.copilotTabId;
     state.live = isLive(d);
