@@ -2451,6 +2451,7 @@
             '<div id="oh-qc-run-bar" style="height:100%;width:0%;background:linear-gradient(90deg,#6366f1,#8b5cf6);transition:width .4s"></div>' +
           '</div>' +
           '<div id="oh-qc-run-tally" style="font-size:10.5px;color:#94a3b8;line-height:1.5">—</div>' +
+          '<div id="oh-qc-run-tier" style="display:none;font-size:10.5px;color:#a78bfa;margin-top:2px"></div>' +
         '</div>' +
         '<div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:6px">' +
           '<button id="oh-qc-open" style="flex:1;background:linear-gradient(135deg,#6366f1,#8b5cf6);' +
@@ -2483,7 +2484,10 @@
           'Real outcome: — submitted · — skipped</div>' +
         '<div id="oh-qc-qamem" title="Answers learned from applications that were confirmed as submitted. Click to review or forget them." ' +
           'style="margin-top:3px;font-size:10.5px;color:#94a3b8;text-align:center;cursor:pointer">' +
-          '🧠 Remembered answers: —</div>';
+          '🧠 Remembered answers: —</div>' +
+        '<div id="oh-qc-prio" title="Apply to jobs on company ATS sites (Greenhouse, Lever, Workday…) first, then other job boards, and Reed last — for OptimHire\'s queue and the CSV Job Queue. Click to switch." ' +
+          'style="margin-top:3px;font-size:10.5px;color:#94a3b8;text-align:center;cursor:pointer">' +
+          '⇅ ATS jobs first, Reed last: —</div>';
       /* Always append to <body> as a fixed overlay — never insert as a
          sibling of #__plasmo (that risked disturbing React). */
       document.body.appendChild(card);
@@ -2499,6 +2503,16 @@
       var exportBtn = document.getElementById('oh-qc-export');
       if (exportBtn) exportBtn.addEventListener('click', function () {
         exportHarvestedJobs();
+      });
+      var prioLine = document.getElementById('oh-qc-prio');
+      if (prioLine) prioLine.addEventListener('click', function () {
+        chrome.storage.local.get(['ohPreferAts'], function (d) {
+          var on = !(d && d.ohPreferAts !== false);   // toggle
+          chrome.storage.local.set({ ohPreferAts: on }, function () {
+            addLog(on ? 'Queue order: ATS jobs first, Reed last' : 'Queue order: as OptimHire sends them', '');
+            refresh();
+          });
+        });
       });
       var qaLine = document.getElementById('oh-qc-qamem');
       if (qaLine) qaLine.addEventListener('click', function () {
@@ -2600,6 +2614,7 @@
        ohRunStats so the toolbar badge (static/background/oh-bg.js) can
        show it even when this panel is closed. */
     var RUN_KEY = 'ohRunStats';
+    var _queueTier = null;   // which part of OptimHire's queue is being served (oh-bg.js)
     var RUN_RESUME_MS = 30 * 60 * 1000;
     var _userStartTs = 0;
     var _lastRunJson = '';
@@ -2708,6 +2723,13 @@
           '<span>🚫 ' + s.closed + ' closed</span>' +
           (s.error ? ' · <span style="color:#f87171">⚠ ' + s.error + ' errors</span>' : '') + eta;
       }
+      var tierEl = document.getElementById('oh-qc-run-tier');
+      if (tierEl) {
+        var tr = s.live && _queueTier && _queueTier.tier;
+        tierEl.style.display = tr ? '' : 'none';
+        if (tr) tierEl.textContent = 'Now applying: ' + _queueTier.tier +
+          (_queueTier.site ? ' (' + _queueTier.site.charAt(0).toUpperCase() + _queueTier.site.slice(1) + ')' : '');
+      }
       /* The Auto-Apply panel header showed our CSV queue's "0 of 0 applied". */
       var hdr = document.getElementById('aapCounter');
       if (hdr && s.live) hdr.textContent = s.submitted + ' submitted · job ' + (s.position || 0) + (s.total ? '/' + s.total : '');
@@ -2745,7 +2767,13 @@
           if (ind) ind.style.display = d[KEY_ACTIVE] ? '' : 'none';
         });
         chrome.storage.local.get(['ohHarvestedJobs', RUN_KEY, 'matchingJobCount', 'isAutoProcessStartJob',
-                                  'isManuallyStartJob', 'autoApplyState', 'ohAutomationDisabled'], function (d) {
+                                  'isManuallyStartJob', 'autoApplyState', 'ohAutomationDisabled',
+                                  'ohPreferAts', 'ohQueueTier'], function (d) {
+          try {
+            var pl = document.getElementById('oh-qc-prio');
+            if (pl) pl.textContent = '⇅ ATS jobs first, Reed last: ' + (d && d.ohPreferAts === false ? 'OFF' : 'ON');
+          } catch (_) {}
+          _queueTier = (d && d.ohPreferAts !== false && d.ohQueueTier) || null;
           var map = (d && d.ohHarvestedJobs) || {};
           try { updateRun(d || {}, map); } catch (_) {}
           var n = 0, sub = 0, skip = 0, other = 0;
@@ -2792,7 +2820,8 @@
           if (area !== 'local') return;
           if (changes.ohQaMemory) setQaCount(changes.ohQaMemory.newValue);
           if (changes[KEY_QUEUE] || changes[KEY_ACTIVE] || changes.ohHarvestedJobs ||
-              changes.isAutoProcessStartJob || changes.isManuallyStartJob || changes.matchingJobCount) refresh();
+              changes.isAutoProcessStartJob || changes.isManuallyStartJob || changes.matchingJobCount ||
+              changes.ohPreferAts || changes.ohQueueTier) refresh();
         });
       } catch (_) {}
     }

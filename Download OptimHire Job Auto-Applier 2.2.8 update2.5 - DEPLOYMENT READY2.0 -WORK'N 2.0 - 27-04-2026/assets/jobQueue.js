@@ -80,6 +80,36 @@
     } catch (_) { return 'Other'; }
   }
 
+  /* ───── Order: ATS jobs first, Reed last ─────
+     Direct ATS applications (Greenhouse, Lever, Workday…) go first, then
+     company career sites we don't recognise, then job boards, and Reed
+     last. Within a tier the queue keeps its own order. On by default;
+     "ATS first, Reed last" in the header turns it off (ohPreferAts). */
+  const BOARD_ATS = new Set(['LinkedIn', 'Indeed', 'Dice', 'ZipRecruiter', 'HiringCafe']);
+  const BOARD_HOST_RE = /(^|\.)(indeed|linkedin|ziprecruiter|adzuna|dice|glassdoor|monster|totaljobs|cv-library|jobsite|irishjobs|jobs\.ie|simplyhired|careerbuilder|jooble|talent|hiring\.cafe)\./i;
+  const REED_HOST_RE = /(^|\.)reed\.co\.uk$/i;
+  let _preferAts = true;
+  function jobTier(url) {
+    let host = '';
+    try { host = new URL(url).hostname.toLowerCase(); } catch (_) { return 1; }
+    if (REED_HOST_RE.test(host)) return 3;
+    const ats = detectAts(url);
+    if (ats !== 'Other' && !BOARD_ATS.has(ats)) return 0;
+    if (BOARD_ATS.has(ats) || BOARD_HOST_RE.test(host)) return 2;
+    return 1;
+  }
+  /* First eligible job of the best tier (queue order within a tier). */
+  function pickNext(eligible) {
+    if (!_preferAts) return queue.find(eligible) || null;
+    let best = null, bestTier = 9;
+    for (const j of queue) {
+      if (!eligible(j)) continue;
+      const t = jobTier(j.url);
+      if (t < bestTier) { best = j; bestTier = t; if (t === 0) break; }
+    }
+    return best;
+  }
+
   /* ───── CSV parsing / writing ───── */
   /** RFC-4180-ish CSV parser. Handles quoted fields with commas, embedded
       newlines, and "" escapes. Returns array of row arrays. */
@@ -124,7 +154,9 @@
   /* ───── Storage ───── */
   function load() {
     return new Promise(res => {
-      ST.get([KEY_QUEUE, KEY_ACTIVE, KEY_CURRENT, KEY_STARTTS], (d) => {
+      /* KEY_CONCURRENCY was missing here, so the saved "Parallel tabs"
+         choice was never restored and silently reset to 1. */
+      ST.get([KEY_QUEUE, KEY_ACTIVE, KEY_CURRENT, KEY_STARTTS, KEY_CONCURRENCY, 'ohPreferAts'], (d) => {
         queue = Array.isArray(d[KEY_QUEUE]) ? d[KEY_QUEUE] : [];
         res(d);
       });
@@ -596,7 +628,7 @@
           const t = queue.find(j => j.id === jid);
           if (t && t.url) openUrls.add(normaliseUrl(t.url));
         }
-        const candidate = queue.find(j =>
+        const candidate = pickNext(j =>
           j.status === 'pending' &&
           !_tabMap.has(j.id) &&
           (j.attempts || 0) < MAX_OPEN_ATTEMPTS &&
@@ -1041,12 +1073,22 @@
     on('concurrencySelect', 'change', (e) => {
       ST.set({ [KEY_CONCURRENCY]: parseInt(e.target.value, 10) || 1 });
     });
+    on('preferAts', 'change', (e) => {
+      _preferAts = !!e.target.checked;
+      ST.set({ ohPreferAts: _preferAts });
+      toast(_preferAts ? 'ATS jobs first, Reed last' : 'Queue order as listed', 'info');
+    });
 
     /* Watch storage so the running indicator + statuses stay live AND
        the orchestrator advances when a content script reports done. */
     chrome.storage.onChanged.addListener((changes, area) => {
       if (area !== 'local') return;
       if (changes[KEY_QUEUE]) { queue = changes[KEY_QUEUE].newValue || []; render(); }
+      if (changes.ohPreferAts) {
+        _preferAts = changes.ohPreferAts.newValue !== false;
+        const pa = document.getElementById('preferAts');
+        if (pa) pa.checked = _preferAts;
+      }
       if (changes[KEY_ACTIVE]) {
         const on = !!changes[KEY_ACTIVE].newValue;
         setRunnerIndicator(on);
@@ -1070,6 +1112,9 @@
       /* Restore concurrency choice */
       const sel = document.getElementById('concurrencySelect');
       if (sel && d[KEY_CONCURRENCY]) sel.value = String(d[KEY_CONCURRENCY]);
+      _preferAts = d.ohPreferAts !== false;
+      const pa = document.getElementById('preferAts');
+      if (pa) pa.checked = _preferAts;
       setRunnerIndicator(!!d[KEY_ACTIVE]);
       init();
       render();

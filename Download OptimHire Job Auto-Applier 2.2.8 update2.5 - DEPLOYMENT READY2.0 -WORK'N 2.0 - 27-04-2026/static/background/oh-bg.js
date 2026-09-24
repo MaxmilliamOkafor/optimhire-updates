@@ -26,6 +26,15 @@
  *    and clears when nothing is running. Done here so it stays correct
  *    even when the side panel is closed.
  *
+ * 4. ATS jobs first, Reed last. OptimHire's server hands out ONE job per
+ *    request (GET /candidate/{id}/application), optionally filtered by
+ *    ?jobsite=<key> (its liveATS list). With ohPreferAts on (default), each
+ *    "next job" request asks the ATS sites first (sticking with the one
+ *    that last had jobs), then the other job boards, and only then the
+ *    normal mixed queue — which is where Reed comes from. A site with no
+ *    jobs is skipped for 15 minutes, so this is ~1 request per job. A
+ *    jobsite the user chose in OptimHire's own settings is left alone.
+ *
  * Wiring: manifest.json background.service_worker points here. On an
  * OptimHire update, copy the new index.js in and keep this entry point.
  * Same directory as index.js on purpose, so nothing that resolves paths
@@ -35,7 +44,7 @@
 (function () {
   'use strict';
   var KEYS = ['copilotTabId', 'isAutoProcessStartJob', 'isManuallyStartJob', 'autoApplyState',
-              'ohRunStats', 'ohJobQueueActive', 'ohJobQueue', 'ohAutomationDisabled'];
+              'ohRunStats', 'ohJobQueueActive', 'ohJobQueue', 'ohAutomationDisabled', 'ohPreferAts'];
   var state = { tab: null, live: false, loaded: false };
   var ohSuccessWatch = null;      // OptimHire's handler, once it registers it
   var registered = null;          // { fn, tab } currently registered with Chrome
@@ -157,6 +166,66 @@
       } }).catch(function () {});
     }
   }
+
+  /* ── ATS jobs first, Reed last ── */
+  var ATS_SITES = ['greenhouse', 'lever', 'ashby', 'workday', 'smartrecruiters', 'workable', 'bamboohr',
+                   'breezyhr', 'jazzhr', 'jobvite', 'recruitee', 'rippling', 'comeet', 'paylocity',
+                   'manatal', 'freshteam', 'recooty', 'gohire'];
+  var BOARD_SITES = ['linkedin', 'indeed', 'ziprecruiter', 'ziprecruiterpaid', 'adzuna', 'adzunapaid', 'dice'];
+  var EMPTY_TTL_MS = 15 * 60 * 1000;
+  var _emptyUntil = {};
+  var _sticky = null;
+  var _tierSig = '';
+  var NEXT_JOB_RE = /\/candidate\/[^/?#]+\/application(?:[?#]|$)/;
+  var _fetch = self.fetch.bind(self);
+
+  function noteTier(tier, site) {
+    var sig = tier + '|' + (site || '');
+    if (sig === _tierSig) return;
+    _tierSig = sig;
+    try { chrome.storage.local.set({ ohQueueTier: { tier: tier, site: site || '', ts: Date.now() } }); } catch (_) {}
+  }
+  function withSite(url, site) {
+    var i = url.indexOf('#'), base = i >= 0 ? url.slice(0, i) : url;
+    return base + (base.indexOf('?') >= 0 ? '&' : '?') + 'jobsite=' + encodeURIComponent(site);
+  }
+  /* A reply that actually carries a job (OptimHire: ok, status != 0, data.data). */
+  function hasJob(res) {
+    if (!res || !res.ok) return Promise.resolve(false);
+    return res.clone().json().then(function (b) {
+      var j = b && b.status !== 0 && b.data;
+      return !!(j && (j.source || j.copilot_job_id));
+    }, function () { return false; });
+  }
+  async function nextJobAtsFirst(url, init) {
+    var tiers = [['ATS', ATS_SITES], ['job boards', BOARD_SITES]];
+    for (var t = 0; t < tiers.length; t++) {
+      var now = Date.now();
+      var order = tiers[t][1].filter(function (k) { return !(_emptyUntil[k] > now); });
+      if (_sticky && order.indexOf(_sticky) > 0) { order.splice(order.indexOf(_sticky), 1); order.unshift(_sticky); }
+      for (var i = 0; i < order.length; i++) {
+        var site = order[i], res = null;
+        try { res = await _fetch(withSite(url, site), init); } catch (_) { continue; }   // network: don't mark empty
+        if (res && (res.status === 401 || res.status === 403)) return _fetch(url, init);  // let OptimHire handle auth
+        if (await hasJob(res)) { _sticky = site; noteTier(tiers[t][0], site); return res; }
+        _emptyUntil[site] = Date.now() + EMPTY_TTL_MS;
+        if (_sticky === site) _sticky = null;
+      }
+    }
+    noteTier('everything else (incl. Reed)', '');
+    return _fetch(url, init);
+  }
+  self.fetch = function (input, init) {
+    try {
+      var url = typeof input === 'string' ? input : (input && input.url) || '';
+      var method = String((init && init.method) || (input && input.method) || 'GET').toUpperCase();
+      if (method === 'GET' && NEXT_JOB_RE.test(url) && !/[?&](job_id|jobsite)=/.test(url) &&
+          snap.ohPreferAts !== false) {
+        return nextJobAtsFirst(url, init);
+      }
+    } catch (_) {}
+    return _fetch(input, init);
+  };
 
   var snap = {};
   try {

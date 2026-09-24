@@ -7429,12 +7429,22 @@
            never stalls. */
         setTimeout(async () => {
           try {
-            const dd = await ST.get(['ohJobQueueAdvanceReq', 'ohJobQueue', 'ohJobQueueActive']);
+            const dd = await ST.get(['ohJobQueueAdvanceReq', 'ohJobQueue', 'ohJobQueueActive', 'ohPreferAts']);
             const req = dd.ohJobQueueAdvanceReq;
             if (!req || req.ts !== reqTs) return;        // manager handled it
             if (!dd.ohJobQueueActive) return;            // queue stopped
             let qq = Array.isArray(dd.ohJobQueue) ? dd.ohJobQueue : [];
-            const nx = qq.find(j => j.status === 'pending');
+            /* Same order as the Queue Manager: ATS jobs first, Reed last. */
+            const tier = (u) => {
+              let h = ''; try { h = new URL(u).hostname.toLowerCase(); } catch (_) { return 1; }
+              if (/(^|\.)reed\.co\.uk$/.test(h)) return 3;
+              if (/(^|\.)(indeed|linkedin|ziprecruiter|adzuna|dice|glassdoor|monster|totaljobs|cv-library|simplyhired|hiring\.cafe)\./.test(h)) return 2;
+              if (/greenhouse|lever\.co|myworkdayjobs|workday|ashbyhq|icims|smartrecruiters|workable|breezy|jobvite|bamboohr|paylocity|jazzhr|teamtailor|recruitee|pinpoint|oraclecloud|taleo|successfactors|ultipro|avature|rippling|comeet|manatal/.test(h)) return 0;
+              return 1;
+            };
+            const pending = qq.filter(j => j.status === 'pending');
+            const nx = dd.ohPreferAts === false ? pending[0]
+              : pending.reduce((best, j) => (!best || tier(j.url) < tier(best.url) ? j : best), null);
             if (nx) {
               nx.status = 'running';
               nx.attempts = (nx.attempts || 0) + 1;
