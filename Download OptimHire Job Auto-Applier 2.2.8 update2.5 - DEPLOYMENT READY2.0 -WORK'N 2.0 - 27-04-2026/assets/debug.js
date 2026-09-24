@@ -7,6 +7,9 @@
  */
 (function () {
   'use strict';
+  /* Refuse to run inside a frame (tabs/* is web-accessible to every site;
+     this page must never be embeddable to trick clicks on "Clear all"). */
+  if (window.top !== window.self) { document.documentElement.innerHTML = ''; return; }
   var ST = chrome.storage.local;
   var KEY         = 'ohDebugLog';
   var KEY_ENABLED = 'ohDebugEnabled';

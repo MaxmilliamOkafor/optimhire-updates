@@ -230,6 +230,9 @@
   /* ── Auto-capture: runtime messages ────────────────────────────── */
   try {
     chrome.runtime.onMessage.addListener(function (msg, sender) {
+      /* Bail BEFORE serializing: safe(msg) deep-walks the payload, and this
+         listener runs in every tab for every message even with capture off. */
+      if (!_enabled || _paused) return;
       try {
         var label = (msg && (msg.type || msg.action)) || '(message)';
         log('message', String(label), {
