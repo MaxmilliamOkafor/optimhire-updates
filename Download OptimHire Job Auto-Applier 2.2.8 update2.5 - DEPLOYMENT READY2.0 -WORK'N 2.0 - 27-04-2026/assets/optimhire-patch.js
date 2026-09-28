@@ -220,6 +220,20 @@
     }).catch(() => {});
   } catch (_) {}
 
+  /* OptimHire activity. Its state (autoApplyState / the one-job mode's
+     job) changes as it works, and the side panel stamps ohPanelActivityTs
+     whenever OptimHire's panel text changes ("Fetching your answers",
+     "Filling your answers"…). Watchdogs treat recent activity as progress,
+     so a job OptimHire is still working on is never skipped as "stuck". */
+  let _ohActivityTs = Date.now();
+  try {
+    chrome.storage.onChanged.addListener((c, area) => {
+      if (area !== 'local') return;
+      if (c.autoApplyState || c.manualApplicationDetail || c.isManualSubmit || c.ohPanelActivityTs ||
+          c.complexFormInProgress || c.complexFormData) _ohActivityTs = Date.now();
+    });
+  } catch (_) {}
+
   /* May we take ACTION (click Apply, submit a form, skip a job)?
      `d` is a storage snapshot containing the keys below. */
   function mayAutomate(d) {
@@ -927,9 +941,108 @@
     return Math.max(0, Math.round(AUTO_SKIP_MAX_SECONDS - elapsed));
   }
 
+  /* ── Rescue: finish the form before OptimHire gives up on it ──────────
+   * When OptimHire's own page script can't complete a form (a required
+   * question it had no answer for, a submit that bounced) it reports an
+   * error — and that error is what ends the job: a 10s skip countdown in
+   * auto mode, or waiting for a human in one-job-at-a-time mode. That is
+   * where most "skipped, never submitted" jobs came from.
+   *
+   * OptimHire's page script runs in this same content-script world, so
+   * its messages pass through chrome.runtime.sendMessage below. A fixable
+   * error is held back while OUR engine fills what is missing (dropdowns,
+   * location, required fields) and presses submit. Confirmed → OptimHire
+   * is told the application went through. Not confirmed within the time
+   * limit → the original error is passed on and OptimHire skips as before.
+   * A submit that navigates to a new page is finished by that page (the
+   * pending rescue is kept in storage for a minute). */
+  const RESCUABLE_ERR_RE = /^(missing-questions|submit-failed|incomplete|failure|submissionError)$/;
+  const RESCUE_MS = 30_000;
+  let _rescueBusy = false, _rescuedUrl = '', _rescuedTs = 0;
+  function isRescuableError(msg) {
+    if (!msg || window.top !== window.self) return false;
+    const manualErr = msg.type === 'MANUAL_FORM_ERROR_SUCCESS_MESSAGE' && !msg.isSuccess;
+    if (msg.type !== 'COMPLEX_FORM_ERROR' && !manualErr) return false;
+    return RESCUABLE_ERR_RE.test(String(msg.errorType || ''));
+  }
+  function successFor(msg) {
+    return msg.type === 'COMPLEX_FORM_ERROR'
+      ? { type: 'COMPLEX_FORM_SUCCESS', message: 'successMessage', url: location.href, success_next_job: true }
+      : { type: 'MANUAL_FORM_ERROR_SUCCESS_MESSAGE', message: 'Application submitted successfully', url: location.href,
+          applicationDetails: msg.applicationDetails, isSuccess: true };
+  }
+  async function rescueThenReport(msg, send) {
+    _rescueBusy = true;
+    const deadline = Date.now() + RESCUE_MS;
+    let confirmed = false;
+    try {
+      const d = await ST.get(['ohAutomationDisabled']);
+      if (d.ohAutomationDisabled === true) { send(msg); return; }
+      LOG(`Rescue: OptimHire reported "${msg.errorType}" — completing the form ourselves before giving up`);
+      if (pageConfirmsApplication()) confirmed = true;
+      for (let round = 0; !confirmed && round < 2 && Date.now() < deadline; round++) {
+        try {
+          _fillActive = true;
+          await runAtsAutofill();
+          try { await detectAndFixValidationErrors(); } catch (_) {}
+          try { await sanitizeBadFills(); } catch (_) {}
+          try { await answerComboDropdowns(document, await getProfile()); } catch (_) {}
+        } catch (_) {} finally { _fillActive = false; }
+        if (typeof rescueLocationNow === 'function') { try { await rescueLocationNow(); } catch (_) {} }
+        const hit = typeof findAnySubmitButton === 'function' ? findAnySubmitButton() : null;
+        if (!hit) { LOG('Rescue: no submit button to press'); break; }
+        /* The submit may load a new page — leave a note for it. */
+        await ST.set({ ohRescuePending: { ts: Date.now(), origin: location.origin, msg } });
+        markSubmitAttempted();
+        LOG(`Rescue: pressing ${hit.why}`);
+        try { realClick(hit.btn); } catch (_) { try { hit.btn.click(); } catch (__) {} }
+        for (let i = 0; i < 20 && Date.now() < deadline; i++) {
+          await sleep(500);
+          if (pageConfirmsApplication()) { confirmed = true; break; }
+        }
+      }
+      if (confirmed) {
+        LOG('Rescue: application confirmed — telling OptimHire it went through');
+        _rescuedUrl = location.href; _rescuedTs = Date.now();
+        send(successFor(msg));
+      } else {
+        LOG(`Rescue: could not complete the form — passing on "${msg.errorType}"`);
+        send(msg);
+      }
+      await ST.remove('ohRescuePending');
+    } catch (_) {
+      send(msg);
+    } finally {
+      _rescueBusy = false;
+    }
+  }
+  /* A rescue whose submit loaded this page: finish it here. */
+  (async function finishRescueOnNewPage() {
+    try {
+      if (window.top !== window.self) return;
+      const { ohRescuePending: r } = await ST.get('ohRescuePending');
+      if (!r || !r.msg || Date.now() - (r.ts || 0) > 60_000 || r.origin !== location.origin) return;
+      await sleep(2500);                                   // let the confirmation render
+      const ok = pageConfirmsApplication();
+      await ST.remove('ohRescuePending');
+      LOG(ok ? 'Rescue: confirmation page after our submit — telling OptimHire it went through'
+             : `Rescue: no confirmation after our submit — passing on "${r.msg.errorType}"`);
+      chrome.runtime.sendMessage(ok ? successFor(r.msg) : r.msg).catch(() => {});
+    } catch (_) {}
+  })();
+
   (function capAutoSkipOnSend() {
     const _orig = chrome.runtime.sendMessage.bind(chrome.runtime);
     chrome.runtime.sendMessage = function (msg, ...args) {
+      try {
+        if (isRescuableError(msg)) {
+          /* Already rescued this page → the job is done; ignore late echoes. */
+          if (_rescuedUrl === location.href && Date.now() - _rescuedTs < 60_000) return Promise.resolve();
+          if (_rescueBusy) return Promise.resolve();    // the rescue in progress decides
+          rescueThenReport(msg, (m) => { try { _orig(m).catch(() => {}); } catch (_) {} });
+          return Promise.resolve();
+        }
+      } catch (_) {}
       try {
         if (msg && msg.type === 'AUTO_APPLY_STATE_UPDATE' &&
             typeof msg.autoSkipSeconds === 'number') {
@@ -4407,7 +4520,12 @@
        fill → generate cover letter → upload CV → submit) legitimately
        takes 30-60s on slower ATSes. Skipping earlier abandons real
        applications. */
-    const STUCK_TIMEOUT_MS = 60_000;
+    /* Was 60s of "no page change" — but OptimHire's own "Fetching your
+       answers" step (its AI writing answers) often keeps the page still
+       for that long, and skips are real now: jobs were being skipped
+       mid-fill. OptimHire's activity counts as progress (below), and a job
+       has to be silent for 3 minutes before it is judged stuck. */
+    const STUCK_TIMEOUT_MS = 180_000;
     const POLL_MS = 2_000;
 
     let _lastUrl = '';
@@ -4451,6 +4569,8 @@
       if (_fillActive) progressed = true;                                 // our autofill
       if (_submitAttempted && now - _submitAttemptTs < 30_000) progressed = true;
       if (optimHireBusy()) progressed = true;                             // OH overlay/spinner
+      if (Date.now() - _ohActivityTs < 45_000) progressed = true;         // OptimHire's state/panel moved
+      if (_rescueBusy) progressed = true;                                 // we are finishing the form
       const sig = formSignature();
       if (sig !== _lastFormSignature) { _lastFormSignature = sig; progressed = true; }
 
@@ -5047,6 +5167,7 @@
          fields are still not satisfied AND there ARE required fields
          (so we don't fire on empty pages or pages with no form). */
       if (Date.now() - _lastFillCompletedTs < MISSING_SKIP_MS) return;
+      if (Date.now() - _ohActivityTs < 30_000 || _rescueBusy) return;   // OptimHire (or our rescue) still working
       const reqCount = $$(
         'input[required]:not([type=hidden]),input[aria-required="true"]:not([type=hidden]),' +
         'textarea[required],textarea[aria-required="true"],' +

@@ -39,6 +39,14 @@
  *    that way is held back in favour of a waiting ATS job (not skipped —
  *    it stays in OptimHire's queue for later).
  *
+ * 6. OptimHire's own auto-submit, back on. 2.9.0 overwrites
+ *    is_copilot_automatic_apply_to_job with "0" every time it saves your
+ *    profile, so its engine filled each form and then STOPPED at "Review and
+ *    submit the form" — and did not move on after a success either. That
+ *    stored flag decides whether OptimHire submits the form itself (with
+ *    its per-site knowledge of each ATS) and goes to the next job. It is
+ *    kept at "1" while automation is ON (master switch).
+ *
  * Wiring: manifest.json background.service_worker points here. On an
  * OptimHire update, copy the new index.js in and keep this entry point.
  * Same directory as index.js on purpose, so nothing that resolves paths
@@ -363,8 +371,54 @@
   };
 
   var snap = {};
+
+  /* Auto-submit: keep OptimHire's "automatic apply" flag on (see 6 above). */
+  var AUTO_FLAG = 'is_copilot_automatic_apply_to_job';
+  var area = chrome.storage && chrome.storage.local;
+  var _origSet = area && area.set ? area.set.bind(area) : null;
+  if (_origSet) {
+    area.set = function (items, cb) {
+      try {
+        var cd = items && items.candidateDetails;
+        if (cd && typeof cd === 'object' && cd[AUTO_FLAG] !== '1' && snap.ohAutomationDisabled !== true) {
+          var copy = Object.assign({}, cd); copy[AUTO_FLAG] = '1';
+          items = Object.assign({}, items, { candidateDetails: copy });
+        }
+      } catch (_) {}
+      return typeof cb === 'function' ? _origSet(items, cb) : _origSet(items);
+    };
+  }
+  /* …and every READ of the profile by OptimHire's background sees it on —
+     its auto-submit / next-job decisions read the stored profile at the
+     moment they decide, whether or not anything re-saved it since. */
+  var _origGet = area && area.get ? area.get.bind(area) : null;
+  if (_origGet) {
+    area.get = function (keys, cb) {
+      var wants = keys == null || keys === 'candidateDetails' ||
+                  (Array.isArray(keys) && keys.indexOf('candidateDetails') !== -1) ||
+                  (typeof keys === 'object' && !Array.isArray(keys) && Object.prototype.hasOwnProperty.call(keys, 'candidateDetails'));
+      if (!wants || snap.ohAutomationDisabled === true) return _origGet.apply(null, arguments);
+      var fix = function (d) {
+        try {
+          var cd = d && d.candidateDetails;
+          if (cd && typeof cd === 'object' && cd[AUTO_FLAG] !== '1') { var c2 = Object.assign({}, cd); c2[AUTO_FLAG] = '1'; d.candidateDetails = c2; }
+        } catch (_) {}
+        return d;
+      };
+      if (typeof cb === 'function') return _origGet(keys, function (d) { cb(fix(d)); });
+      return _origGet(keys).then(fix);
+    };
+  }
+  function ensureAutoSubmitFlag() {
+    if (!_origSet || snap.ohAutomationDisabled === true) return;
+    _origGet(['candidateDetails'], function (d) {                       // the raw stored value
+      var cd = d && d.candidateDetails;
+      if (cd && typeof cd === 'object' && cd[AUTO_FLAG] !== '1') area.set({ candidateDetails: cd });   // re-saved through the wrapper
+    });
+  }
+
   try {
-    chrome.storage.local.get(KEYS, function (d) { snap = d || {}; apply(snap); });
+    chrome.storage.local.get(KEYS, function (d) { snap = d || {}; apply(snap); ensureAutoSubmitFlag(); });
     chrome.storage.onChanged.addListener(function (c, area) {
       if (area !== 'local') return;
       var hit = false;
@@ -372,6 +426,10 @@
         if (c[k]) { hit = true; if (c[k].newValue === undefined) delete snap[k]; else snap[k] = c[k].newValue; }
       });
       if (hit) apply(snap);
+      if (c.ohAutomationDisabled && c.ohAutomationDisabled.newValue !== true) ensureAutoSubmitFlag();
+      /* Any other writer (the panel, a page) saving it with auto-submit off. */
+      var ncd = c.candidateDetails && c.candidateDetails.newValue;
+      if (ncd && typeof ncd === 'object' && ncd[AUTO_FLAG] !== '1') ensureAutoSubmitFlag();
     });
   } catch (_) {}
 })();
