@@ -906,7 +906,7 @@
   }
   if (btnSkip) {
     btnSkip.addEventListener('click', function () {
-      chrome.runtime.sendMessage({ action: 'skipCurrent' }).catch(function () {});
+      sendOhSkip('Skip pressed');
       addLog('Skipping current job...', '');
     });
   }
@@ -939,7 +939,7 @@
    *   - SUBMIT_ATTEMPTED was received (content script just clicked submit)
    *   - The current status is "submitting" (from SIDEBAR_STATUS event)
    * ─────────────────────────────────────────────────────────────────────── */
-  const AUTO_SKIP_MAX = 15;
+  const AUTO_SKIP_MAX = 10;         // seconds (was 15); OptimHire's own 180s is cut to 10s in oh-bg.js
   let _forceSkipTimer  = null;
   let _forceSkipJobKey = '';
   let _submitAttemptedTs = 0; // timestamp of last SUBMIT_ATTEMPTED message
@@ -1027,7 +1027,7 @@
    *   4. Aborted if the warning disappears OR a submit was just
    *      attempted (30-second submit-suppression window).
    * ─────────────────────────────────────────────────────────────────── */
-  var MD_TIMEOUT_MS = 15_000;
+  var MD_TIMEOUT_MS = 10_000;       // was 15s
   var _mdStartAt = 0;
   var _mdTimerId = null;
   var _mdCountdownEl = null;
@@ -1164,6 +1164,32 @@
      timer (the freeze the user kept hitting). Clicking the REAL Skip
      button in the sidepanel DOES advance it. So we click the button
      first and only fall back to the message if no button is present. */
+  /* Skip the current job the way OptimHire 2.9.0 actually understands.
+     Its background has NO handler for {action:'skipCurrent'} any more —
+     every "sent skipCurrent" (stall recovery, watchdogs, our Skip button)
+     was silently ignored, which is why a stuck "Loading your Job" never
+     recovered. AUTO_APPLY_SKIP records the skip and loads the next job
+     (or, for a job started from the optimhire.com page, ends it and goes
+     back to the page); the one-job-at-a-time mode takes a skip flag on
+     OPEN_MANUAL_APPLICATION. */
+  function sendOhSkip(reason) {
+    try {
+      chrome.storage.local.get(['autoApplyState', 'isAutoProcessStartJob', 'isManuallyStartJob', 'isSingleManualApplication'], function (d) {
+        d = d || {};
+        var st = d.autoApplyState;
+        var msg;
+        if (d.isManuallyStartJob && !d.isSingleManualApplication && !(st && st.isActive)) {
+          msg = { action: 'OPEN_MANUAL_APPLICATION', isSkipped: true, error: { reason: 'auto_' + (reason || 'skip') } };
+        } else {
+          msg = { action: 'AUTO_APPLY_SKIP', skipReason: 'auto_skip', status: '4',
+                  status_message: 'Skipped automatically: ' + (reason || 'stuck'),
+                  applicationDetails: (st && st.applicationDetails) || undefined };
+        }
+        Promise.resolve(chrome.runtime.sendMessage(msg)).catch(function () {});
+      });
+    } catch (_) {}
+  }
+
   function forceAdvanceSkip(reason) {
     var btn = findVisibleSkipButton();
     if (btn) {
@@ -1176,8 +1202,8 @@
       addLog((reason ? reason + ' — ' : '') + 'clicked Skip to advance', '');
       return true;
     }
-    try { chrome.runtime.sendMessage({ action: 'skipCurrent' }).catch(function () {}); } catch (_) {}
-    addLog((reason ? reason + ' — ' : '') + 'sent skipCurrent (no Skip button found)', '');
+    sendOhSkip(reason);
+    addLog((reason ? reason + ' — ' : '') + 'told OptimHire to skip (no Skip button showing)', '');
     return false;
   }
 
@@ -1259,9 +1285,8 @@
         } catch (_) { try { btn.click(); } catch (__) {} }
         addLog('Missing-details: countdown reached 0, clicked Skip', '');
       } else {
-        try { chrome.runtime.sendMessage({ action: 'skipCurrent' }).catch(function(){}); }
-        catch (_) {}
-        addLog('Missing-details: countdown reached 0, sent skipCurrent', '');
+        sendOhSkip('missing details');
+        addLog('Missing-details: countdown reached 0, told OptimHire to skip', '');
       }
     }
   }
@@ -1847,11 +1872,23 @@
   (function installReviewSubmitRelay() {
     var RE = /review and submit the form/i;
     var _lastSend = 0;
+    var _lastText = '', _lastBeat = 0;
     function check() {
       try {
-        if (Date.now() - _lastSend < 1500) return;
         var root = document.getElementById('__plasmo') || document.body;
-        if (!root || !RE.test(root.innerText || '')) return;
+        var text = root ? (root.innerText || '') : '';
+        /* Heartbeat: OptimHire's panel changing ("Fetching your answers",
+           "Filling your answers"…) means it is working — the job tab's
+           watchdogs must not call that "stuck". */
+        if (text !== _lastText) {
+          _lastText = text;
+          if (Date.now() - _lastBeat > 5000) {
+            _lastBeat = Date.now();
+            try { chrome.storage.local.set({ ohPanelActivityTs: _lastBeat }); } catch (_) {}
+          }
+        }
+        if (Date.now() - _lastSend < 1500) return;
+        if (!root || !RE.test(text)) return;
         chrome.storage.local.get(OH_AUTOMATION_KEYS.concat(['copilotTabId']), function (d) {
           try {
             if (!mayAutomateSP(d)) return;
@@ -2139,8 +2176,7 @@
           _lastNudgeTs = now;
           addLog('Throughput monitor: no progress for ' +
                  fmtDuration(now - _lastProgressTs) + ' — nudging queue', '');
-          try { chrome.runtime.sendMessage({ action: 'skipCurrent' }).catch(function(){}); }
-          catch (_) {}
+          sendOhSkip('no progress');
         }
       } catch (_) {}
     }
@@ -2195,9 +2231,17 @@
           /application submitted successfully|your application (has been|was) (received|submitted)|thank you for applying|we('| ?ha)ve received your application|application (has been )?received|application successful/i.test(msg)) {
         return { outcome: 'submitted', reason: msg || 'confirmed' };
       }
-      if (state === 'skipped' || err === 'missing-questions' ||
+      /* Jobs that can't be applied to at all. */
+      if (/^(already-applied|redirect-to-company-site|page-error|form-not-found)$/.test(state)) {
+        return { outcome: 'closed', reason: msg || state };
+      }
+      /* Unattended, nobody can sign in or solve a captcha. */
+      if (state === 'login-required' || /login required/i.test(lmsg)) return { outcome: 'skipped', reason: 'site needs a login / account' };
+      if (state === 'captcha-required' || /captcha/i.test(lmsg)) return { outcome: 'skipped', reason: 'captcha' };
+      if (state === 'skipped' || err === 'missing-questions' || state === 'missing-questions' ||
+          state === 'submission-error' || state === 'button-not-found' ||
           /required fields are missing|submission blocked|missing or invalid/i.test(lmsg)) {
-        return { outcome: 'skipped', reason: msg || err || 'skipped' };
+        return { outcome: 'skipped', reason: msg || err || state || 'skipped' };
       }
       if (/no longer (open|available)|posting is closed|already applied|page not found|404|job closed/i.test(lmsg) ||
           state === 'job-closed') {
@@ -2263,9 +2307,10 @@
             var prev = prevKey && prevKey !== key ? map[prevKey] : null;
             if (prev && prev.outcome === 'pending') {
               prev.outcome = 'skipped';
-              prev.reason = 'moved on without a confirmation';
+              prev.reason = 'moved on without a confirmation' + (_lastStatus ? ' (last: ' + _lastStatus + ')' : '');
               prev.outcomeTs = Date.now();
             }
+            if (prevKey !== key) _lastStatus = '';
             var rec = map[key] || { id: String(jid || ''), firstSeen: Date.now(), outcome: 'pending' };
             /* Seen again in a new run: its old outcome belongs to that run. */
             if (map[key] && (rec.lastSeen || 0) < (_runStartTs || 0)) {
@@ -2293,9 +2338,11 @@
       } catch (_) {}
     }
 
+    var _lastStatus = '';   // what OptimHire was last doing on the current job
     function onState(st) {
       if (!st) return;
       upsert(st.applicationDetails);
+      if (st.statusMessage) _lastStatus = String(st.statusMessage).slice(0, 80);
       recordOutcome(st);
     }
 
@@ -2312,7 +2359,11 @@
       chrome.runtime.onMessage.addListener(function (msg) {
         if (!msg || msg.type !== 'MANUALLY_APPLY_STATE_UPDATE') return;
         if (msg.applicationDetails && msg.applicationDetails.source) upsert(msg.applicationDetails);
-        if (msg.manuallyApplyState) recordOutcome(msg.manuallyApplyState);
+        if (msg.manuallyApplyState) {
+          if (msg.manuallyApplyState.statusMessage) _lastStatus = String(msg.manuallyApplyState.statusMessage).slice(0, 80);
+          recordOutcome(msg.manuallyApplyState);
+        }
+        if (msg.checkStatusMessage) _lastStatus = String(msg.checkStatusMessage).slice(0, 80);
         if (msg.isManualSubmited) recordOutcome({ applicationState: 'completed', statusMessage: 'Application submitted successfully' });
       });
     } catch (_) {}
@@ -2803,6 +2854,19 @@
           }
           var truth = document.getElementById('oh-qc-truth');
           if (truth) {
+            /* Hover: why jobs were skipped, most common first. */
+            var why = {};
+            for (var wk in map) {
+              if (!Object.prototype.hasOwnProperty.call(map, wk)) continue;
+              var wr = map[wk];
+              if (!wr || wr.outcome === 'submitted' || wr.outcome === 'pending') continue;
+              var rs = String(wr.reason || wr.outcome).replace(/\s*\(last:.*\)$/, '').slice(0, 70);
+              why[rs] = (why[rs] || 0) + 1;
+            }
+            var whyList = Object.keys(why).sort(function (a, b) { return why[b] - why[a]; }).slice(0, 8)
+              .map(function (k) { return why[k] + ' × ' + k; });
+            truth.title = whyList.length ? 'Not submitted — why:\n' + whyList.join('\n') :
+              'OptimHire’s ‘X applied’ counter also counts SKIPS. This shows how many actually got a real submission confirmation.';
             truth.innerHTML = 'Real outcome: ' +
               '<b style="color:#4ade80">' + sub + ' submitted</b> · ' +
               '<b style="color:#fbbf24">' + skip + ' skipped</b>' +
