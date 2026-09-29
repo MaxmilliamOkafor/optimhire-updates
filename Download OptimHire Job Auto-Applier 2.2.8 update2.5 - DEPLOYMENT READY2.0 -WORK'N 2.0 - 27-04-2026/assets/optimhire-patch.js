@@ -349,9 +349,118 @@
       if (setter) setter.call(el, val); else el.value = val;
     } catch (_) { try { el.value = val; } catch (__) {} }
   }
+  /* ── Phone boxes with their own country-code picker ─────────────────
+   * Workable, intl-tel-input, react-phone-number-input… draw the dial
+   * code (🇮🇪 +353) in a picker beside the number box. Typing the full
+   * "+353 87 426 1508" into that box is rejected — the site cleared it,
+   * showed "This field is required.", our fillers typed it again, and the
+   * field flickered forever. Such a box gets the local number instead. */
+  let _profileDialCode = '';   // "353" — set by getProfile() from mobile_code
+  function isPhoneInput(el) {
+    if (!el || el.tagName !== 'INPUT') return false;
+    if ((el.type || '').toLowerCase() === 'tel') return true;
+    return /phone|mobile|\btel\b/i.test(`${el.name || ''} ${el.id || ''} ${el.getAttribute('autocomplete') || ''}`);
+  }
+  /* The dial code shown beside a phone box: "353", 'picker' when there is a
+     picker whose code can't be read, '' when there is none. */
+  function dialCodeBeside(el) {
+    const cls = x => String((x.getAttribute && x.getAttribute('class')) || '');
+    let box = el.parentElement;
+    for (let i = 0; i < 4 && box && box !== document.body; i++, box = box.parentElement) {
+      /* Stop once the box holds another field: we have left the phone widget. */
+      const others = [...box.querySelectorAll('input:not([type=hidden]),textarea')]
+        .filter(f => f !== el && !/country|dial|code|flag|search/i.test(`${f.name || ''} ${f.id || ''} ${f.placeholder || ''} ${f.getAttribute('aria-label') || ''}`));
+      if (others.length) return '';
+      for (const x of box.querySelectorAll('select,button,[role="combobox"],[aria-haspopup],[class*="country" i],[class*="dial" i],[class*="flag" i],[class*="iti" i],[class*="prefix" i]')) {
+        if (x === el || x.contains(el)) continue;
+        let t = x.tagName === 'SELECT'
+          ? ((x.selectedOptions && x.selectedOptions[0] && (x.selectedOptions[0].text + ' ' + x.selectedOptions[0].value)) || '')
+          : `${x.textContent || ''} ${x.getAttribute('aria-label') || ''} ${x.getAttribute('title') || ''}`;
+        const m = t.match(/\+\s?(\d{1,4})\b/);
+        if (m) return m[1];
+        if (x.tagName === 'SELECT' ? [...x.options].some(o => /\+\d{1,4}\b/.test(o.text)) :
+            /country|dial|flag|iti__|calling.?code|phone.?code/i.test(cls(x) + ' ' + (x.getAttribute('aria-label') || ''))) return 'picker';
+      }
+    }
+    return '';
+  }
+  /* Part of a phone widget (its country picker / search box), not a field. */
+  function inPhoneWidget(el) {
+    if (!el || isPhoneInput(el)) return false;
+    if (!/country|dial|code|flag|search|iti/i.test(`${el.name || ''} ${el.id || ''} ${el.placeholder || ''} ` +
+        `${el.getAttribute('aria-label') || ''} ${el.getAttribute('class') || ''}`)) return false;
+    let box = el.parentElement;
+    for (let i = 0; i < 3 && box && box !== document.body; i++, box = box.parentElement) {
+      const fields = [...box.querySelectorAll('input:not([type=hidden]),textarea')].filter(f => f !== el);
+      if (!fields.length) continue;
+      return fields.length === 1 && isPhoneInput(fields[0]);
+    }
+    return false;
+  }
+  /* "+353 87 426 1508" → "874261508" for a box that has its own picker. */
+  function phoneValueFor(el, val) {
+    if (!/^\s*(\+|00)\s?\d/.test(val) || !isPhoneInput(el)) return val;
+    const shown = dialCodeBeside(el);
+    if (!shown) return val;
+    const digits = val.replace(/\D/g, '').replace(/^00/, '');
+    const code = /^\d+$/.test(shown) ? shown : _profileDialCode;
+    if (code && digits.startsWith(code) && digits.length - code.length >= 6) return digits.slice(code.length);
+    return val;
+  }
+
+  /* ── No fill fights ─────────────────────────────────────────────────
+   * Several fillers (ours per ATS, sanitize passes, the validation fixer,
+   * the rescue) each re-typed a field whenever it looked wrong. When the
+   * SITE changes the value — reformats it, picks a suggestion, or clears
+   * what it rejects — that became an endless write/clear loop: the
+   * flickering Phone and "Dublin, Ireland, Dublin, Ireland" Address on
+   * Workable. Per field and value, we now type a value that the site
+   * rejected (cleared) at most FIGHT_MAX times, never retype a value we
+   * already wrote that is still there, and never overwrite the site's own
+   * edit of our value with the same value again. */
+  const FIGHT_MAX = 3;
+  const _ourWrites = new WeakMap();   // el → Map(value → times typed)
+  function wroteBefore(el, val) {
+    const m = _ourWrites.get(el);
+    return !!(m && m.has(val));
+  }
+  function mayWrite(el, val) {
+    if (!val || isComboInput(el)) return true;              // clearing, or a dropdown's search text
+    const m = _ourWrites.get(el);
+    const n = (m && m.get(val)) || 0;
+    if (!n) return true;
+    const cur = (el.value || '').trim();
+    if (cur === val.trim()) return false;                    // ours, still there
+    if (cur) {                                               // the site changed it
+      /* …except a value that was doubled up ("Dublin, Ireland, Dublin,
+         Ireland"): put it right, once. */
+      const doubled = /,/.test(val) &&
+                      (cur.split(val.trim()).length > 2 || cur.endsWith(', ' + val.trim()));
+      if (doubled && !(m.get('\u0000repaired'))) { m.set('\u0000repaired', 1); return true; }
+      return false;
+    }
+    if (n >= FIGHT_MAX) {                                    // the site keeps clearing it
+      if (!m.get('\u0000gaveUp')) {
+        m.set('\u0000gaveUp', 1);
+        LOG(`Fill: "${(getLabel(el) || el.name || el.id || 'field').slice(0, 40)}" keeps rejecting "${val.slice(0, 30)}" — leaving it`);
+      }
+      return false;
+    }
+    return true;
+  }
+  function noteWrite(el, val) {
+    if (!val) return;
+    let m = _ourWrites.get(el);
+    if (!m) { m = new Map(); _ourWrites.set(el, m); }
+    m.set(val, (m.get(val) || 0) + 1);
+  }
+
   function nativeSet(el, val) {
-    if (!el) return;
+    if (!el) return false;
     val = (val == null) ? '' : String(val);
+    val = phoneValueFor(el, val);
+    if (!mayWrite(el, val)) return false;
+    noteWrite(el, val);
     let ok = false;
     try {
       el.focus();
@@ -385,6 +494,7 @@
       try { el.dispatchEvent(new Event('input',  { bubbles: true })); } catch (__) {}
       try { el.dispatchEvent(new Event('change', { bubbles: true })); } catch (__) {}
     }
+    return true;
   }
 
   /** Real pointer-events click sequence (unchanged proven behaviour). */
@@ -430,6 +540,47 @@
         }
       }
     } catch (_) {}
+    return false;
+  }
+
+  /* ── Which field does an error message belong to? ───────────────────
+   * The old lookup took the FIRST input in a broad "[class*=field]" box,
+   * so Workable's Phone "This field is required." re-typed the Address
+   * above it on every pass. Now: the nearest box holding exactly one field
+   * (a phone widget's code picker doesn't count), or nothing. */
+  const FIELD_SEL = 'input:not([type=hidden]):not([type=submit]):not([type=button]):not([type=file]),textarea,select';
+  function fieldsIn(box) {
+    const all = [...box.querySelectorAll(FIELD_SEL)].filter(f => isVisible(f) || f.type === 'radio' || f.type === 'checkbox');
+    if (all.length < 2) return all;
+    /* A phone widget = number box + its code picker/search: one field. */
+    const tel = all.filter(f => (f.type || '').toLowerCase() === 'tel');
+    if (tel.length === 1 && all.every(f => f === tel[0] || f.tagName === 'SELECT' ||
+        /country|dial|code|flag|search/i.test(`${f.name || ''} ${f.id || ''} ${f.placeholder || ''} ${f.getAttribute('aria-label') || ''}`))) return tel;
+    /* One radio/checkbox group is one field too. */
+    const names = new Set(all.map(f => (f.type === 'radio' || f.type === 'checkbox') && f.name ? 'g:' + f.name : f));
+    return names.size === 1 ? [all[0]] : all;
+  }
+  function fieldOfMessage(msg) {
+    let box = msg.parentElement;
+    for (let i = 0; i < 6 && box && box !== document.body; i++, box = box.parentElement) {
+      const f = fieldsIn(box);
+      if (f.length === 1) return f[0];
+      if (f.length > 1) return null;
+    }
+    return null;
+  }
+  const ERROR_TEXT_SEL = '[class*="error" i],[class*="invalid" i],[role="alert"],[aria-live="assertive"]';
+  /* Is the site flagging THIS field (aria-invalid, or an error message in
+     the field's own box)? */
+  function fieldFlagged(el) {
+    if (el.getAttribute('aria-invalid') === 'true') return true;
+    let box = el.parentElement;
+    for (let i = 0; i < 6 && box && box !== document.body; i++, box = box.parentElement) {
+      if (fieldsIn(box).some(f => f !== el && !(f.type === 'radio' && f.name && f.name === el.name))) return false;
+      const hit = [...box.querySelectorAll(ERROR_TEXT_SEL)].some(e => !e.contains(el) &&
+        !e.querySelector(FIELD_SEL) && isVisible(e) && /\S/.test(e.textContent || '') && (e.textContent || '').trim().length < 200);
+      if (hit) return true;
+    }
     return false;
   }
 
@@ -1421,13 +1572,10 @@
     /* Text typed but no suggestion chosen: the site flags the field
        (aria-invalid or an error message next to it). Greenhouse's
        "Location (City)" sat like this — filled-looking, never accepted. */
-    function looksInvalid(el) {
-      if (el.getAttribute('aria-invalid') === 'true') return true;
-      const box = el.closest('.field,[class*="field" i],.form-group,fieldset,[class*="question" i]');
-      if (!box) return false;
-      return [...box.querySelectorAll('[class*="error" i],[role="alert"]')]
-        .some(e => isVisible(e) && (e.textContent || '').trim().length > 0 && !e.contains(el));
-    }
+    /* Only THIS field's own error counts: the old check looked in any
+       "[class*=field]" box, saw the Phone field's "This field is required."
+       under Workable's Address, and re-typed the address over and over. */
+    const looksInvalid = fieldFlagged;
     const _retriedInvalid = new WeakSet();
     /* Candidate typeahead inputs: required, visible, empty, location-ish. */
     function findLocationInputs() {
@@ -1435,12 +1583,13 @@
       const inputs = $$('input[type=text],input:not([type]),input[type=search],[role="combobox"] input')
         .filter(isVisible);
       for (const el of inputs) {
-        if (!isEmptyInput(el) && !looksInvalid(el)) continue;
-        const req = el.required || el.getAttribute('aria-required') === 'true' ||
-                    !!el.closest('[class*="required"]');
+        if (isPageChromeField(el)) continue;           // the site's own job-search "Where" box
         const lbl = (getLabel(el) || '') + ' ' + (el.placeholder || '') + ' ' +
                     (el.getAttribute('aria-label') || '');
         if (!LOC_RE.test(lbl)) continue;
+        if (!isEmptyInput(el) && !looksInvalid(el)) continue;
+        const req = el.required || el.getAttribute('aria-required') === 'true' ||
+                    !!el.closest('[class*="required"]');
         /* Only bother with fields that are actually required, or that are
            clearly combobox widgets waiting on a selection. */
         const isCombo = el.getAttribute('role') === 'combobox' ||
@@ -1462,10 +1611,20 @@
       }
     }
 
-    function visibleOptions() {
+    /* The suggestion list that belongs to `el` when it names one, else any
+       open option list. (A loose "[class*=menu] li" once matched the site's
+       own menus, and the first entry of whatever list was open got clicked
+       — how "Waterford, Ireland" ended up in the address.) */
+    function ownList(el) {
+      const id = el && (el.getAttribute('aria-controls') || el.getAttribute('aria-owns'));
+      const lb = id && document.getElementById(id);
+      return lb && isVisible(lb) ? lb : null;
+    }
+    function visibleOptions(el) {
+      const lb = ownList(el);
       return $$(
         '[role="option"],[class*="react-select__option"],[class*="Select__option"],' +
-        '[class*="select2-results__option"],[class*="menu"] li,[role="listbox"] li'
+        '[class*="select2-results__option"],[role="listbox"] li,.pac-item', lb || document
       ).filter(isVisible);
     }
 
@@ -1477,19 +1636,21 @@
       pressKey(el, 'ArrowDown');            // many widgets open on ArrowDown
       await sleep(900);                      // let async option lookup finish
 
-      let opts = visibleOptions();
+      const want = String(value).split(',')[0].trim().toLowerCase();
+      const matching = () => visibleOptions(el).filter(o => (o.textContent || '').toLowerCase().includes(want));
+      let opts = matching();
       if (!opts.length) {                    // retry with a shorter query
         const short = String(value).split(',')[0].trim();
         if (short && short !== value) {
           nativeSet(el, short);
           pressKey(el, 'ArrowDown');
           await sleep(900);
-          opts = visibleOptions();
+          opts = matching();
         }
       }
+      if (!opts.length && ownList(el)) opts = visibleOptions(el);   // the field's own list: its best guess
       if (opts.length) {
-        const want = String(value).split(',')[0].trim().toLowerCase();
-        const best = opts.find(o => (o.textContent || '').toLowerCase().includes(want)) || opts[0];
+        const best = opts[0];
         try { realClick(best); } catch (_) { try { best.click(); } catch (__) {} }
         await sleep(300);
         LOG(`Location typeahead: selected "${(best.textContent || '').trim().slice(0, 60)}" for "${entry.lbl.trim().slice(0, 40)}"`);
@@ -2115,8 +2276,23 @@
   /* ── Profile helper ─────────────────────────────────────── */
   async function getProfile() {
     const keys = ['candidateDetails', 'cachedSeekerInfo', 'seekerDetails', 'userDetails'];
-    const data = await ST.get(keys);
+    const data = await ST.get(keys.concat(['autoApplyState', 'complexFormData', 'manualApplicationDetail']));
     let merged = {};
+
+    /* OptimHire 2.9.0 keeps the applicant's real details (e-mail, phone
+       as mobile_code + mobile_num, address, city…) only on the job it is
+       working on — applicationDetails.seeker — and candidateDetails holds
+       little more than the name. Without this base the profile had no
+       phone at all, so a phone box the site cleared was never filled
+       again. Lowest priority: the sources below still override it. */
+    for (const k of ['manualApplicationDetail', 'complexFormData', 'autoApplyState']) {
+      try {
+        let v = data[k];
+        if (typeof v === 'string') v = JSON.parse(v);
+        const ad = v && (v.applicationDetails || v);
+        if (ad && ad.seeker && typeof ad.seeker === 'object') { merged = Object.assign({}, ad.seeker, merged); }
+      } catch (_) {}
+    }
 
     // Parse and merge all available profile sources
     for (const key of keys) {
@@ -2137,6 +2313,13 @@
     const pick = (...keys) => { for (const k of keys) if (merged[k]) return merged[k]; return ''; };
     merged.email    = pick('email', 'email_address', 'emailAddress', 'Email');
     merged.phone    = pick('phone', 'phone_number', 'phoneNumber', 'mobile', 'cell', 'Phone');
+    {
+      const code = String(merged.mobile_code || '').replace(/\D/g, '');
+      const num  = String(merged.mobile_num || '').replace(/\D/g, '');
+      if (!merged.phone && num) merged.phone = code ? `+${code} ${num}` : num;
+      if (code && !merged.phone_country_code) merged.phone_country_code = '+' + code;
+      if (code) _profileDialCode = code;
+    }
     merged.first_name = pick('first_name', 'firstName', 'given_name', 'givenName');
     merged.last_name  = pick('last_name',  'lastName',  'family_name','familyName', 'surname');
     merged.linkedin_profile_url = pick('linkedin_profile_url','linkedin_url','linkedinUrl','linkedin','LinkedIn');
@@ -3447,13 +3630,16 @@
       }
       for (const inp of phoneCandidates) {
         const v = (inp.value || '').trim();
-        if (v) continue; // already has something (likely the country code or user input)
+        /* Already has something (the user's input, or ours) — but a lone
+           "+353" the widget pre-typed is still an empty number. */
+        if (v && !/^\+\s?\d{1,4}$/.test(v)) continue;
         const lbl = (getLabel(inp) || inp.name || inp.id || inp.placeholder || '').toLowerCase();
         /* Skip clearly-country-code-only inputs */
         if (/country.*code|dial.*code|\bprefix\b|code$/.test(lbl)) continue;
         if (inp.maxLength > 0 && inp.maxLength <= 5) continue; // short field = code, not number
-        LOG(`sanitize: phone field "${lbl}" → ${p.phone}`);
-        inp.focus(); nativeSet(inp, p.phone); await sleep(40);
+        if (v && inp.getBoundingClientRect().width < 80) continue;  // a narrow "+353" box is the code itself
+        inp.focus();
+        if (nativeSet(inp, p.phone)) { LOG(`sanitize: phone field "${lbl}" filled`); await sleep(40); }
       }
     }
 
@@ -3552,9 +3738,7 @@
         if (await chooseComboOption(el, String(guessValue(lbl, p) || '').replace(/^n\/?a$/i, ''), true)) fixed++;
       } else {
         const val = guessValue(lbl, p, inputType) || (inputType === 'email' ? p.email : '') || (inputType === 'tel' ? p.phone : '');
-        if (val) {
-          el.focus();
-          nativeSet(el, val);
+        if (val && nativeSet(el, val)) {
           await sleep(60);
           fixed++;
         }
@@ -3562,28 +3746,27 @@
     }
 
     // Also scan for error MESSAGE elements and look for their associated field above
-    const errorMsgEls = $$(
-      '[class*="error-message"],[class*="errorMessage"],[class*="field-error"],[class*="fieldError"],' +
-      '[role="alert"]:not([class*="banner"])'
-    ).filter(isVisible);
+    const errorMsgEls = $$(ERROR_TEXT_SEL + ',[class*="error-message"],[class*="errorMessage"]')
+      .filter(m => !/banner/i.test(String(m.getAttribute('class') || '')) && !m.querySelector(FIELD_SEL) &&
+                   /\S/.test(m.textContent || '') && (m.textContent || '').trim().length < 200 && isVisible(m));
 
+    const seen = new Set();
     for (const msg of errorMsgEls) {
-      const container = msg.closest(
-        '.form-group,.field,[class*="Field"],[class*="Question"],[class*="form-row"],fieldset'
-      );
-      if (!container) continue;
-      const inp = container.querySelector(
-        'input:not([type=hidden]):not([type=submit]):not([type=button]),textarea,select'
-      );
-      if (!inp || !isVisible(inp)) continue;
+      const inp = fieldOfMessage(msg);     // the ONE field this message sits with, or none
+      if (!inp || seen.has(inp) || !isVisible(inp) || isPageChromeField(inp)) continue;
+      seen.add(inp);
       if (inp.tagName === 'SELECT') continue; // handled above
+      if (inp.type === 'radio' || inp.type === 'checkbox') continue;
       if (isComboInput(inp)) continue;        // dropdowns: handled above / answerComboDropdowns
       const lbl = getLabel(inp) || inp.name || '';
       const inputType = (inp.type || '').toLowerCase();
       const val = guessValue(lbl, p, inputType);
-      if (val && inp.value?.trim() !== val) {
-        inp.focus(); nativeSet(inp, val); await sleep(60); fixed++;
-      }
+      if (!val) continue;
+      /* Still flagged although it shows our value? Another writer (OptimHire
+         sets values without typing) may not have registered with the site:
+         type it once for real. nativeSet() refuses anything more. */
+      const want = phoneValueFor(inp, String(val));
+      if ((inp.value?.trim() !== want || !wroteBefore(inp, want)) && nativeSet(inp, val)) { await sleep(60); fixed++; }
     }
 
     if (fixed > 0) LOG(`detectAndFixValidationErrors: fixed ${fixed} error fields`);
@@ -3773,7 +3956,7 @@
 
     /* Inputs + textareas — only unfilled. Dropdown search boxes are not
        text fields: answerComboDropdowns() handles those below. */
-    const inputs = allInputs.filter(el => !el.value?.trim() && !isComboInput(el));
+    const inputs = allInputs.filter(el => !el.value?.trim() && !isComboInput(el) && !inPhoneWidget(el));
 
     for (const inp of inputs) {
       const lbl = getLabel(inp);
@@ -4027,7 +4210,7 @@
       'input[aria-required="true"]:not([type=hidden]):not([type=file]),' +
       'textarea[required],textarea[aria-required="true"],' +
       'select[required],select[aria-required="true"]'
-    ).filter(el => isVisible(el) && !(el.value && el.value.trim()) && !isComboInput(el));
+    ).filter(el => isVisible(el) && !(el.value && el.value.trim()) && !isComboInput(el) && !inPhoneWidget(el));
 
     for (const el of stillEmpty) {
       const lbl = getLabel(el);
@@ -4548,20 +4731,42 @@
       } catch (_) { return ''; }
     }
 
+    /* Hard cap: one job may not hold the page for more than JOB_CAP_MS,
+       busy or not. A form that the site keeps rejecting (Workable's phone)
+       sent OptimHire round and round — re-filling every field, which the
+       checks below count as progress — and one job sat flickering for 22
+       minutes. Real applications take well under a minute. */
+    const JOB_CAP_MS = 300_000;
+    let _capKey = '', _capStartTs = 0;
+
     async function checkStuck() {
-      let active = false;
+      let active = false, jobKey = '';
       try {
         const d = await ST.get([
           'csvActiveJobId', 'isAutoProcessStartJob', 'isManuallyStartJob', 'ohJobTab', 'ohJobQueueActive',
+          'active_copilot_job_id',
         ]);
         active = (!!d.csvActiveJobId || !!d.isAutoProcessStartJob || !!d.isManuallyStartJob) &&
                  !notTheJobTab(d);
+        jobKey = String(d.csvActiveJobId || d.active_copilot_job_id || '');
       } catch (_) { return; }
 
-      if (!active) { _lastProgressTs = Date.now(); return; }
+      if (!active) { _lastProgressTs = Date.now(); _capKey = ''; return; }
 
       const cur = normalizeUrl(location.href);
       const now = Date.now();
+
+      if (window.top === window.self) {
+        const key = jobKey + '|' + cur;
+        if (key !== _capKey) { _capKey = key; _capStartTs = now; }
+        else if (now - _capStartTs >= JOB_CAP_MS) {
+          const min = Math.round((now - _capStartTs) / 60000);
+          LOG(`Stuck watchdog: ${min} min on one job without finishing (${cur}) — skipping`);
+          requestSkipCurrent(`stuck: ${min} min on one job — the form kept being re-filled`);
+          _capStartTs = now; _lastProgressTs = now;
+          return;
+        }
+      }
 
       /* Any of these counts as progress → reset the inactivity clock */
       let progressed = false;
@@ -5816,7 +6021,7 @@
     const submitBtn = $$('button[type="submit"],button').find(el =>
       isVisible(el) && /submit|apply|send.*application/i.test(el.textContent)
     );
-    if (submitBtn) { await sleep(400); realClick(submitBtn); }
+    if (submitBtn && !autoSubmitBlockedHere()) { await sleep(400); realClick(submitBtn); }
   }
 
   /* ── BambooHR autofill ───────────────────────────────────── */
@@ -5947,18 +6152,24 @@
 
     for (const [sel, val] of WBL_MAP) {
       if (!val) continue;
-      const el = $$(sel).find(e => isVisible(e) && !e.value?.trim());
+      /* The phone's country picker has its own search box ("country…",
+         "phone-country"): typing "Ireland" or the number into it reset the
+         phone field. Only real fields, never the picker's parts. */
+      const el = $$(sel).find(e => isVisible(e) && !e.value?.trim() && !isComboInput(e) &&
+        (val === p.phone ? isPhoneInput(e) && !/country|dial|code|search/i.test(`${e.name || ''} ${e.id || ''}`)
+                         : !inPhoneWidget(e)));
       if (el) { el.focus(); nativeSet(el, val); await sleep(50); }
     }
 
     // Handle Workable custom question dropdowns and radio buttons
     await autoFillPage();
 
-    // Workable uses a "Submit application" button
+    /* Workable's button reads "Submit application". (/apply/ also hit
+       "Apply with LinkedIn / Indeed", which leaves the form.) */
     const submitBtn = $$('button').find(el =>
-      isVisible(el) && /submit.*application|submit.*form|apply/i.test(el.textContent)
+      isVisible(el) && /^\s*submit(\s+(your|my))?(\s+application)?\s*$/i.test(el.textContent || '')
     );
-    if (submitBtn) { await sleep(400); realClick(submitBtn); }
+    if (submitBtn && !autoSubmitBlockedHere()) { await sleep(400); realClick(submitBtn); }
 
     LOG('Workable autofill done');
   }
