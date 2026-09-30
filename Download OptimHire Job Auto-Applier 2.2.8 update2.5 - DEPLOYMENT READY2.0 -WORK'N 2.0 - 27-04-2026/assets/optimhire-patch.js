@@ -569,7 +569,8 @@
     }
     return null;
   }
-  const ERROR_TEXT_SEL = '[class*="error" i],[class*="invalid" i],[role="alert"],[aria-live="assertive"]';
+  const ERROR_TEXT_SEL = '[class*="error" i],[class*="invalid" i],[role="alert"],[aria-live="assertive"],' +
+                         '[data-automation-id="inputAlert"],[data-automation-id="errorMessage"]';   // Workday
   /* Is the site flagging THIS field (aria-invalid, or an error message in
      the field's own box)? */
   function fieldFlagged(el) {
@@ -5746,13 +5747,80 @@
     const byId = wdVisible(to === 'create' ? 'createAccountLink' : 'signInLink');
     if (byId) return byId;
     const re = to === 'create' ? /^create (an )?account$/i : /^sign in$/i;
-    return $$('a,button,[role="button"]').find(e => isVisible(e) && re.test((e.textContent || '').trim()) &&
-      !e.closest('[data-automation-id="signInSubmitButton"],[data-automation-id="createAccountSubmitButton"]')) || null;
+    const all = $$('a,button,[role="button"]').filter(e => isVisible(e) && re.test((e.textContent || '').trim()) &&
+      e.getAttribute('data-automation-id') !== 'click_filter' &&
+      !e.closest('[data-automation-id="signInSubmitButton"],[data-automation-id="createAccountSubmitButton"],form[data-automation-id="signInFormo"]'));
+    /* Not the page header's "Sign In" (it opens a different sign-in). */
+    return all.find(e => !e.closest('header,nav,[role="banner"],[data-automation-id="header"]')) || null;
+  }
+  /* Newer Workday sites label their buttons only by text ("Create Account",
+     "Sign In") and name the page in a heading; fields may carry no id but
+     a label ("Email Address", "Verify New Password"). Both kinds are read. */
+  function wdButtonByText(label) {
+    const want = label.toLowerCase();
+    const all = $$('button,[role="button"]').filter(b => isVisible(b) && (b.textContent || '').trim().toLowerCase() === want &&
+      b.getAttribute('data-automation-id') !== 'click_filter');
+    /* Not the header's own "Sign In" — unless it sits in the sign-in form. */
+    return all.find(b => !b.closest('header,nav,[role="banner"],[data-automation-id="header"]') ||
+                         b.closest('form,[data-automation-id*="signIn"],[data-automation-id*="auth"]')) || null;
+  }
+  function wdInputByLabel(re) {
+    for (const l of $$('label').filter(isVisible)) {
+      if (!re.test((l.textContent || '').trim())) continue;
+      const byFor = l.getAttribute('for') && document.getElementById(l.getAttribute('for'));
+      if (byFor && byFor.tagName === 'INPUT') return byFor;
+      for (let n = l.nextElementSibling, i = 0; n && i < 3; n = n.nextElementSibling, i++) {
+        const inp = n.tagName === 'INPUT' ? n : n.querySelector('input');
+        if (inp) return inp;
+      }
+      const inner = l.parentElement && l.parentElement.querySelector('input');
+      if (inner) return inner;
+    }
+    return null;
+  }
+  const wdField = (aid, labelRe, type) => {
+    const byId = $(`input[data-automation-id="${aid}"]`);
+    if (byId && isVisible(byId)) return byId;
+    const byLabel = wdInputByLabel(labelRe);
+    if (byLabel && isVisible(byLabel)) return byLabel;
+    return type ? ($$(`input[type="${type}"]`).find(isVisible) || null) : null;
+  };
+  const wdEmailInput = () => wdField('email', /^e-?mail( address)?\*?$/i, 'email');
+  const wdPasswordInput = () => wdField('password', /^password\*?$/i, 'password');
+  const wdVerifyInput = () => wdField('verifyPassword', /^verify (new )?password\*?$/i);
+  function wdHeading() {
+    const h = $('h2[id*="authViewTitle"],h1[id*="authViewTitle"]') || $$('h1,h2').find(isVisible);
+    return ((h && h.textContent) || '').trim().toLowerCase();
+  }
+  /* 'create' / 'signin' when on that form, else ''. */
+  function wdAuthPage() {
+    if (wdVisible('createAccountSubmitButton') || wdVerifyInput()) return 'create';
+    const form = $('form[data-automation-id="signInFormo"]');
+    if (wdVisible('signInSubmitButton') || (form && isVisible(form))) return 'signin';
+    if (!wdPasswordInput()) return '';
+    const h = wdHeading();
+    if (/create account/.test(h)) return 'create';
+    if (/sign in/.test(h) || wdButtonByText('Sign In')) return 'signin';
+    return '';
+  }
+  function wdSubmit(page) {
+    if (page === 'create') return wdVisible('createAccountSubmitButton') || wdButtonByText('Create Account');
+    const form = $('form[data-automation-id="signInFormo"]');
+    return wdVisible('signInSubmitButton') ||
+           (form && $('[data-automation-id="click_filter"]', form)) || wdButtonByText('Sign In');
   }
   function wdSignedIn() {
-    if (wdVisible('signInSubmitButton') || wdVisible('createAccountSubmitButton')) return false;
+    if (wdAuthPage() || (wdEmailInput() && wdPasswordInput())) return false;
+    if (/\/login\b|login\?redirect/i.test(location.href)) return false;
     if (wdVisible('applyManually') || wdVisible('autofillWithResume')) return false;
-    return !!(wdVisible('utilityMenuButton') || wdVisible('accountSettingsButton') || wdVisible('progressBar') ||
+    /* The step bar's first step is "Create Account/Sign In" — the bar alone
+       does not mean signed in; the step it is on does. */
+    const step = $('[data-automation-id="progressBarActiveStep"]');
+    if (step && isVisible(step)) {
+      const t = (step.textContent || '').trim().toLowerCase();
+      return !!t && !/create account|sign in/.test(t);
+    }
+    return !!(wdVisible('utilityMenuButton') || wdVisible('accountSettingsButton') ||
               wdVisible('pageFooterNextButton') || wdVisible('bottom-navigation-next-button') ||
               wdVisible('legalNameSection_firstName') || $('[data-automation-id^="applyFlow"]'));
   }
@@ -5791,11 +5859,16 @@
       /* "Start Your Application": the form is filled by OptimHire, so apply manually. */
       const manual = wdVisible('applyManually');
       if (manual) { wdPress(manual); await sleep(1200); continue; }
-      const adv = wdVisible('adventureButton');
-      if (adv && !wdVisible('email')) { wdPress(adv); await sleep(1200); continue; }
+      /* The job page's own Apply (then the chooser above opens). */
+      const adv = wdVisible('adventureButton') || $('a[data-uxi-element-id="Apply_adventureButton"]') || wdVisible('continueButton');
+      if (adv && isVisible(adv) && !wdPasswordInput()) { wdPress(adv); await sleep(1200); continue; }
+      /* Some sites first ask how to sign in (Google / LinkedIn / e-mail). */
+      const byEmail = wdButtonByText('Sign in with email');
+      if (byEmail && !wdPasswordInput()) { wdPress(byEmail); await sleep(900); continue; }
 
-      const onCreate = !!wdVisible('createAccountSubmitButton');
-      const onSignIn = !onCreate && !!wdVisible('signInSubmitButton');
+      const page = wdAuthPage();
+      const onCreate = page === 'create';
+      const onSignIn = page === 'signin';
       if (!onCreate && !onSignIn) {
         /* A sign-in page that shows the other form's link only. */
         const link = wdLink(mode);
@@ -5821,20 +5894,22 @@
       }
       if (Date.now() - lastSubmit < 5000) continue;          // give the last press time to land
 
-      const email = $('input[data-automation-id="email"]') || $('input[type="email"]');
+      const email = wdEmailInput();
       const pws = $$('input[type="password"]').filter(isVisible);
-      const pw = $('input[data-automation-id="password"]') || pws[0];
-      const verify = $('input[data-automation-id="verifyPassword"]') || pws[1];
+      const pw = wdPasswordInput() || pws[0];
+      const verify = wdVerifyInput() || (onCreate ? pws[1] : null);
       if (email && isVisible(email) && email.value.trim().toLowerCase() !== creds.email.toLowerCase()) { email.focus(); nativeSet(email, creds.email); await sleep(150); }
       if (pw && isVisible(pw) && pw.value !== creds.password) { pw.focus(); nativeSet(pw, creds.password); await sleep(150); }
       if (onCreate && verify && isVisible(verify) && verify !== pw && verify.value !== creds.password) { verify.focus(); nativeSet(verify, creds.password); await sleep(150); }
       if (onCreate) {
         const cb = $('input[type="checkbox"][data-automation-id="createAccountCheckbox"]') ||
-                   $('[data-automation-id="createAccountCheckbox"] input[type="checkbox"]');
+                   $('[data-automation-id="createAccountCheckbox"] input[type="checkbox"]') ||
+                   $$('input[type="checkbox"]').find(c => isVisible(c) && !c.checked &&
+                     /agree|terms|privacy|consent|acknowledge/i.test(((c.closest('label,div') || {}).textContent || '')));
         if (cb && !cb.checked) { realClick(cb); await sleep(150); }
       }
       await sleep(300);
-      wdPress(wdVisible(onCreate ? 'createAccountSubmitButton' : 'signInSubmitButton'));
+      wdPress(wdSubmit(onCreate ? 'create' : 'signin'));
       if (onCreate) triedCreate = true; else triedSignIn = true;
       lastSubmit = Date.now(); submits++;
       LOG(`Workday: ${onCreate ? 'creating the account' : 'signing in'}`);
@@ -5853,9 +5928,7 @@
     /* Signed out on a Workday sign-in / create-account / "Start Your
        Application" page: the shared sign-in above does it (the same run as
        oh-bg.js's call, never two at once). */
-    if (wdVisible('signInSubmitButton') || wdVisible('createAccountSubmitButton') || wdVisible('applyManually')) {
-      await workdaySignIn();
-    }
+    if (wdAuthPage() || wdVisible('applyManually')) await workdaySignIn();
   }
 
   async function workdayEeoFields(p) {
