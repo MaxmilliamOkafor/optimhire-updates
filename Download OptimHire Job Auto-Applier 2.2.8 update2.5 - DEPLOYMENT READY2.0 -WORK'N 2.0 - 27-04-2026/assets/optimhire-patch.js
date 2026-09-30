@@ -1048,7 +1048,7 @@
    * The autofill script (autofill.73df3a6d.js) exposes its config as a
    * module-internal object. We intercept chrome.runtime.sendMessage here
    * so any AUTO_APPLY_STATE_UPDATE with autoSkipSeconds > 5 is clamped.   */
-  const AUTO_SKIP_MAX_SECONDS = 10;   // was 15
+  const AUTO_SKIP_MAX_SECONDS = 3;    // was 15, then 10
 
   /* ── T22: Global fill-active + submit-attempted guards ─────────────────
    * _fillActive  = true while any autofill pass is running.
@@ -2339,15 +2339,6 @@
     merged.cover_letter    = pick('cover_letter', 'coverLetter', 'cover_letter_body');
     merged.summary         = pick('summary', 'bio', 'about', 'profile_summary', 'professional_summary');
     return merged;
-  }
-
-  /* ── Applications Account helper ────────────────────────── */
-  async function getAppAccount() {
-    const data = await ST.get(['appAccountEmail', 'appAccountPassword']);
-    return {
-      email:    data.appAccountEmail    || '',
-      password: data.appAccountPassword || '',
-    };
   }
 
   /* ── Field label extraction ──────────────────────────────── */
@@ -4735,8 +4726,10 @@
        busy or not. A form that the site keeps rejecting (Workable's phone)
        sent OptimHire round and round — re-filling every field, which the
        checks below count as progress — and one job sat flickering for 22
-       minutes. Real applications take well under a minute. */
-    const JOB_CAP_MS = 300_000;
+       minutes. Real applications take well under a minute (the 4-minute
+       ones were OptimHire's resume screen counting down — now pressed at
+       once); Workday's many pages plus signing in get longer. */
+    const JOB_CAP_MS = /myworkday(jobs|site)\.com$|workday\.com$/i.test(location.hostname) ? 480_000 : 180_000;
     let _capKey = '', _capStartTs = 0;
 
     async function checkStuck() {
@@ -5577,10 +5570,9 @@
     if (!isWD) return;
 
     const p = await getProfile();
-    const acct = await getAppAccount();
 
     /* Step 1: Account creation / sign-in flow */
-    await workdayAccountFlow(p, acct);
+    await workdayAccountFlow();
 
     /* Steps 2–N: Workday is a multi-step wizard — fill each page then advance */
     let maxPages = 10;
@@ -5597,6 +5589,12 @@
         .filter(cb => !cb.checked && isVisible(cb)).forEach(cb => realClick(cb));
 
       await sleep(400);
+
+      /* In an OptimHire run its own engine walks the Workday steps (Next /
+         Submit) after filling each one; pressing them here as well skipped
+         pages it had not filled yet. */
+      const drv = await ST.get(['isAutoProcessStartJob', 'isManuallyStartJob']);
+      if (drv.isAutoProcessStartJob || drv.isManuallyStartJob) break;
 
       /* Try Submit first (final page) */
       let advanced = false;
@@ -5699,58 +5697,164 @@
     });
   }
 
-  async function workdayAccountFlow(p, acct) {
-    /* Create Account checkbox */
-    const createCb = $('[data-automation-id="createAccountCheckbox"] input[type=checkbox]') ||
-                     $('input[data-automation-id="createAccountCheckbox"]');
-    if (createCb && !createCb.checked) {
-      realClick(createCb);
-      await sleep(600);
+  /* ── Workday sign-in / account creation ─────────────────────────────
+   * Every company's Workday site needs its own account. OptimHire only
+   * checks whether you are already signed in there; if not it shows "Login
+   * required" and skips the job — so Workday jobs were all skipped. Before
+   * that check (oh-bg.js sends OH_WORKDAY_SIGN_IN first) this signs in, or
+   * creates the account, with one e-mail and password used for every
+   * Workday site: the Applications account if one is set, else your
+   * OptimHire e-mail and a strong password made once and kept (shown in the
+   * Queue Manager). A site that wants its e-mail link clicked first is
+   * noted and skipped at once next time. */
+  const WD_LOGIN_KEY = 'ohWorkdayLogin';
+  const WD = s => $(`[data-automation-id="${s}"]`);
+  const wdVisible = s => { const e = WD(s); return e && isVisible(e) ? e : null; };
+  async function workdayCreds() {
+    const [d, p] = await Promise.all([ST.get([WD_LOGIN_KEY, 'appAccountEmail', 'appAccountPassword']), getProfile()]);
+    const login = Object.assign({ sites: {} }, d[WD_LOGIN_KEY] || {});
+    if (!login.password) {
+      /* ≥ 8 chars with upper, lower, digit and symbol — what Workday asks.
+         (Same recipe as the Queue Manager's "Workday sign-in".) */
+      const abc = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789';
+      const r = crypto.getRandomValues(new Uint32Array(12));
+      login.password = d.appAccountPassword || ('Oh' + [...r].map(n => abc[n % abc.length]).join('') + '!7q');
+      await ST.set({ [WD_LOGIN_KEY]: login });
     }
+    return { email: login.email || d.appAccountEmail || p.email || '', password: login.password, login };
+  }
+  async function noteWorkdaySite(state) {
+    try {
+      const d = await ST.get([WD_LOGIN_KEY]);
+      const login = Object.assign({ sites: {} }, d[WD_LOGIN_KEY] || {});
+      login.sites = Object.assign({}, login.sites, { [HOST]: { state, ts: Date.now() } });
+      await ST.set({ [WD_LOGIN_KEY]: login });
+    } catch (_) {}
+  }
+  /* Workday's buttons sit under a transparent "click_filter" layer that
+     takes the click. */
+  function wdPress(btn) {
+    if (!btn) return false;
+    const filt = btn.querySelector('[data-automation-id="click_filter"]') ||
+                 (btn.parentElement && btn.parentElement.querySelector('[data-automation-id="click_filter"]'));
+    try { realClick(filt && isVisible(filt) ? filt : btn); } catch (_) { try { btn.click(); } catch (__) {} }
+    return true;
+  }
+  const wdText = () => ((document.body && document.body.innerText) || '').slice(0, 6000);
+  /* "Create Account" / "Sign In" switch links, by id or by their words. */
+  function wdLink(to) {
+    const byId = wdVisible(to === 'create' ? 'createAccountLink' : 'signInLink');
+    if (byId) return byId;
+    const re = to === 'create' ? /^create (an )?account$/i : /^sign in$/i;
+    return $$('a,button,[role="button"]').find(e => isVisible(e) && re.test((e.textContent || '').trim()) &&
+      !e.closest('[data-automation-id="signInSubmitButton"],[data-automation-id="createAccountSubmitButton"]')) || null;
+  }
+  function wdSignedIn() {
+    if (wdVisible('signInSubmitButton') || wdVisible('createAccountSubmitButton')) return false;
+    if (wdVisible('applyManually') || wdVisible('autofillWithResume')) return false;
+    return !!(wdVisible('utilityMenuButton') || wdVisible('accountSettingsButton') || wdVisible('progressBar') ||
+              wdVisible('pageFooterNextButton') || wdVisible('bottom-navigation-next-button') ||
+              wdVisible('legalNameSection_firstName') || $('[data-automation-id^="applyFlow"]'));
+  }
+  const WD_VERIFY_RE = /verify your (e-?mail|account)|verification (e-?mail|link)|check your (e-?mail|inbox)|confirm your e-?mail|activate your account/i;
+  const WD_EXISTS_RE = /already (exists|in use|registered|been used)|account with this e-?mail/i;
+  const WD_BADPW_RE = /wrong e-?mail|incorrect|invalid (e-?mail|user|password|credentials)|doesn[’']?t (exist|match)|not (valid|recogni[sz]ed)|locked/i;
 
-    /* Fill account email */
-    const emailField = $('[data-automation-id="createAccountEmail"] input') ||
-                       $('[data-automation-id="accountCreationEmail"] input') ||
-                       $('input[data-automation-id="email"]') ||
-                       $('input[name="email"][type="email"]');
-    if (emailField && !emailField.value?.trim()) {
-      const emailVal = acct.email || p.email || '';
-      if (emailVal) { emailField.focus(); nativeSet(emailField, emailVal); await sleep(200); }
-    }
-
-    /* Fill account password */
-    const pwField = $('[data-automation-id="password"] input[type=password]') ||
-                    $('input[data-automation-id="password"]') ||
-                    $('input[type=password]');
-    if (pwField && !pwField.value?.trim() && acct.password) {
-      pwField.focus();
-      nativeSet(pwField, acct.password);
-      await sleep(200);
-    }
-
-    /* Verify password */
-    const pwFields = $$('input[type=password]').filter(isVisible);
-    if (pwFields.length >= 2 && acct.password) {
-      const verify = pwFields[1];
-      if (!verify.value?.trim()) { verify.focus(); nativeSet(verify, acct.password); await sleep(200); }
-    }
-
-    /* Click "Create Account" submit button */
-    const createBtn = $('[data-automation-id="createAccountSubmitButton"]') ||
-                      $('button[data-automation-id="createAccountSubmitButton"]');
-    if (createBtn && isVisible(createBtn)) {
+  let _wdSignIn = null;
+  function workdaySignIn() {
+    if (!_wdSignIn) _wdSignIn = runWorkdaySignIn().finally(() => { setTimeout(() => { _wdSignIn = null; }, 3000); });
+    return _wdSignIn;
+  }
+  async function runWorkdaySignIn() {
+    if (CURRENT_ATS !== 'Workday' && !/myworkday(jobs|site)\.com$/i.test(HOST)) return { ok: false, reason: 'not workday' };
+    const creds = await workdayCreds();
+    if (!creds.email || !creds.password) return { ok: false, reason: 'no e-mail for the Workday account' };
+    const known = (creds.login.sites || {})[HOST] || {};
+    if (known.state === 'verify' && Date.now() - known.ts < 7 * 864e5) return { ok: false, reason: 'this site wants its e-mail link clicked first' };
+    let mode = known.state === 'account' ? 'signin' : 'create';   // a new site: create first, sign in if it exists
+    let lastSubmit = 0, submits = 0, triedSignIn = false, triedCreate = false;
+    const deadline = Date.now() + 60_000;
+    LOG(`Workday: signing in on ${HOST} as ${creds.email}`);
+    while (Date.now() < deadline) {
       await sleep(400);
-      realClick(createBtn);
-      await sleep(1500);
-      return;
-    }
+      const t = wdText();
+      if (wdSignedIn()) {
+        await noteWorkdaySite('account');
+        LOG('Workday: signed in');
+        return { ok: true };
+      }
+      if (submits && WD_VERIFY_RE.test(t) && !wdVisible('createAccountSubmitButton') && !wdVisible('signInSubmitButton')) {
+        await noteWorkdaySite('verify');
+        LOG('Workday: this site wants the e-mail verified before applying — skipping it');
+        return { ok: false, reason: 'e-mail verification needed' };
+      }
+      /* "Start Your Application": the form is filled by OptimHire, so apply manually. */
+      const manual = wdVisible('applyManually');
+      if (manual) { wdPress(manual); await sleep(1200); continue; }
+      const adv = wdVisible('adventureButton');
+      if (adv && !wdVisible('email')) { wdPress(adv); await sleep(1200); continue; }
 
-    /* Or "Sign In" if already has account */
-    const signInBtn = $('[data-automation-id="signInSubmitButton"]');
-    if (signInBtn && isVisible(signInBtn)) {
-      await sleep(400);
-      realClick(signInBtn);
-      await sleep(1500);
+      const onCreate = !!wdVisible('createAccountSubmitButton');
+      const onSignIn = !onCreate && !!wdVisible('signInSubmitButton');
+      if (!onCreate && !onSignIn) {
+        /* A sign-in page that shows the other form's link only. */
+        const link = wdLink(mode);
+        if (link) { wdPress(link); await sleep(900); }
+        continue;
+      }
+      const err = [...$$('[data-automation-id="errorMessage"],[role="alert"],[data-automation-id="inputAlert"]')]
+        .filter(isVisible).map(e => e.textContent || '').join(' ');
+      if (onCreate) {
+        if (mode !== 'create' || (WD_EXISTS_RE.test(err) && submits)) {
+          /* An account is there already: sign in instead (once). */
+          if (triedSignIn) { await noteWorkdaySite('other-password'); return { ok: false, reason: 'an account exists with another password' }; }
+          const link = wdLink('signin');
+          mode = 'signin';
+          if (link) { wdPress(link); await sleep(900); continue; }
+        }
+      } else if (mode !== 'signin' || (WD_BADPW_RE.test(err) && submits)) {
+        /* No account yet (or a wrong password): create one (once). */
+        if (triedCreate) { await noteWorkdaySite('other-password'); return { ok: false, reason: 'sign-in refused' }; }
+        const link = wdLink('create');
+        mode = 'create';
+        if (link) { wdPress(link); await sleep(900); continue; }
+      }
+      if (Date.now() - lastSubmit < 5000) continue;          // give the last press time to land
+
+      const email = $('input[data-automation-id="email"]') || $('input[type="email"]');
+      const pws = $$('input[type="password"]').filter(isVisible);
+      const pw = $('input[data-automation-id="password"]') || pws[0];
+      const verify = $('input[data-automation-id="verifyPassword"]') || pws[1];
+      if (email && isVisible(email) && email.value.trim().toLowerCase() !== creds.email.toLowerCase()) { email.focus(); nativeSet(email, creds.email); await sleep(150); }
+      if (pw && isVisible(pw) && pw.value !== creds.password) { pw.focus(); nativeSet(pw, creds.password); await sleep(150); }
+      if (onCreate && verify && isVisible(verify) && verify !== pw && verify.value !== creds.password) { verify.focus(); nativeSet(verify, creds.password); await sleep(150); }
+      if (onCreate) {
+        const cb = $('input[type="checkbox"][data-automation-id="createAccountCheckbox"]') ||
+                   $('[data-automation-id="createAccountCheckbox"] input[type="checkbox"]');
+        if (cb && !cb.checked) { realClick(cb); await sleep(150); }
+      }
+      await sleep(300);
+      wdPress(wdVisible(onCreate ? 'createAccountSubmitButton' : 'signInSubmitButton'));
+      if (onCreate) triedCreate = true; else triedSignIn = true;
+      lastSubmit = Date.now(); submits++;
+      LOG(`Workday: ${onCreate ? 'creating the account' : 'signing in'}`);
+    }
+    return { ok: false, reason: 'timed out' };
+  }
+  try {
+    chrome.runtime.onMessage.addListener((msg, _sender, reply) => {
+      if (!msg || msg.type !== 'OH_WORKDAY_SIGN_IN' || window.top !== window.self) return;
+      workdaySignIn().then(r => reply(r), e => reply({ ok: false, reason: String(e && e.message || e) }));
+      return true;
+    });
+  } catch (_) {}
+
+  async function workdayAccountFlow() {
+    /* Signed out on a Workday sign-in / create-account / "Start Your
+       Application" page: the shared sign-in above does it (the same run as
+       oh-bg.js's call, never two at once). */
+    if (wdVisible('signInSubmitButton') || wdVisible('createAccountSubmitButton') || wdVisible('applyManually')) {
+      await workdaySignIn();
     }
   }
 

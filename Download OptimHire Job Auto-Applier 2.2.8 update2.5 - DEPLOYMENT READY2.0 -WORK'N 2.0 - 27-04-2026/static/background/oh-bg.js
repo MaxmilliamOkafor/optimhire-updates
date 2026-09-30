@@ -1,6 +1,6 @@
 /**
  * oh-bg.js — service-worker entry point. Loads OptimHire's background
- * (index.js, unchanged) after narrowing two things in it that kept the
+ * (index.js — unchanged but for the pauses in 8) after narrowing two things in it that kept the
  * WHOLE BROWSER busy, all the time, whether or not anything was running:
  *
  * 1. A network hook on EVERY request in every tab.
@@ -46,6 +46,15 @@
  *    stored flag decides whether OptimHire submits the form itself (with
  *    its per-site knowledge of each ATS) and goes to the next job. It is
  *    kept at "1" while automation is ON (master switch).
+ *
+ * 7. Workday sign-in before OptimHire's login check (see 7 below).
+ *
+ * 8. Shorter fixed pauses between jobs — edited in index.js itself (the
+ *    only edits there): after a submission 3 s → 0.4 s, after an error 5 s →
+ *    0.6 s, "Loading next job" 2 s → 0.3 s, job closed 2 s → 0.5 s, around
+ *    fetching the next job 1 s → 0.25 s, and the settle after a job page
+ *    loads 2 s (5 s on redirecting sites) → 1 s (2.5 s). Search index.js
+ *    for "setTimeout(e,400)" etc. to re-apply after an OptimHire update.
  *
  * Wiring: manifest.json background.service_worker points here. On an
  * OptimHire update, copy the new index.js in and keep this entry point.
@@ -372,6 +381,40 @@
 
   var snap = {};
 
+  /* 7. Workday: sign in before OptimHire checks. Each company's Workday
+     site needs its own account; OptimHire only checks whether one is
+     signed in (CHECK_LOGIN_STATUS to the job tab) and otherwise shows
+     "Login required" and skips — every Workday job was skipped. On a
+     Workday tab our content script signs in / creates the account first
+     (OH_WORKDAY_SIGN_IN), then OptimHire's own check runs as usual. */
+  var WD_HOST_RE = /(^|\.)(myworkdayjobs\.com|myworkdaysite\.com|workday\.com)$/i;
+  var WD_SIGN_IN_MS = 75000;
+  var tabsApi = chrome.tabs;
+  if (tabsApi && typeof tabsApi.sendMessage === 'function') {
+    var origSend = tabsApi.sendMessage.bind(tabsApi);
+    tabsApi.sendMessage = function (tabId, msg) {
+      var args = arguments;
+      try {
+        if (msg && msg.type === 'CHECK_LOGIN_STATUS' && typeof tabId === 'number' &&
+            typeof args[args.length - 1] !== 'function' && snap.ohAutomationDisabled !== true) {
+          return new Promise(function (resolve) {
+            tabsApi.get(tabId, function (t) { void chrome.runtime.lastError; resolve((t && (t.url || t.pendingUrl)) || ''); });
+          }).then(function (url) {
+            var host = '';
+            try { host = new URL(url).hostname; } catch (_) {}
+            if (!WD_HOST_RE.test(host)) return origSend.apply(null, args);
+            return within(origSend(tabId, { type: 'OH_WORKDAY_SIGN_IN' }, { frameId: 0 }).catch(function () { return null; }), WD_SIGN_IN_MS)
+              .then(function (r) {
+                try { console.info('[OH-BG] Workday sign-in on ' + host + ': ' + JSON.stringify(r)); } catch (_) {}
+                return origSend.apply(null, args);
+              });
+          });
+        }
+      } catch (_) {}
+      return origSend.apply(null, args);
+    };
+  }
+
   /* Auto-submit: keep OptimHire's "automatic apply" flag on (see 6 above). */
   var AUTO_FLAG = 'is_copilot_automatic_apply_to_job';
   var area = chrome.storage && chrome.storage.local;
@@ -443,7 +486,9 @@ importScripts('index.js');
    lives in the bundle's module registry (globalThis.parcelRequire*), found
    by shape so this survives OptimHire updates. */
 (function tuneOptimHireTimers() {
-  var AUTO_SKIP_S = 10, LOGIN_WAIT_S = 10;
+  /* 3s: long enough to read the reason on the panel. Workday sign-in runs
+     BEFORE OptimHire's login check (7 above), so it needs no wait here. */
+  var AUTO_SKIP_S = 3, LOGIN_WAIT_S = 3;
   try {
     Object.getOwnPropertyNames(self).forEach(function (name) {
       var req = /^parcelRequire/.test(name) ? self[name] : null;

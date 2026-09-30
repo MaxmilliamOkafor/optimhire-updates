@@ -39,7 +39,10 @@
     'ohFreshBadges',          // freshness badges opt-in
     'ohAutoFilledUrls',       // already-filled URL de-dupe list
     'ohPreferAts',            // "ATS first, Reed last" queue order
-    'ohQaMemory'              // remembered answers
+    'ohQaMemory',             // remembered answers
+    'ohWorkdayLogin',         // Workday e-mail + password, and which company sites have an account
+    'appAccountEmail',        // "Applications account" (used for Workday too)
+    'appAccountPassword'
   ];
   var KEYSET = {};
   KEYS.forEach(function (k) { KEYSET[k] = 1; });

@@ -939,7 +939,7 @@
    *   - SUBMIT_ATTEMPTED was received (content script just clicked submit)
    *   - The current status is "submitting" (from SIDEBAR_STATUS event)
    * ─────────────────────────────────────────────────────────────────────── */
-  const AUTO_SKIP_MAX = 10;         // seconds (was 15); OptimHire's own 180s is cut to 10s in oh-bg.js
+  const AUTO_SKIP_MAX = 3;          // seconds (was 15, then 10); OptimHire's own 180s is cut to 3s in oh-bg.js
   let _forceSkipTimer  = null;
   let _forceSkipJobKey = '';
   let _submitAttemptedTs = 0; // timestamp of last SUBMIT_ATTEMPTED message
