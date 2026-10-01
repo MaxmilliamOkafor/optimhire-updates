@@ -165,6 +165,7 @@
         <button id="btnStart" class="btn-primary">▶ Start Queue</button>
         <button id="btnStop" class="btn-danger" disabled>■ Stop</button>
         <button id="btnQaMemory" title="Answers learned from applications that were confirmed as submitted — review or forget them">🧠 Remembered answers <span id="qaMemCount"></span></button>
+        <button id="btnWdLogin" title="The e-mail and password used to sign in to (or create) your account on each company's Workday site">🔑 Workday sign-in</button>
         <button id="btnDebug" title="Open the debug log viewer in a new tab">🐞 Debug log</button>
       </div>
     </div>
@@ -262,11 +263,38 @@
     </div>
   </div>
 
+  <!-- Workday sign-in -->
+  <div id="wdModal" class="modal-bg hidden">
+    <div class="modal qa-modal">
+      <h2>Workday sign-in</h2>
+      <div class="help-text">
+        Every company's Workday site needs its own account before you can apply. During a run the automation signs in
+        with these details — or creates the account with them if there is none yet — so Workday jobs are applied to
+        instead of skipped. The password was made for you; keep it (or change it) to sign in to those sites yourself.
+        A site that insists on an e-mail link being clicked first is skipped.
+      </div>
+      <label>E-mail</label>
+      <input type="email" id="wdEmail" placeholder="your OptimHire e-mail is used when empty">
+      <label>Password</label>
+      <div class="qa-tools">
+        <input type="text" id="wdPassword" autocomplete="off" spellcheck="false">
+        <button id="wdCopy" class="btn-small">Copy</button>
+      </div>
+      <div class="help-text">At least 8 characters with an upper-case letter, a lower-case letter, a number and a symbol.</div>
+      <div id="wdSites" class="qa-list"></div>
+      <div class="modal-actions">
+        <button id="wdClose">Close</button>
+        <button id="wdSave" class="btn-primary">Save</button>
+      </div>
+    </div>
+  </div>
+
   <input type="file" id="csvInput" accept=".csv,text/csv" style="display:none">
   <div id="toastContainer"></div>
   <script src="../assets/debug-logger.js"></script>
   <script src="../assets/oh-persist.js"></script>
   <script src="../assets/jobQueue.js"></script>
   <script src="../assets/qaMemory.js"></script>
+  <script src="../assets/workdayLogin.js"></script>
 </body>
 </html>

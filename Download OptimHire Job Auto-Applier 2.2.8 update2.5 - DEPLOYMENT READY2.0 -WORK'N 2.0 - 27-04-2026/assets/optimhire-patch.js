@@ -543,6 +543,26 @@
     return false;
   }
 
+  /* ── Job boards: browsing them is never an application ───────────────
+   * Indeed, LinkedIn, Glassdoor, Reed… are search + listing sites. Only
+   * their own apply step is a form (Indeed Apply, LinkedIn's Easy Apply
+   * window, a board's apply dialog). Autofill and auto-clicks fired on
+   * Indeed while the user was just browsing it. */
+  const JOB_BOARD_HOST_RE = /(^|\.)(indeed\.[a-z.]+|linkedin\.com|glassdoor\.[a-z.]+|ziprecruiter\.[a-z.]+|reed\.co\.uk|dice\.com|monster\.[a-z.]+|totaljobs\.com|cv-library\.co\.uk|simplyhired\.[a-z.]+|careerbuilder\.[a-z.]+|adzuna\.[a-z.]+|jooble\.org|hiring\.cafe|seek\.com\.au|seek\.co\.nz|foundit\.[a-z.]+|irishjobs\.ie|jobs\.ie)$/i;
+  function onJobBoard() { return JOB_BOARD_HOST_RE.test(location.hostname); }
+  function boardApplyFlowOpen() {
+    try {
+      const h = location.hostname.toLowerCase();
+      if (/(^|\.)(smartapply|apply|m5\.apply)\.indeed\.com$/.test(h)) return true;          // Indeed Apply
+      if (/(^|\.)indeed\./.test(h) && /\/(indeedapply|apply)(\/|$)/i.test(location.pathname)) return true;
+      if (document.querySelector('.jobs-easy-apply-modal,[data-test-modal-id="easy-apply-modal"]')) return true;   // LinkedIn Easy Apply
+      /* A board's own apply window (Reed's "Apply now" dialog…). */
+      return [...document.querySelectorAll('[role="dialog"],[aria-modal="true"]')].some(d => isVisible(d) &&
+        !!d.querySelector('input[type=file],input[type=email],input[type=tel],textarea') &&
+        /\b(apply|application|submit)\b/i.test((d.textContent || '').slice(0, 3000)));
+    } catch (_) { return false; }
+  }
+
   /* ── Which field does an error message belong to? ───────────────────
    * The old lookup took the FIRST input in a broad "[class*=field]" box,
    * so Workable's Phone "This field is required." re-typed the Address
@@ -569,7 +589,8 @@
     }
     return null;
   }
-  const ERROR_TEXT_SEL = '[class*="error" i],[class*="invalid" i],[role="alert"],[aria-live="assertive"]';
+  const ERROR_TEXT_SEL = '[class*="error" i],[class*="invalid" i],[role="alert"],[aria-live="assertive"],' +
+                         '[data-automation-id="inputAlert"],[data-automation-id="errorMessage"]';   // Workday
   /* Is the site flagging THIS field (aria-invalid, or an error message in
      the field's own box)? */
   function fieldFlagged(el) {
@@ -1048,7 +1069,7 @@
    * The autofill script (autofill.73df3a6d.js) exposes its config as a
    * module-internal object. We intercept chrome.runtime.sendMessage here
    * so any AUTO_APPLY_STATE_UPDATE with autoSkipSeconds > 5 is clamped.   */
-  const AUTO_SKIP_MAX_SECONDS = 10;   // was 15
+  const AUTO_SKIP_MAX_SECONDS = 3;    // was 15, then 10
 
   /* ── T22: Global fill-active + submit-attempted guards ─────────────────
    * _fillActive  = true while any autofill pass is running.
@@ -2341,15 +2362,6 @@
     return merged;
   }
 
-  /* ── Applications Account helper ────────────────────────── */
-  async function getAppAccount() {
-    const data = await ST.get(['appAccountEmail', 'appAccountPassword']);
-    return {
-      email:    data.appAccountEmail    || '',
-      password: data.appAccountPassword || '',
-    };
-  }
-
   /* ── Field label extraction ──────────────────────────────── */
   function getLabel(el) {
     if (!el) return '';
@@ -2915,6 +2927,8 @@
     if (_IS_OH_PAGE) return false;
     /* A visible password box means a sign-in / account form. */
     if ([...document.querySelectorAll('input[type=password]')].some(isVisible)) return false;
+    /* LinkedIn messages, Indeed searches… are not applications. */
+    if (onJobBoard()) return boardApplyFlowOpen();
     if (CURRENT_ATS || _engagedNow) return true;
     if (document.querySelector('input[type=file]')) return true;
     if (/apply|application|career|\bjobs?\b|recruit|hiring|talent|vacanc|position/i.test(location.href + ' ' + document.title)) return true;
@@ -3920,11 +3934,13 @@
     let filledCount = 0;
 
     /* ── Scan all visible form fields first to build field list ── */
+    /* The site's own search / header boxes (Indeed's "What / Where") are
+       never part of the application. */
     const allInputs = $$(
       'input:not([type=hidden]):not([type=file]):not([type=submit]):not([type=button]),' +
       'textarea'
-    ).filter(isVisible);
-    const allSelects = $$('select').filter(isVisible);
+    ).filter(el => isVisible(el) && !isPageChromeField(el));
+    const allSelects = $$('select').filter(el => isVisible(el) && !isPageChromeField(el));
 
     for (const el of allInputs) {
       const lbl = getLabel(el) || el.name || el.id || '';
@@ -4735,8 +4751,10 @@
        busy or not. A form that the site keeps rejecting (Workable's phone)
        sent OptimHire round and round — re-filling every field, which the
        checks below count as progress — and one job sat flickering for 22
-       minutes. Real applications take well under a minute. */
-    const JOB_CAP_MS = 300_000;
+       minutes. Real applications take well under a minute (the 4-minute
+       ones were OptimHire's resume screen counting down — now pressed at
+       once); Workday's many pages plus signing in get longer. */
+    const JOB_CAP_MS = /myworkday(jobs|site)\.com$|workday\.com$/i.test(location.hostname) ? 480_000 : 180_000;
     let _capKey = '', _capStartTs = 0;
 
     async function checkStuck() {
@@ -5577,10 +5595,9 @@
     if (!isWD) return;
 
     const p = await getProfile();
-    const acct = await getAppAccount();
 
     /* Step 1: Account creation / sign-in flow */
-    await workdayAccountFlow(p, acct);
+    await workdayAccountFlow();
 
     /* Steps 2–N: Workday is a multi-step wizard — fill each page then advance */
     let maxPages = 10;
@@ -5597,6 +5614,12 @@
         .filter(cb => !cb.checked && isVisible(cb)).forEach(cb => realClick(cb));
 
       await sleep(400);
+
+      /* In an OptimHire run its own engine walks the Workday steps (Next /
+         Submit) after filling each one; pressing them here as well skipped
+         pages it had not filled yet. */
+      const drv = await ST.get(['isAutoProcessStartJob', 'isManuallyStartJob']);
+      if (drv.isAutoProcessStartJob || drv.isManuallyStartJob) break;
 
       /* Try Submit first (final page) */
       let advanced = false;
@@ -5699,59 +5722,237 @@
     });
   }
 
-  async function workdayAccountFlow(p, acct) {
-    /* Create Account checkbox */
-    const createCb = $('[data-automation-id="createAccountCheckbox"] input[type=checkbox]') ||
-                     $('input[data-automation-id="createAccountCheckbox"]');
-    if (createCb && !createCb.checked) {
-      realClick(createCb);
-      await sleep(600);
+  /* ── Workday sign-in / account creation ─────────────────────────────
+   * Every company's Workday site needs its own account. OptimHire only
+   * checks whether you are already signed in there; if not it shows "Login
+   * required" and skips the job — so Workday jobs were all skipped. Before
+   * that check (oh-bg.js sends OH_WORKDAY_SIGN_IN first) this signs in, or
+   * creates the account, with one e-mail and password used for every
+   * Workday site: the Applications account if one is set, else your
+   * OptimHire e-mail and a strong password made once and kept (shown in the
+   * Queue Manager). A site that wants its e-mail link clicked first is
+   * noted and skipped at once next time. */
+  const WD_LOGIN_KEY = 'ohWorkdayLogin';
+  const WD = s => $(`[data-automation-id="${s}"]`);
+  const wdVisible = s => { const e = WD(s); return e && isVisible(e) ? e : null; };
+  async function workdayCreds() {
+    const [d, p] = await Promise.all([ST.get([WD_LOGIN_KEY, 'appAccountEmail', 'appAccountPassword']), getProfile()]);
+    const login = Object.assign({ sites: {} }, d[WD_LOGIN_KEY] || {});
+    if (!login.password) {
+      /* ≥ 8 chars with upper, lower, digit and symbol — what Workday asks.
+         (Same recipe as the Queue Manager's "Workday sign-in".) */
+      const abc = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789';
+      const r = crypto.getRandomValues(new Uint32Array(12));
+      login.password = d.appAccountPassword || ('Oh' + [...r].map(n => abc[n % abc.length]).join('') + '!7q');
+      await ST.set({ [WD_LOGIN_KEY]: login });
     }
-
-    /* Fill account email */
-    const emailField = $('[data-automation-id="createAccountEmail"] input') ||
-                       $('[data-automation-id="accountCreationEmail"] input') ||
-                       $('input[data-automation-id="email"]') ||
-                       $('input[name="email"][type="email"]');
-    if (emailField && !emailField.value?.trim()) {
-      const emailVal = acct.email || p.email || '';
-      if (emailVal) { emailField.focus(); nativeSet(emailField, emailVal); await sleep(200); }
+    return { email: login.email || d.appAccountEmail || p.email || '', password: login.password, login };
+  }
+  async function noteWorkdaySite(state) {
+    try {
+      const d = await ST.get([WD_LOGIN_KEY]);
+      const login = Object.assign({ sites: {} }, d[WD_LOGIN_KEY] || {});
+      login.sites = Object.assign({}, login.sites, { [HOST]: { state, ts: Date.now() } });
+      await ST.set({ [WD_LOGIN_KEY]: login });
+    } catch (_) {}
+  }
+  /* Workday's buttons sit under a transparent "click_filter" layer that
+     takes the click. */
+  function wdPress(btn) {
+    if (!btn) return false;
+    const filt = btn.querySelector('[data-automation-id="click_filter"]') ||
+                 (btn.parentElement && btn.parentElement.querySelector('[data-automation-id="click_filter"]'));
+    try { realClick(filt && isVisible(filt) ? filt : btn); } catch (_) { try { btn.click(); } catch (__) {} }
+    return true;
+  }
+  const wdText = () => ((document.body && document.body.innerText) || '').slice(0, 6000);
+  /* "Create Account" / "Sign In" switch links, by id or by their words. */
+  function wdLink(to) {
+    const byId = wdVisible(to === 'create' ? 'createAccountLink' : 'signInLink');
+    if (byId) return byId;
+    const re = to === 'create' ? /^create (an )?account$/i : /^sign in$/i;
+    const all = $$('a,button,[role="button"]').filter(e => isVisible(e) && re.test((e.textContent || '').trim()) &&
+      e.getAttribute('data-automation-id') !== 'click_filter' &&
+      !e.closest('[data-automation-id="signInSubmitButton"],[data-automation-id="createAccountSubmitButton"],form[data-automation-id="signInFormo"]'));
+    /* Not the page header's "Sign In" (it opens a different sign-in). */
+    return all.find(e => !e.closest('header,nav,[role="banner"],[data-automation-id="header"]')) || null;
+  }
+  /* Newer Workday sites label their buttons only by text ("Create Account",
+     "Sign In") and name the page in a heading; fields may carry no id but
+     a label ("Email Address", "Verify New Password"). Both kinds are read. */
+  function wdButtonByText(label) {
+    const want = label.toLowerCase();
+    const all = $$('button,[role="button"]').filter(b => isVisible(b) && (b.textContent || '').trim().toLowerCase() === want &&
+      b.getAttribute('data-automation-id') !== 'click_filter');
+    /* Not the header's own "Sign In" — unless it sits in the sign-in form. */
+    return all.find(b => !b.closest('header,nav,[role="banner"],[data-automation-id="header"]') ||
+                         b.closest('form,[data-automation-id*="signIn"],[data-automation-id*="auth"]')) || null;
+  }
+  function wdInputByLabel(re) {
+    for (const l of $$('label').filter(isVisible)) {
+      if (!re.test((l.textContent || '').trim())) continue;
+      const byFor = l.getAttribute('for') && document.getElementById(l.getAttribute('for'));
+      if (byFor && byFor.tagName === 'INPUT') return byFor;
+      for (let n = l.nextElementSibling, i = 0; n && i < 3; n = n.nextElementSibling, i++) {
+        const inp = n.tagName === 'INPUT' ? n : n.querySelector('input');
+        if (inp) return inp;
+      }
+      const inner = l.parentElement && l.parentElement.querySelector('input');
+      if (inner) return inner;
     }
-
-    /* Fill account password */
-    const pwField = $('[data-automation-id="password"] input[type=password]') ||
-                    $('input[data-automation-id="password"]') ||
-                    $('input[type=password]');
-    if (pwField && !pwField.value?.trim() && acct.password) {
-      pwField.focus();
-      nativeSet(pwField, acct.password);
-      await sleep(200);
+    return null;
+  }
+  const wdField = (aid, labelRe, type) => {
+    const byId = $(`input[data-automation-id="${aid}"]`);
+    if (byId && isVisible(byId)) return byId;
+    const byLabel = wdInputByLabel(labelRe);
+    if (byLabel && isVisible(byLabel)) return byLabel;
+    return type ? ($$(`input[type="${type}"]`).find(isVisible) || null) : null;
+  };
+  const wdEmailInput = () => wdField('email', /^e-?mail( address)?\*?$/i, 'email');
+  const wdPasswordInput = () => wdField('password', /^password\*?$/i, 'password');
+  const wdVerifyInput = () => wdField('verifyPassword', /^verify (new )?password\*?$/i);
+  function wdHeading() {
+    const h = $('h2[id*="authViewTitle"],h1[id*="authViewTitle"]') || $$('h1,h2').find(isVisible);
+    return ((h && h.textContent) || '').trim().toLowerCase();
+  }
+  /* 'create' / 'signin' when on that form, else ''. */
+  function wdAuthPage() {
+    if (wdVisible('createAccountSubmitButton') || wdVerifyInput()) return 'create';
+    const form = $('form[data-automation-id="signInFormo"]');
+    if (wdVisible('signInSubmitButton') || (form && isVisible(form))) return 'signin';
+    if (!wdPasswordInput()) return '';
+    const h = wdHeading();
+    if (/create account/.test(h)) return 'create';
+    if (/sign in/.test(h) || wdButtonByText('Sign In')) return 'signin';
+    return '';
+  }
+  function wdSubmit(page) {
+    if (page === 'create') return wdVisible('createAccountSubmitButton') || wdButtonByText('Create Account');
+    const form = $('form[data-automation-id="signInFormo"]');
+    return wdVisible('signInSubmitButton') ||
+           (form && $('[data-automation-id="click_filter"]', form)) || wdButtonByText('Sign In');
+  }
+  function wdSignedIn() {
+    if (wdAuthPage() || (wdEmailInput() && wdPasswordInput())) return false;
+    if (/\/login\b|login\?redirect/i.test(location.href)) return false;
+    if (wdVisible('applyManually') || wdVisible('autofillWithResume')) return false;
+    /* The step bar's first step is "Create Account/Sign In" — the bar alone
+       does not mean signed in; the step it is on does. */
+    const step = $('[data-automation-id="progressBarActiveStep"]');
+    if (step && isVisible(step)) {
+      const t = (step.textContent || '').trim().toLowerCase();
+      return !!t && !/create account|sign in/.test(t);
     }
+    return !!(wdVisible('utilityMenuButton') || wdVisible('accountSettingsButton') ||
+              wdVisible('pageFooterNextButton') || wdVisible('bottom-navigation-next-button') ||
+              wdVisible('legalNameSection_firstName') || $('[data-automation-id^="applyFlow"]'));
+  }
+  const WD_VERIFY_RE = /verify your (e-?mail|account)|verification (e-?mail|link)|check your (e-?mail|inbox)|confirm your e-?mail|activate your account/i;
+  const WD_EXISTS_RE = /already (exists|in use|registered|been used)|account with this e-?mail/i;
+  const WD_BADPW_RE = /wrong e-?mail|incorrect|invalid (e-?mail|user|password|credentials)|doesn[’']?t (exist|match)|not (valid|recogni[sz]ed)|locked/i;
 
-    /* Verify password */
-    const pwFields = $$('input[type=password]').filter(isVisible);
-    if (pwFields.length >= 2 && acct.password) {
-      const verify = pwFields[1];
-      if (!verify.value?.trim()) { verify.focus(); nativeSet(verify, acct.password); await sleep(200); }
-    }
-
-    /* Click "Create Account" submit button */
-    const createBtn = $('[data-automation-id="createAccountSubmitButton"]') ||
-                      $('button[data-automation-id="createAccountSubmitButton"]');
-    if (createBtn && isVisible(createBtn)) {
+  let _wdSignIn = null;
+  function workdaySignIn() {
+    if (!_wdSignIn) _wdSignIn = runWorkdaySignIn().finally(() => { setTimeout(() => { _wdSignIn = null; }, 3000); });
+    return _wdSignIn;
+  }
+  async function runWorkdaySignIn() {
+    if (CURRENT_ATS !== 'Workday' && !/myworkday(jobs|site)\.com$/i.test(HOST)) return { ok: false, reason: 'not workday' };
+    const creds = await workdayCreds();
+    if (!creds.email || !creds.password) return { ok: false, reason: 'no e-mail for the Workday account' };
+    const known = (creds.login.sites || {})[HOST] || {};
+    if (known.state === 'verify' && Date.now() - known.ts < 7 * 864e5) return { ok: false, reason: 'this site wants its e-mail link clicked first' };
+    let mode = known.state === 'account' ? 'signin' : 'create';   // a new site: create first, sign in if it exists
+    let lastSubmit = 0, submits = 0, triedSignIn = false, triedCreate = false;
+    const deadline = Date.now() + 60_000;
+    LOG(`Workday: signing in on ${HOST} as ${creds.email}`);
+    while (Date.now() < deadline) {
       await sleep(400);
-      realClick(createBtn);
-      await sleep(1500);
-      return;
-    }
+      const t = wdText();
+      if (wdSignedIn()) {
+        await noteWorkdaySite('account');
+        LOG('Workday: signed in');
+        return { ok: true };
+      }
+      if (submits && WD_VERIFY_RE.test(t) && !wdVisible('createAccountSubmitButton') && !wdVisible('signInSubmitButton')) {
+        await noteWorkdaySite('verify');
+        LOG('Workday: this site wants the e-mail verified before applying — skipping it');
+        return { ok: false, reason: 'e-mail verification needed' };
+      }
+      /* "Start Your Application": the form is filled by OptimHire, so apply manually. */
+      const manual = wdVisible('applyManually');
+      if (manual) { wdPress(manual); await sleep(1200); continue; }
+      /* The job page's own Apply (then the chooser above opens). */
+      const adv = wdVisible('adventureButton') || $('a[data-uxi-element-id="Apply_adventureButton"]') || wdVisible('continueButton');
+      if (adv && isVisible(adv) && !wdPasswordInput()) { wdPress(adv); await sleep(1200); continue; }
+      /* Some sites first ask how to sign in (Google / LinkedIn / e-mail). */
+      const byEmail = wdButtonByText('Sign in with email');
+      if (byEmail && !wdPasswordInput()) { wdPress(byEmail); await sleep(900); continue; }
 
-    /* Or "Sign In" if already has account */
-    const signInBtn = $('[data-automation-id="signInSubmitButton"]');
-    if (signInBtn && isVisible(signInBtn)) {
-      await sleep(400);
-      realClick(signInBtn);
-      await sleep(1500);
+      const page = wdAuthPage();
+      const onCreate = page === 'create';
+      const onSignIn = page === 'signin';
+      if (!onCreate && !onSignIn) {
+        /* A sign-in page that shows the other form's link only. */
+        const link = wdLink(mode);
+        if (link) { wdPress(link); await sleep(900); }
+        continue;
+      }
+      const err = [...$$('[data-automation-id="errorMessage"],[role="alert"],[data-automation-id="inputAlert"]')]
+        .filter(isVisible).map(e => e.textContent || '').join(' ');
+      if (onCreate) {
+        if (mode !== 'create' || (WD_EXISTS_RE.test(err) && submits)) {
+          /* An account is there already: sign in instead (once). */
+          if (triedSignIn) { await noteWorkdaySite('other-password'); return { ok: false, reason: 'an account exists with another password' }; }
+          const link = wdLink('signin');
+          mode = 'signin';
+          if (link) { wdPress(link); await sleep(900); continue; }
+        }
+      } else if (mode !== 'signin' || (WD_BADPW_RE.test(err) && submits)) {
+        /* No account yet (or a wrong password): create one (once). */
+        if (triedCreate) { await noteWorkdaySite('other-password'); return { ok: false, reason: 'sign-in refused' }; }
+        const link = wdLink('create');
+        mode = 'create';
+        if (link) { wdPress(link); await sleep(900); continue; }
+      }
+      if (Date.now() - lastSubmit < 5000) continue;          // give the last press time to land
+
+      const email = wdEmailInput();
+      const pws = $$('input[type="password"]').filter(isVisible);
+      const pw = wdPasswordInput() || pws[0];
+      const verify = wdVerifyInput() || (onCreate ? pws[1] : null);
+      if (email && isVisible(email) && email.value.trim().toLowerCase() !== creds.email.toLowerCase()) { email.focus(); nativeSet(email, creds.email); await sleep(150); }
+      if (pw && isVisible(pw) && pw.value !== creds.password) { pw.focus(); nativeSet(pw, creds.password); await sleep(150); }
+      if (onCreate && verify && isVisible(verify) && verify !== pw && verify.value !== creds.password) { verify.focus(); nativeSet(verify, creds.password); await sleep(150); }
+      if (onCreate) {
+        const cb = $('input[type="checkbox"][data-automation-id="createAccountCheckbox"]') ||
+                   $('[data-automation-id="createAccountCheckbox"] input[type="checkbox"]') ||
+                   $$('input[type="checkbox"]').find(c => isVisible(c) && !c.checked &&
+                     /agree|terms|privacy|consent|acknowledge/i.test(((c.closest('label,div') || {}).textContent || '')));
+        if (cb && !cb.checked) { realClick(cb); await sleep(150); }
+      }
+      await sleep(300);
+      wdPress(wdSubmit(onCreate ? 'create' : 'signin'));
+      if (onCreate) triedCreate = true; else triedSignIn = true;
+      lastSubmit = Date.now(); submits++;
+      LOG(`Workday: ${onCreate ? 'creating the account' : 'signing in'}`);
     }
+    return { ok: false, reason: 'timed out' };
+  }
+  try {
+    chrome.runtime.onMessage.addListener((msg, _sender, reply) => {
+      if (!msg || msg.type !== 'OH_WORKDAY_SIGN_IN' || window.top !== window.self) return;
+      workdaySignIn().then(r => reply(r), e => reply({ ok: false, reason: String(e && e.message || e) }));
+      return true;
+    });
+  } catch (_) {}
+
+  async function workdayAccountFlow() {
+    /* Signed out on a Workday sign-in / create-account / "Start Your
+       Application" page: the shared sign-in above does it (the same run as
+       oh-bg.js's call, never two at once). */
+    if (wdAuthPage() || wdVisible('applyManually')) await workdaySignIn();
   }
 
   async function workdayEeoFields(p) {
@@ -5864,7 +6065,21 @@
   /* ── T5: Indeed "Apply on company site" ─────────────────── */
   function handleIndeed() {
     if (!HOST.includes('indeed.com')) return;
-    const click = () => {
+    /* Only for OUR CSV queue's job, in that job's tab. It ran on every
+       Indeed page, on every change of the page, and pressed "Apply now" /
+       dialog buttons while the user was just browsing. OptimHire's own runs
+       apply on Indeed themselves. */
+    let _busy = false;
+    const click = async () => {
+      if (_busy) return;
+      _busy = true;
+      try {
+        const q = await ST.get(['csvActiveJobId', 'ohJobQueueActive']);
+        if (!(q.csvActiveJobId || q.ohJobQueueActive) || !(await isAutomationActive()) || !(await isActiveJobTab())) return;
+        clickNow();
+      } finally { _busy = false; }
+    };
+    const clickNow = () => {
       const btn = $$('button,a').find(el =>
         /apply on company site|apply externally|apply now/i.test(el.textContent) ||
         el.getAttribute('data-testid') === 'company-site-apply-button'
@@ -5878,7 +6093,7 @@
       if (confirm) realClick(confirm);
     };
     setTimeout(click, 1500);
-    new MutationObserver(click).observe(document.body, { childList: true, subtree: true });
+    setInterval(click, 2000);
   }
   handleIndeed();
 
@@ -5893,6 +6108,10 @@
       if (_linkedInActing) return;
       _linkedInActing = true;
       try {
+        /* Our CSV queue's job only, in that job's tab — it pressed Apply /
+           Easy Apply on any LinkedIn jobs page the user was looking at. */
+        const q = await ST.get(['csvActiveJobId', 'ohJobQueueActive']);
+        if (!(q.csvActiveJobId || q.ohJobQueueActive) || !(await isAutomationActive()) || !(await isActiveJobTab())) return;
         const direct = $$('.jobs-apply-button,.apply-button,[data-control-name*="apply"]')
           .find(el => {
             const t = el.textContent.trim().toLowerCase();
@@ -7118,12 +7337,16 @@
       return true;
     }
 
+    /* ── Job boards (Indeed, Reed, Glassdoor…) ───────────────────────
+     * Only their own apply step — never search / listing pages. */
+    if (onJobBoard()) return boardApplyFlowOpen();
+
     /* ── All other recognised ATS ─────────────────────────────────
      * If we're on a known ATS domain, be permissive:
-     * 2+ non-hidden inputs anywhere in the DOM is enough.             */
-    return document.querySelectorAll(
+     * 2+ fields (not the site's search / header boxes) is enough.     */
+    return [...document.querySelectorAll(
       'input:not([type=hidden]):not([type=file]):not([type=submit]):not([type=button]),textarea'
-    ).length >= 2;
+    )].filter(el => !isPageChromeField(el)).length >= 2;
   }
 
   /** Inject/update the "Autofill in progress" banner */
@@ -7170,7 +7393,7 @@
       let vis = 0;
       for (const el of inputs) {
         const r = el.getBoundingClientRect();
-        if (r.width > 0 && r.height > 0) { vis++; if (vis >= 3) break; }
+        if (r.width > 0 && r.height > 0 && !isPageChromeField(el)) { vis++; if (vis >= 3) break; }
       }
       if (vis < 3) return false;
       if (document.querySelector('input[type=file]')) return true;
@@ -7207,11 +7430,13 @@
      * page the user happens to browse. */
     const { ohAutoTrigger } = await ST.get('ohAutoTrigger');
     if (ohAutoTrigger === false) return; /* user explicitly disabled */
-    if (ohAutoTrigger !== true) {
-      // Setting unset or any non-true value → require active automation
-      const active = await isAutomationActive();
-      if (!active) return;
-    }
+    const active = await isAutomationActive();
+    if (ohAutoTrigger !== true && !active) return;   // unset → only during a run
+    /* "Auto-fill on supported ATS pages" while browsing: a job board's
+       search / listing pages are not application forms (Indeed fired here
+       while the user was browsing); its own apply step is. During a run,
+       only the job's own tab. */
+    if (onJobBoard() && !(active && await isActiveJobTab()) && !boardApplyFlowOpen()) return;
 
     /* URL-dedup: don't fill same page twice */
     const norm = normalizeUrl(location.href);

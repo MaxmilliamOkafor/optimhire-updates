@@ -939,7 +939,7 @@
    *   - SUBMIT_ATTEMPTED was received (content script just clicked submit)
    *   - The current status is "submitting" (from SIDEBAR_STATUS event)
    * ─────────────────────────────────────────────────────────────────────── */
-  const AUTO_SKIP_MAX = 10;         // seconds (was 15); OptimHire's own 180s is cut to 10s in oh-bg.js
+  const AUTO_SKIP_MAX = 3;          // seconds (was 15, then 10); OptimHire's own 180s is cut to 3s in oh-bg.js
   let _forceSkipTimer  = null;
   let _forceSkipJobKey = '';
   let _submitAttemptedTs = 0; // timestamp of last SUBMIT_ATTEMPTED message
@@ -1439,6 +1439,47 @@
         });
       } catch (_) {}
     }, 2_000);
+  })();
+
+  /* ── "Could not load page properly": retry once, then skip ────────────
+   * When OptimHire cannot open a job page (the navigation throws, or its
+   * content script never answers) it shows "Could not load page properly"
+   * and simply stops — no countdown, no next job. The run then sat until a
+   * watchdog noticed, 4–6 minutes later, 7 times in one run. Now: retry the
+   * job once (OptimHire's own Retry), and skip it if that fails too. */
+  (function installPageLoadFailRecovery() {
+    var FAIL_RE = /could not (load page properly|establish connection)/i;
+    var STABLE_MS = 2500;
+    var _key = '', _since = 0, _acted = {};
+
+    function evaluate(st) {
+      if (!st || st.isActive === false || st.applicationState !== 'error' || !FAIL_RE.test(String(st.statusMessage || ''))) {
+        _key = ''; return;
+      }
+      var ad = st.applicationDetails || {};
+      var job = String(ad.copilot_job_id || (ad.source && ad.source.apply_now_url) || '');
+      var key = job + '|' + st.statusMessage;
+      var now = Date.now();
+      if (key !== _key) { _key = key; _since = now; return; }
+      if (now - _since < STABLE_MS) return;
+      _key = '';
+      var tries = _acted[job] || 0;
+      _acted[job] = tries + 1;
+      if (tries === 0 && !/after retry/i.test(st.statusMessage)) {
+        addLog('Job page did not load — retrying it', '');
+        Promise.resolve(chrome.runtime.sendMessage({ type: 'AUTO_APPLY_RETRY' })).catch(function () {});
+      } else if (tries <= 1) {
+        forceAdvanceSkip('Job page would not load');
+      }
+    }
+    try {
+      chrome.storage.onChanged.addListener(function (changes, area) {
+        if (area === 'local' && changes.autoApplyState) evaluate(changes.autoApplyState.newValue);
+      });
+    } catch (_) {}
+    setInterval(function () {
+      try { chrome.storage.local.get(['autoApplyState'], function (d) { evaluate(d && d.autoApplyState); }); } catch (_) {}
+    }, 1_000);
   })();
 
   /* ── "All applications completed" auto-resume ─────────────────────────
