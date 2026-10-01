@@ -543,6 +543,26 @@
     return false;
   }
 
+  /* ── Job boards: browsing them is never an application ───────────────
+   * Indeed, LinkedIn, Glassdoor, Reed… are search + listing sites. Only
+   * their own apply step is a form (Indeed Apply, LinkedIn's Easy Apply
+   * window, a board's apply dialog). Autofill and auto-clicks fired on
+   * Indeed while the user was just browsing it. */
+  const JOB_BOARD_HOST_RE = /(^|\.)(indeed\.[a-z.]+|linkedin\.com|glassdoor\.[a-z.]+|ziprecruiter\.[a-z.]+|reed\.co\.uk|dice\.com|monster\.[a-z.]+|totaljobs\.com|cv-library\.co\.uk|simplyhired\.[a-z.]+|careerbuilder\.[a-z.]+|adzuna\.[a-z.]+|jooble\.org|hiring\.cafe|seek\.com\.au|seek\.co\.nz|foundit\.[a-z.]+|irishjobs\.ie|jobs\.ie)$/i;
+  function onJobBoard() { return JOB_BOARD_HOST_RE.test(location.hostname); }
+  function boardApplyFlowOpen() {
+    try {
+      const h = location.hostname.toLowerCase();
+      if (/(^|\.)(smartapply|apply|m5\.apply)\.indeed\.com$/.test(h)) return true;          // Indeed Apply
+      if (/(^|\.)indeed\./.test(h) && /\/(indeedapply|apply)(\/|$)/i.test(location.pathname)) return true;
+      if (document.querySelector('.jobs-easy-apply-modal,[data-test-modal-id="easy-apply-modal"]')) return true;   // LinkedIn Easy Apply
+      /* A board's own apply window (Reed's "Apply now" dialog…). */
+      return [...document.querySelectorAll('[role="dialog"],[aria-modal="true"]')].some(d => isVisible(d) &&
+        !!d.querySelector('input[type=file],input[type=email],input[type=tel],textarea') &&
+        /\b(apply|application|submit)\b/i.test((d.textContent || '').slice(0, 3000)));
+    } catch (_) { return false; }
+  }
+
   /* ── Which field does an error message belong to? ───────────────────
    * The old lookup took the FIRST input in a broad "[class*=field]" box,
    * so Workable's Phone "This field is required." re-typed the Address
@@ -2907,6 +2927,8 @@
     if (_IS_OH_PAGE) return false;
     /* A visible password box means a sign-in / account form. */
     if ([...document.querySelectorAll('input[type=password]')].some(isVisible)) return false;
+    /* LinkedIn messages, Indeed searches… are not applications. */
+    if (onJobBoard()) return boardApplyFlowOpen();
     if (CURRENT_ATS || _engagedNow) return true;
     if (document.querySelector('input[type=file]')) return true;
     if (/apply|application|career|\bjobs?\b|recruit|hiring|talent|vacanc|position/i.test(location.href + ' ' + document.title)) return true;
@@ -3912,11 +3934,13 @@
     let filledCount = 0;
 
     /* ── Scan all visible form fields first to build field list ── */
+    /* The site's own search / header boxes (Indeed's "What / Where") are
+       never part of the application. */
     const allInputs = $$(
       'input:not([type=hidden]):not([type=file]):not([type=submit]):not([type=button]),' +
       'textarea'
-    ).filter(isVisible);
-    const allSelects = $$('select').filter(isVisible);
+    ).filter(el => isVisible(el) && !isPageChromeField(el));
+    const allSelects = $$('select').filter(el => isVisible(el) && !isPageChromeField(el));
 
     for (const el of allInputs) {
       const lbl = getLabel(el) || el.name || el.id || '';
@@ -6041,7 +6065,21 @@
   /* ── T5: Indeed "Apply on company site" ─────────────────── */
   function handleIndeed() {
     if (!HOST.includes('indeed.com')) return;
-    const click = () => {
+    /* Only for OUR CSV queue's job, in that job's tab. It ran on every
+       Indeed page, on every change of the page, and pressed "Apply now" /
+       dialog buttons while the user was just browsing. OptimHire's own runs
+       apply on Indeed themselves. */
+    let _busy = false;
+    const click = async () => {
+      if (_busy) return;
+      _busy = true;
+      try {
+        const q = await ST.get(['csvActiveJobId', 'ohJobQueueActive']);
+        if (!(q.csvActiveJobId || q.ohJobQueueActive) || !(await isAutomationActive()) || !(await isActiveJobTab())) return;
+        clickNow();
+      } finally { _busy = false; }
+    };
+    const clickNow = () => {
       const btn = $$('button,a').find(el =>
         /apply on company site|apply externally|apply now/i.test(el.textContent) ||
         el.getAttribute('data-testid') === 'company-site-apply-button'
@@ -6055,7 +6093,7 @@
       if (confirm) realClick(confirm);
     };
     setTimeout(click, 1500);
-    new MutationObserver(click).observe(document.body, { childList: true, subtree: true });
+    setInterval(click, 2000);
   }
   handleIndeed();
 
@@ -6070,6 +6108,10 @@
       if (_linkedInActing) return;
       _linkedInActing = true;
       try {
+        /* Our CSV queue's job only, in that job's tab — it pressed Apply /
+           Easy Apply on any LinkedIn jobs page the user was looking at. */
+        const q = await ST.get(['csvActiveJobId', 'ohJobQueueActive']);
+        if (!(q.csvActiveJobId || q.ohJobQueueActive) || !(await isAutomationActive()) || !(await isActiveJobTab())) return;
         const direct = $$('.jobs-apply-button,.apply-button,[data-control-name*="apply"]')
           .find(el => {
             const t = el.textContent.trim().toLowerCase();
@@ -7295,12 +7337,16 @@
       return true;
     }
 
+    /* ── Job boards (Indeed, Reed, Glassdoor…) ───────────────────────
+     * Only their own apply step — never search / listing pages. */
+    if (onJobBoard()) return boardApplyFlowOpen();
+
     /* ── All other recognised ATS ─────────────────────────────────
      * If we're on a known ATS domain, be permissive:
-     * 2+ non-hidden inputs anywhere in the DOM is enough.             */
-    return document.querySelectorAll(
+     * 2+ fields (not the site's search / header boxes) is enough.     */
+    return [...document.querySelectorAll(
       'input:not([type=hidden]):not([type=file]):not([type=submit]):not([type=button]),textarea'
-    ).length >= 2;
+    )].filter(el => !isPageChromeField(el)).length >= 2;
   }
 
   /** Inject/update the "Autofill in progress" banner */
@@ -7347,7 +7393,7 @@
       let vis = 0;
       for (const el of inputs) {
         const r = el.getBoundingClientRect();
-        if (r.width > 0 && r.height > 0) { vis++; if (vis >= 3) break; }
+        if (r.width > 0 && r.height > 0 && !isPageChromeField(el)) { vis++; if (vis >= 3) break; }
       }
       if (vis < 3) return false;
       if (document.querySelector('input[type=file]')) return true;
@@ -7384,11 +7430,13 @@
      * page the user happens to browse. */
     const { ohAutoTrigger } = await ST.get('ohAutoTrigger');
     if (ohAutoTrigger === false) return; /* user explicitly disabled */
-    if (ohAutoTrigger !== true) {
-      // Setting unset or any non-true value → require active automation
-      const active = await isAutomationActive();
-      if (!active) return;
-    }
+    const active = await isAutomationActive();
+    if (ohAutoTrigger !== true && !active) return;   // unset → only during a run
+    /* "Auto-fill on supported ATS pages" while browsing: a job board's
+       search / listing pages are not application forms (Indeed fired here
+       while the user was browsing); its own apply step is. During a run,
+       only the job's own tab. */
+    if (onJobBoard() && !(active && await isActiveJobTab()) && !boardApplyFlowOpen()) return;
 
     /* URL-dedup: don't fill same page twice */
     const norm = normalizeUrl(location.href);
