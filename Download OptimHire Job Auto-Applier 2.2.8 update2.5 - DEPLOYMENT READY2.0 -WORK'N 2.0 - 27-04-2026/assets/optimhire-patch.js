@@ -459,6 +459,10 @@
     if (!el) return false;
     val = (val == null) ? '' : String(val);
     val = phoneValueFor(el, val);
+    if (val && isTrapField(el)) {
+      if (!_trapLogged.has(el)) { _trapLogged.add(el); LOG(`Fill: skipped a hidden bot-trap field (${(el.name || el.id || 'unnamed').slice(0, 40)})`); }
+      return false;
+    }
     if (!mayWrite(el, val)) return false;
     noteWrite(el, val);
     let ok = false;
@@ -550,6 +554,36 @@
    * Indeed while the user was just browsing it. */
   const JOB_BOARD_HOST_RE = /(^|\.)(indeed\.[a-z.]+|linkedin\.com|glassdoor\.[a-z.]+|ziprecruiter\.[a-z.]+|reed\.co\.uk|dice\.com|monster\.[a-z.]+|totaljobs\.com|cv-library\.co\.uk|simplyhired\.[a-z.]+|careerbuilder\.[a-z.]+|adzuna\.[a-z.]+|jooble\.org|hiring\.cafe|seek\.com\.au|seek\.co\.nz|foundit\.[a-z.]+|irishjobs\.ie|jobs\.ie)$/i;
   function onJobBoard() { return JOB_BOARD_HOST_RE.test(location.hostname); }
+
+  /* ── Bot traps ("honeypots") ─────────────────────────────────────────
+   * Hidden fields a person never sees; anything typed into one marks the
+   * application as a bot and it is quietly thrown away. Oracle and others
+   * draw them with a real size, so the size-based visibility check let
+   * them through. Never fill them. (Patterns after NextRaise's adapter.) */
+  const TRAP_RE = /\bhoney[\s_-]*pot\b|\bhoneypot\b|\bbot[\s_-]*(field|trap)\b|\bspam[\s_-]*trap\b|\brobots?\s+only\b|\bdo\s+not\s+(enter|fill|complete)[^.!?]{0,80}\b(human|person)\b|\bleave\s+(this\s+)?(field|input)?\s*blank\b/i;
+  const _trapLogged = new WeakSet();
+  function isTrapField(el) {
+    try {
+      if (!el || el.nodeType !== 1 || !/^(INPUT|TEXTAREA|SELECT)$/.test(el.tagName)) return false;
+      if ((el.type || '').toLowerCase() === 'file') return false;            // upload boxes are often visually hidden on purpose
+      /* Hidden from assistive tech on the field or its own wrapper (a trap's
+         container). Not further up: dialog libraries hide the whole page
+         behind an open cookie / modal dialog the same way. */
+      for (let n = el, i = 0; n && i < 4; n = n.parentElement, i++) {
+        if (n.getAttribute && (n.getAttribute('aria-hidden') === 'true' || n.hasAttribute('inert'))) return true;
+      }
+      const corpus = [el.getAttribute('name'), el.id, el.getAttribute('aria-label'), el.getAttribute('data-testid'),
+                      el.getAttribute('data-qa'), el.getAttribute('placeholder'),
+                      el.labels && [...el.labels].map(l => l.textContent).join(' ')].filter(Boolean).join(' ');
+      if (TRAP_RE.test(corpus)) return true;
+      /* Pushed off-screen / see-through and kept out of the tab order. */
+      if (el.tabIndex === -1) {
+        const r = el.getBoundingClientRect(), cs = getComputedStyle(el);
+        if (r.right < 0 || r.bottom < 0 || r.left > (innerWidth + 2000) || parseFloat(cs.opacity) === 0 || r.width < 2 || r.height < 2) return true;
+      }
+    } catch (_) {}
+    return false;
+  }
   function boardApplyFlowOpen() {
     try {
       const h = location.hostname.toLowerCase();
@@ -923,11 +957,71 @@
 
   /* The ONLY way this file may ask the queue to advance. Silently drops
      the request unless this tab is the active job. */
+  /* ── Why a job was given up: the fields still empty or flagged ────────
+   * Written to chrome.storage (ohFieldFailures, last 40 jobs) so it comes
+   * along in the diagnostic file: the question's label, the kind of widget
+   * and whether it was required / empty / flagged with the site's message.
+   * Never the values typed. (Idea from NextRaise's autofill diagnostics.) */
+  let _lastFailureNote = '';
+  function failureWidget(el) {
+    if (el.tagName === 'SELECT') return el.classList.contains('select2-hidden-accessible') ? 'select2' : 'select';
+    if (el.closest('[data-automation-id]') && /myworkday/i.test(location.hostname)) return 'workday-' + ((el.type || el.tagName).toLowerCase());
+    if (isComboInput(el)) return el.closest(COMBO_WRAP_SEL) ? 'react-select' : 'combobox';
+    return (el.type || el.tagName).toLowerCase();
+  }
+  function failureEmpty(el) {
+    const t = (el.type || '').toLowerCase();
+    if (t === 'radio') return !el.name || ![...document.getElementsByName(el.name)].some(r => r.checked);
+    if (t === 'checkbox') return !el.checked;
+    if (t === 'file') return !(el.files && el.files.length);
+    if (el.tagName === 'SELECT') return !el.value;
+    if (isComboInput(el)) return !comboSelectedText(el);
+    return !(el.value || '').trim();
+  }
+  function failureMessage(el) {
+    let box = el.parentElement;
+    for (let i = 0; i < 6 && box && box !== document.body; i++, box = box.parentElement) {
+      if (fieldsIn(box).some(f => f !== el && !(f.type === 'radio' && f.name && f.name === el.name))) break;
+      const e = [...box.querySelectorAll(ERROR_TEXT_SEL)].find(x => !x.contains(el) && !x.querySelector(FIELD_SEL) && isVisible(x) && /\S/.test(x.textContent || ''));
+      if (e) return (e.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 90);
+    }
+    return '';
+  }
+  async function noteFieldFailures(reason) {
+    try {
+      if (window.top !== window.self || _IS_OH_PAGE) return;
+      const key = location.href + '|' + reason;
+      if (key === _lastFailureNote) return;
+      _lastFailureNote = key;
+      const seenGroups = new Set(), fields = [];
+      for (const el of $$(FIELD_SEL + ',input[type="file"]')) {      // upload boxes count here
+        if (fields.length >= 15) break;
+        const t = (el.type || '').toLowerCase();
+        if (t === 'radio' || t === 'checkbox') { if (el.name && seenGroups.has(el.name)) continue; if (el.name) seenGroups.add(el.name); }
+        if (t !== 'file' && t !== 'radio' && t !== 'checkbox' && !isVisible(el)) continue;
+        if (isPageChromeField(el) || isTrapField(el) || inPhoneWidget(el)) continue;
+        const lbl = ((t === 'radio' && typeof radioGroupLabel === 'function' ? radioGroupLabel(el) : '') || getLabel(el) || el.name || '').replace(/\s+/g, ' ').trim();
+        const required = el.required || el.getAttribute('aria-required') === 'true' || /\*\s*$/.test(lbl);
+        const flagged = fieldFlagged(el);
+        const empty = failureEmpty(el);
+        if (!((required && empty) || flagged)) continue;
+        fields.push({ label: lbl.slice(0, 90), widget: failureWidget(el), required, empty, flagged, error: flagged ? failureMessage(el) : '' });
+      }
+      const entry = { ts: Date.now(), host: location.hostname, path: location.pathname.slice(0, 120), ats: CURRENT_ATS || '', reason: String(reason || '').slice(0, 120), fields };
+      const d = await ST.get(['ohFieldFailures']);
+      const list = Array.isArray(d.ohFieldFailures) ? d.ohFieldFailures : [];
+      list.push(entry);
+      await ST.set({ ohFieldFailures: list.slice(-40) });
+      LOG(`Diagnostics: ${fields.length} unfinished field(s) noted for "${entry.reason}"`);
+    } catch (_) {}
+  }
+
   async function requestSkipCurrent(reason) {
     if (window.top !== window.self || !(await isActiveJobTab())) {
       LOG(`skipCurrent suppressed (not the active job tab): ${reason || ''}`);
       return false;
     }
+    await noteFieldFailures(reason);
     await sendOptimHireSkip(reason);
     LOG(`skip sent: ${reason || ''}`);
     return true;
@@ -1179,6 +1273,7 @@
         send(successFor(msg));
       } else {
         LOG(`Rescue: could not complete the form — passing on "${msg.errorType}"`);
+        await noteFieldFailures(`OptimHire: ${msg.errorType}${msg.message ? ' — ' + String(msg.message).slice(0, 80) : ''}`);
         send(msg);
       }
       await ST.remove('ohRescuePending');
@@ -1597,6 +1692,16 @@
        "[class*=field]" box, saw the Phone field's "This field is required."
        under Workable's Address, and re-typed the address over and over. */
     const looksInvalid = fieldFlagged;
+    /* Lever's city box has no combobox markup: a suggestion only counts once
+       its hidden selectedLocation holds the same name (from NextRaise's
+       Lever adapter). Typed text alone left Lever's form unsubmittable. */
+    const isLeverLocation = el => el.matches('input.location-input[name="location"]') && !!el.closest('.application-field');
+    function leverPicked(el) {
+      const sel = el.closest('.application-field').querySelector('input[type="hidden"][name="selectedLocation"]');
+      let name = '';
+      try { name = (JSON.parse((sel && sel.value) || '{}') || {}).name || ''; } catch (_) {}
+      return !!name && name.trim() === (el.value || '').trim();
+    }
     const _retriedInvalid = new WeakSet();
     /* Candidate typeahead inputs: required, visible, empty, location-ish. */
     function findLocationInputs() {
@@ -1607,8 +1712,10 @@
         if (isPageChromeField(el)) continue;           // the site's own job-search "Where" box
         const lbl = (getLabel(el) || '') + ' ' + (el.placeholder || '') + ' ' +
                     (el.getAttribute('aria-label') || '');
-        if (!LOC_RE.test(lbl)) continue;
-        if (!isEmptyInput(el) && !looksInvalid(el)) continue;
+        const lever = isLeverLocation(el);
+        if (!lever && !LOC_RE.test(lbl)) continue;
+        if (lever ? leverPicked(el) : (!isEmptyInput(el) && !looksInvalid(el))) continue;
+        if (lever) { out.push({ el, lbl: lbl.trim() || 'Location' }); continue; }
         const req = el.required || el.getAttribute('aria-required') === 'true' ||
                     !!el.closest('[class*="required"]');
         /* Only bother with fields that are actually required, or that are
@@ -1642,6 +1749,7 @@
       return lb && isVisible(lb) ? lb : null;
     }
     function visibleOptions(el) {
+      if (el && isLeverLocation(el)) return $$('.dropdown-container .dropdown-results > .dropdown-location', el.closest('.application-field')).filter(isVisible);
       const lb = ownList(el);
       return $$(
         '[role="option"],[class*="react-select__option"],[class*="Select__option"],' +
@@ -1658,7 +1766,19 @@
       await sleep(900);                      // let async option lookup finish
 
       const want = String(value).split(',')[0].trim().toLowerCase();
-      const matching = () => visibleOptions(el).filter(o => (o.textContent || '').toLowerCase().includes(want));
+      /* Best first: the city AND your country ("Dublin, … Ireland" before
+         "Dublin, Ohio, United States"), then the city alone. */
+      const parts = String(value).split(',').map(x => x.trim().toLowerCase()).filter(Boolean);
+      const country = parts.length > 1 ? parts[parts.length - 1] : '';
+      const ALIAS = { ie: 'ireland', irl: 'ireland', uk: 'united kingdom', gb: 'united kingdom', 'great britain': 'united kingdom',
+                      us: 'united states', usa: 'united states', 'united states of america': 'united states', uae: 'united arab emirates' };
+      const norm = c => ALIAS[c] || c;
+      const score = o => {
+        const ps = (o.textContent || '').split(',').map(x => x.trim().toLowerCase()).filter(Boolean);
+        return (ps[0] === want ? 2 : 1) + (country && ps.length > 1 && norm(ps[ps.length - 1]) === norm(country) ? 4 : 0);
+      };
+      const matching = () => visibleOptions(el).filter(o => (o.textContent || '').toLowerCase().includes(want))
+        .map((o, i) => ({ o, i, s: score(o) })).sort((a, b) => b.s - a.s || a.i - b.i).map(x => x.o);
       let opts = matching();
       if (!opts.length) {                    // retry with a shorter query
         const short = String(value).split(',')[0].trim();
@@ -3939,8 +4059,8 @@
     const allInputs = $$(
       'input:not([type=hidden]):not([type=file]):not([type=submit]):not([type=button]),' +
       'textarea'
-    ).filter(el => isVisible(el) && !isPageChromeField(el));
-    const allSelects = $$('select').filter(el => isVisible(el) && !isPageChromeField(el));
+    ).filter(el => isVisible(el) && !isPageChromeField(el) && !isTrapField(el));
+    const allSelects = $$('select').filter(el => isVisible(el) && !isPageChromeField(el) && !isTrapField(el));
 
     for (const el of allInputs) {
       const lbl = getLabel(el) || el.name || el.id || '';
@@ -5204,7 +5324,7 @@
         'input[aria-required="true"]:not([type=hidden]):not([type=submit]):not([type=button]),' +
         'textarea[required],textarea[aria-required="true"],' +
         'select[required],select[aria-required="true"]'
-      ).filter(isVisible);
+      ).filter(el => isVisible(el) && !isTrapField(el));
       for (const el of reqs) {
         if (el.type === 'checkbox' || el.type === 'radio') {
           /* For groups, check that at least one member of the same name
@@ -5809,7 +5929,8 @@
     if (byLabel && isVisible(byLabel)) return byLabel;
     return type ? ($$(`input[type="${type}"]`).find(isVisible) || null) : null;
   };
-  const wdEmailInput = () => wdField('email', /^e-?mail( address)?\*?$/i, 'email');
+  const wdEmailInput = () => wdField('email', /^e-?mail( address)?\*?$/i, 'email') ||
+    $$('input[data-automation-id="emailAddress"],input[autocomplete="username"]').find(isVisible) || null;
   const wdPasswordInput = () => wdField('password', /^password\*?$/i, 'password');
   const wdVerifyInput = () => wdField('verifyPassword', /^verify (new )?password\*?$/i);
   function wdHeading() {
@@ -5822,9 +5943,13 @@
     const form = $('form[data-automation-id="signInFormo"]');
     if (wdVisible('signInSubmitButton') || (form && isVisible(form))) return 'signin';
     if (!wdPasswordInput()) return '';
+    /* Two password boxes next to one e-mail box = create; one = sign in. */
+    const pwCount = $$('input[type="password"]').filter(isVisible).length;
+    if (wdEmailInput() && pwCount === 2) return 'create';
     const h = wdHeading();
     if (/create account/.test(h)) return 'create';
     if (/sign in/.test(h) || wdButtonByText('Sign In')) return 'signin';
+    if (wdEmailInput() && pwCount === 1) return 'signin';
     return '';
   }
   function wdSubmit(page) {
@@ -5844,6 +5969,15 @@
       const t = (step.textContent || '').trim().toLowerCase();
       return !!t && !/create account|sign in/.test(t);
     }
+    /* The step bar names several application steps at once, or the page
+       already carries real Workday form fields. */
+    const bar = $('[data-automation-id="progressBar"]');
+    if (bar && isVisible(bar)) {
+      const t = (bar.textContent || '').toLowerCase();
+      if (['my information', 'my experience', 'application questions', 'voluntary disclosures', 'self identify', 'review']
+            .filter(x => t.includes(x)).length >= 2 && !/create account|sign in/.test(((step && step.textContent) || '').toLowerCase())) return true;
+    }
+    if ($$('[data-automation-id^="formField-"]').filter(isVisible).length >= 3) return true;
     return !!(wdVisible('utilityMenuButton') || wdVisible('accountSettingsButton') ||
               wdVisible('pageFooterNextButton') || wdVisible('bottom-navigation-next-button') ||
               wdVisible('legalNameSection_firstName') || $('[data-automation-id^="applyFlow"]'));
@@ -5874,6 +6008,11 @@
         await noteWorkdaySite('account');
         LOG('Workday: signed in');
         return { ok: true };
+      }
+      /* A CAPTCHA on the sign-in step: nothing we can do — skip now, don't wait. */
+      if (wdAuthPage() && $$('iframe').some(fr => isVisible(fr) && /captcha|recaptcha|hcaptcha|turnstile/i.test(fr.src || ''))) {
+        LOG('Workday: a CAPTCHA guards this sign-in — skipping');
+        return { ok: false, reason: 'captcha' };
       }
       if (submits && WD_VERIFY_RE.test(t) && !wdVisible('createAccountSubmitButton') && !wdVisible('signInSubmitButton')) {
         await noteWorkdaySite('verify');
