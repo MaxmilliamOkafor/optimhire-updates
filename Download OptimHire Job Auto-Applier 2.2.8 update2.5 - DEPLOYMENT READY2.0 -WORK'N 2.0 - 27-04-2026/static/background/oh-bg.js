@@ -56,6 +56,13 @@
  *    loads 2 s (5 s on redirecting sites) → 1 s (2.5 s). Search index.js
  *    for "setTimeout(e,400)" etc. to re-apply after an OptimHire update.
  *
+ * 9. Workday jobs go to the Workday engine (assets/wd-engine.js, built from
+ *    workday-engine/): OptimHire's FILL_COMPLEX_FORM for a Workday tab is
+ *    handed to it as oh:wd:start; it signs in, uploads the CV, fills every
+ *    step, submits and reports back like OptimHire's own filler. If it
+ *    doesn't answer within 8 s the message goes to OptimHire's filler as
+ *    before. ohWdEngineOff: true in storage turns it off.
+ *
  * Wiring: manifest.json background.service_worker points here. On an
  * OptimHire update, copy the new index.js in and keep this entry point.
  * Same directory as index.js on purpose, so nothing that resolves paths
@@ -66,7 +73,7 @@
   'use strict';
   var KEYS = ['copilotTabId', 'isAutoProcessStartJob', 'isManuallyStartJob', 'autoApplyState',
               'ohRunStats', 'ohJobQueueActive', 'ohJobQueue', 'ohAutomationDisabled', 'ohPreferAts',
-              'ohAutoApplyEngaged', 'ohAutoApplyEngagedTs', 'ohAutoPressTs', 'preferredJobsite'];
+              'ohAutoApplyEngaged', 'ohAutoApplyEngagedTs', 'ohAutoPressTs', 'preferredJobsite', 'ohWdEngineOff'];
   var state = { tab: null, live: false, loaded: false };
   var ohSuccessWatch = null;      // OptimHire's handler, once it registers it
   var registered = null;          // { fn, tab } currently registered with Chrome
@@ -389,12 +396,41 @@
      (OH_WORKDAY_SIGN_IN), then OptimHire's own check runs as usual. */
   var WD_HOST_RE = /(^|\.)(myworkdayjobs\.com|myworkdaysite\.com|workday\.com)$/i;
   var WD_SIGN_IN_MS = 75000;
+  /* 9. Hosts the Workday engine's content script runs on (manifest). */
+  var WD_ENGINE_RE = /(^|\.)(myworkdayjobs|myworkdaysite|myworkday|workdayjobs)\.com$/i;
+  var WD_ENGINE_ACK_MS = 8000;
   var tabsApi = chrome.tabs;
+  function tabHost(tabId) {
+    return new Promise(function (resolve) {
+      tabsApi.get(tabId, function (t) {
+        void chrome.runtime.lastError;
+        var host = '';
+        try { host = new URL((t && (t.url || t.pendingUrl)) || '').hostname; } catch (_) {}
+        resolve(host);
+      });
+    });
+  }
   if (tabsApi && typeof tabsApi.sendMessage === 'function') {
     var origSend = tabsApi.sendMessage.bind(tabsApi);
     tabsApi.sendMessage = function (tabId, msg) {
       var args = arguments;
       try {
+        if (msg && msg.type === 'FILL_COMPLEX_FORM' && typeof tabId === 'number' &&
+            typeof args[args.length - 1] !== 'function' && snap.ohAutomationDisabled !== true && snap.ohWdEngineOff !== true) {
+          return tabHost(tabId).then(function (host) {
+            if (!WD_ENGINE_RE.test(host)) return origSend.apply(null, args);
+            var start = Object.assign({}, msg, { type: 'oh:wd:start' });
+            return within(origSend(tabId, start, { frameId: 0 }).catch(function () { return null; }), WD_ENGINE_ACK_MS)
+              .then(function (r) {
+                if (r && r.acknowledged) {
+                  try { console.info('[OH-BG] Workday job handed to the Workday engine on ' + host); } catch (_) {}
+                  return { acknowledged: true };
+                }
+                try { console.info('[OH-BG] Workday engine did not answer on ' + host + ' — OptimHire fills it'); } catch (_) {}
+                return origSend.apply(null, args);
+              });
+          });
+        }
         if (msg && msg.type === 'CHECK_LOGIN_STATUS' && typeof tabId === 'number' &&
             typeof args[args.length - 1] !== 'function' && snap.ohAutomationDisabled !== true) {
           return new Promise(function (resolve) {
@@ -414,6 +450,24 @@
       return origSend.apply(null, args);
     };
   }
+
+  /* 9. The Workday engine fetches the CV here when the page may not (CORS). */
+  try {
+    chrome.runtime.onMessage.addListener(function (msg, sender, reply) {
+      if (!msg || msg.type !== 'OH_WD_FETCH_FILE' || sender.id !== chrome.runtime.id ||
+          typeof msg.url !== 'string' || !/^https:\/\//i.test(msg.url)) return;
+      fetch(msg.url).then(function (r) {
+        if (!r.ok) return null;
+        var mime = r.headers.get('content-type') || '';
+        return r.arrayBuffer().then(function (buf) {
+          var bytes = new Uint8Array(buf), bin = '';
+          for (var i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+          return { base64: btoa(bin), mime: mime };
+        });
+      }).then(reply, function () { reply(null); });
+      return true;
+    });
+  } catch (_) {}
 
   /* Auto-submit: keep OptimHire's "automatic apply" flag on (see 6 above). */
   var AUTO_FLAG = 'is_copilot_automatic_apply_to_job';

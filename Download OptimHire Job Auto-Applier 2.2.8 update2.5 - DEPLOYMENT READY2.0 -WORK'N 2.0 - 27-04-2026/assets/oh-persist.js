@@ -42,7 +42,11 @@
     'ohQaMemory',             // remembered answers
     'ohWorkdayLogin',         // Workday e-mail + password, and which company sites have an account
     'appAccountEmail',        // "Applications account" (used for Workday too)
-    'appAccountPassword'
+    'appAccountPassword',
+    'ohWorkdayProfile',       // full profile imported for the Workday engine
+    'ohWdEngineOff',          // Workday engine switched off (OptimHire fills Workday itself)
+    'ohWdEngineLog',          // the Workday engine's last runs, for diagnostics
+    'ohWdSeeker'              // your details from the last OptimHire job (Workday "Autofill this page")
   ];
   var KEYSET = {};
   KEYS.forEach(function (k) { KEYSET[k] = 1; });

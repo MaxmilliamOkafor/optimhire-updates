@@ -5,7 +5,12 @@
  * or create, the account on each company's Workday site
  * (chrome.storage.local.ohWorkdayLogin = { email, password, sites }), and
  * which sites have an account / want their e-mail link clicked first. The
- * sign-in itself is done by assets/optimhire-patch.js.
+ * sign-in itself is done by the Workday engine (assets/wd-engine.js), or by
+ * assets/optimhire-patch.js when the engine is off.
+ *
+ * Also: the Workday engine's on/off switch (ohWdEngineOff) and the optional
+ * full profile it uses (ohWorkdayProfile — work history, education, skills),
+ * imported from the Workday extension's profile JSON.
  */
 (function () {
   'use strict';
@@ -68,11 +73,39 @@
       if (cb) cb();
     });
   }
+  /* A Profile, or a storage export holding one ({"wd:profile": …} / {profile: …}). */
+  function profileFrom(j) {
+    var p = j && (j['wd:profile'] || j.profile || j);
+    return p && typeof p === 'object' && (p.personal || Array.isArray(p.work)) ? p : null;
+  }
+  function renderEngine() {
+    ST.get(['ohWdEngineOff', 'ohWorkdayProfile'], function (d) {
+      $('wdEngineOn').checked = !(d && d.ohWdEngineOff === true);
+      var p = d && d.ohWorkdayProfile;
+      var name = p && p.personal ? [p.personal.firstName, p.personal.lastName].filter(Boolean).join(' ') : '';
+      $('wdProfileState').textContent = p
+        ? 'Imported' + (name ? ': ' + name : '') + ' — ' + ((p.work || []).length) + ' role(s), ' +
+          ((p.education || []).length) + ' education, ' + ((p.skills || []).length) + ' skill(s)'
+        : 'Not imported — your OptimHire details are used.';
+      $('wdProfileRemove').disabled = !p;
+    });
+  }
+  function importProfile(file) {
+    var r = new FileReader();
+    r.onload = function () {
+      var p = null;
+      try { p = profileFrom(JSON.parse(String(r.result || ''))); } catch (_) {}
+      if (!p) { toast('That file has no Workday profile in it', 'error'); return; }
+      ST.set({ ohWorkdayProfile: p }, function () { toast('Workday profile imported', 'success'); renderEngine(); });
+    };
+    r.readAsText(file);
+  }
   function open() {
     load(function () {
       $('wdEmail').value = login.email || '';
       $('wdPassword').value = login.password || '';
       renderSites();
+      renderEngine();
       $('wdModal').classList.remove('hidden');
     });
   }
@@ -101,6 +134,16 @@
     $('wdCopy').addEventListener('click', function () {
       var v = $('wdPassword').value;
       try { navigator.clipboard.writeText(v).then(function () { toast('Password copied', 'success'); }); } catch (_) {}
+    });
+    $('wdEngineOn').addEventListener('change', function () {
+      ST.set({ ohWdEngineOff: !$('wdEngineOn').checked }, function () {
+        toast($('wdEngineOn').checked ? 'Workday engine on' : 'Workday engine off — OptimHire fills Workday', 'success');
+      });
+    });
+    $('wdProfileImport').addEventListener('click', function () { $('wdProfileFile').value = ''; $('wdProfileFile').click(); });
+    $('wdProfileFile').addEventListener('change', function () { var f = this.files && this.files[0]; if (f) importProfile(f); });
+    $('wdProfileRemove').addEventListener('click', function () {
+      ST.set({ ohWorkdayProfile: null }, function () { toast('Workday profile removed', 'success'); renderEngine(); });
     });
     var modal = $('wdModal');
     modal.addEventListener('click', function (e) {
