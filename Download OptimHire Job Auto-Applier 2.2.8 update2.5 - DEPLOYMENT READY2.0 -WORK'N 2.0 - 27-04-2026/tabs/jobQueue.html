@@ -282,6 +282,22 @@
       </div>
       <div class="help-text">At least 8 characters with an upper-case letter, a lower-case letter, a number and a symbol.</div>
       <div id="wdSites" class="qa-list"></div>
+      <h2 style="margin-top:14px">Workday engine</h2>
+      <label style="display:flex;gap:8px;align-items:flex-start;font-weight:normal">
+        <input type="checkbox" id="wdEngineOn" style="width:auto;margin-top:3px">
+        <span>Apply to Workday jobs with the Workday engine: it signs in, uploads your CV, fills every step and
+        submits. Off: OptimHire fills Workday itself.</span>
+      </label>
+      <div class="help-text">
+        Full profile (optional): import the profile JSON from your Workday extension to add your work history,
+        education and skills. Without it your OptimHire details are used and Workday reads the rest from your CV.
+      </div>
+      <div class="qa-tools">
+        <span id="wdProfileState" style="flex:1"></span>
+        <button id="wdProfileImport" class="btn-small">Import profile…</button>
+        <button id="wdProfileRemove" class="btn-small">Remove</button>
+      </div>
+      <input type="file" id="wdProfileFile" accept=".json,application/json" style="display:none">
       <div class="modal-actions">
         <button id="wdClose">Close</button>
         <button id="wdSave" class="btn-primary">Save</button>

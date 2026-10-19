@@ -1,0 +1,12 @@
+{
+  "name": "optimhire-workday-engine",
+  "private": true,
+  "type": "module",
+  "description": "Workday autopilot engine + OptimHire adapter, bundled into the extension as assets/wd-engine.js",
+  "scripts": {
+    "build": "node build.mjs"
+  },
+  "devDependencies": {
+    "esbuild": "0.24.2"
+  }
+}

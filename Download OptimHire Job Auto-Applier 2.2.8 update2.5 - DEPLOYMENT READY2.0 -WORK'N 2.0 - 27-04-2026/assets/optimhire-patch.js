@@ -805,6 +805,10 @@
   };
 
   const HOST = location.hostname.toLowerCase().replace(/^www\./, '');
+  /* A Workday page the Workday engine (assets/wd-engine.js) is applying on:
+     everything here that fills fields or presses buttons leaves it alone —
+     two fillers on one form undo each other. */
+  const wdEngineOwns = () => { try { return !!(window.__ohWdEngine && window.__ohWdEngine.owns()); } catch (_) { return false; } };
   const _rawATS = Object.entries(ATS_DOMAINS)
     .find(([domain]) => HOST.includes(domain))?.[1] || null;
   // LinkedIn: only activate on /jobs path — not on feeds, profiles, or messaging
@@ -1098,6 +1102,7 @@
     if (msg.type === 'TRIGGER_AUTOFILL' || msg.type === 'MANUAL_AUTOFILL' ||
         msg.action === 'autofill' || msg.action === 'startAutofill' ||
         msg.type === 'OH_AUTOFILL_THIS_PAGE') {
+      if (msg.type === 'OH_AUTOFILL_THIS_PAGE' && window.__ohWdEngine && window.__ohWdEngine.takesManual()) return;   // Workday: the engine fills it
       _manualTriggerTs = Date.now();
       _automationCache = { active: true, ts: Date.now() };
       /* Only the top frame drives the fill so we don't run once per iframe. */
@@ -1227,6 +1232,7 @@
   let _rescueBusy = false, _rescuedUrl = '', _rescuedTs = 0;
   function isRescuableError(msg) {
     if (!msg || window.top !== window.self) return false;
+    if (msg.fromWdEngine) return false;      // the Workday engine already did all it could on that form
     const manualErr = msg.type === 'MANUAL_FORM_ERROR_SUCCESS_MESSAGE' && !msg.isSuccess;
     if (msg.type !== 'COMPLEX_FORM_ERROR' && !manualErr) return false;
     return RESCUABLE_ERR_RE.test(String(msg.errorType || ''));
@@ -1809,7 +1815,7 @@
       if (_busy) return;
       try {
         if (location.href !== _forUrl) { _forUrl = location.href; _tries = 0; }
-        if (_fillActive) return;
+        if (_fillActive || wdEngineOwns()) return;
         if (!(await isAutomationActive())) return;
         /* Only rescue fields on the tab that is actually the current job. */
         if (!(await isActiveJobTab())) return;
@@ -2053,6 +2059,7 @@
       }
       /* Don't fight an in-flight submit. */
       if (_submitAttempted && now - _submitAttemptTs < SUBMIT_SETTLE_MS) return;
+      if (wdEngineOwns()) return;
 
       const d = await ST.get(AUTOMATION_KEYS);
       if (!mayAutomate(d)) return;
@@ -2892,6 +2899,9 @@
     return _qaCache;
   }
 
+  /* The Workday engine (assets/wd-engine.js) asks the same memory first. */
+  window.__ohQaLookup = async (label) => { await loadQaMemory(); return rememberedAnswer(label, ''); };
+
   /* Memory lookup used at the top of guessValue(). */
   const _qaUsedLogged = new Set();
   function rememberedAnswer(label, inputType) {
@@ -3704,6 +3714,7 @@
    * into every empty field.  Designed to run multiple times (it's idempotent).
    */
   async function sanitizeBadFills() {
+    if (wdEngineOwns()) return;
     const p = await getProfile();
     const inputs = $$(
       'input:not([type=hidden]):not([type=file]):not([type=submit]):not([type=button]),' +
@@ -3830,6 +3841,7 @@
    * Returns the number of errors fixed.
    * ─────────────────────────────────────────────────────────────────── */
   async function detectAndFixValidationErrors() {
+    if (wdEngineOwns()) return 0;
     const p = await getProfile();
     let fixed = 0;
 
@@ -4049,6 +4061,7 @@
   }
 
   async function autoFillPage() {
+    if (wdEngineOwns()) return;
     const p = await getProfile();
     const allFields = [];
     let filledCount = 0;
@@ -4914,6 +4927,7 @@
       if (optimHireBusy()) progressed = true;                             // OH overlay/spinner
       if (Date.now() - _ohActivityTs < 45_000) progressed = true;         // OptimHire's state/panel moved
       if (_rescueBusy) progressed = true;                                 // we are finishing the form
+      if (wdEngineOwns()) progressed = true;                              // the Workday engine is applying
       const sig = formSignature();
       if (sig !== _lastFormSignature) { _lastFormSignature = sig; progressed = true; }
 
@@ -5069,7 +5083,7 @@
        own storage read on every tick. */
     /* Use the shared cached helper (declared at top of file) instead
        of doing our own storage read on every tick. */
-    const automationActive = () => isAutomationActive();
+    const automationActive = async () => !wdEngineOwns() && isAutomationActive();
 
     async function maybeClick(re, label) {
       if (!(await automationActive())) return;
@@ -5252,7 +5266,7 @@
     /* Use the shared cached helper (declared at top of file) — its
        1.5s cache covers our 400ms tick cadence without any storage
        reads on most ticks. */
-    const automationActive = () => isAutomationActive();
+    const automationActive = async () => !wdEngineOwns() && isAutomationActive();
 
     /* OptimHire filled the form itself (its own engine, not ours) and is
        now waiting for a human to press submit — the sidebar shows "Form
@@ -6927,6 +6941,7 @@
 
   /* ── Shared ATS dispatch helper ─────────────────────────── */
   async function runAtsAutofill() {
+    if (wdEngineOwns()) return;
     // v6.1: bail out cleanly if a Cloudflare bot-challenge is showing,
     // so we don't trip a refresh loop while it's in progress.
     if (isCloudflareChallenge()) {
@@ -7551,6 +7566,7 @@
 
   async function autoTriggerAutofill() {
     /* Guards */
+    if (wdEngineOwns()) return;
     if (_autoTriggerRunning) return;
     if (_autoTriggered)      return;
     /* On a RECOGNISED ATS we always proceed. On an UNRECOGNISED ATS
