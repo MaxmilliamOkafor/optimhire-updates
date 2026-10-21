@@ -111,9 +111,21 @@
   }
 
   /* ───── CSV parsing / writing ───── */
-  /** RFC-4180-ish CSV parser. Handles quoted fields with commas, embedded
+  /* Real exports are comma, semicolon (European Excel), tab (pasted
+     spreadsheets) or pipe delimited; the first line decides. */
+  function sniffDelimiter(text) {
+    const line = text.split(/\r?\n/).find(l => l.trim()) || '';
+    let best = ',', bestN = 0;
+    for (const d of [',', ';', '\t', '|']) {
+      const n = line.split(d).length - 1;
+      if (n > bestN) { bestN = n; best = d; }
+    }
+    return bestN ? best : ',';
+  }
+  /** RFC-4180 CSV parser. Handles quoted fields with delimiters, embedded
       newlines, and "" escapes. Returns array of row arrays. */
-  function parseCsv(text) {
+  function parseCsv(text, delim) {
+    delim = delim || ',';
     const rows = [];
     let row = [], field = '', inQuotes = false;
     for (let i = 0; i < text.length; i++) {
@@ -124,7 +136,7 @@
         else { field += ch; }
       } else {
         if (ch === '"') { inQuotes = true; }
-        else if (ch === ',') { row.push(field); field = ''; }
+        else if (ch === delim) { row.push(field); field = ''; }
         else if (ch === '\r') { /* skip */ }
         else if (ch === '\n') { row.push(field); rows.push(row); row = []; field = ''; }
         else { field += ch; }
@@ -158,6 +170,15 @@
          choice was never restored and silently reset to 1. */
       ST.get([KEY_QUEUE, KEY_ACTIVE, KEY_CURRENT, KEY_STARTTS, KEY_CONCURRENCY, 'ohPreferAts'], (d) => {
         queue = Array.isArray(d[KEY_QUEUE]) ? d[KEY_QUEUE] : [];
+        /* Entries an earlier import made from cells that were not links
+           (https://font-semibold/, a job title as a host name…) can never be
+           opened; they are removed once, with a note. */
+        const junk = queue.filter(j => !plausibleJobUrl(j.url));
+        if (junk.length) {
+          forget(junk);
+          queue = queue.filter(j => plausibleJobUrl(j.url));
+          _junkRemoved = junk.length;
+        }
         res(d);
       });
     });
@@ -193,9 +214,10 @@
           out.attempts = Math.max(mine.attempts || 0, theirs.attempts || 0);
           return out;
         });
-        /* Keep any job that exists in storage but not in our cache. */
+        /* Keep any job that exists in storage but not in our cache — unless
+           it was deleted here. */
         const mineIds = new Set(queue.map(j => j.id));
-        for (const j of stored) if (!mineIds.has(j.id)) merged.push(j);
+        for (const j of stored) if (!mineIds.has(j.id) && !_removedIds.has(j.id)) merged.push(j);
         queue = merged;
         ST.set({ [KEY_QUEUE]: merged }, res);
       });
@@ -209,6 +231,8 @@
       }));
     });
   }
+
+  let _junkRemoved = 0;
 
   /* ───── CRUD ───── */
   function uid() { return 'j_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 8); }
@@ -231,6 +255,40 @@
       const x = new URL(u);
       return /^https?:$/.test(x.protocol) ? x.href : '';
     } catch (_) { return ''; }
+  }
+
+  /* A link a job can actually be applied at: http(s), a real host name
+     (with a dot), and not an image or other asset. A scraped page export
+     carries logo images and CSS class names; those used to become "jobs"
+     like https://font-semibold/ that could never be opened. */
+  const ASSET_RE = /\.(png|jpe?g|gif|svg|webp|ico|bmp|css|js|woff2?|ttf|mp4|pdf)(\?|#|$)/i;
+  function plausibleJobUrl(u) {
+    try {
+      const x = new URL(String(u || '').trim());
+      if (!/^https?:$/.test(x.protocol)) return false;
+      if (!/^[a-z0-9-]+(\.[a-z0-9-]+)*\.[a-z]{2,}$/i.test(x.hostname)) return false;
+      return !ASSET_RE.test(x.pathname) && !/(^|\.)(media|cdn|static|img|images)\./i.test(x.hostname + '.');
+    } catch (_) { return false; }
+  }
+  /* The same posting with tracking noise is still the same posting. */
+  function cleanJobUrl(u) {
+    try {
+      const x = new URL(String(u).trim());
+      x.hash = '';
+      for (const k of [...x.searchParams.keys()]) {
+        if (/^(utm_[\w-]*|fbclid|gclid|msclkid|mc_cid|mc_eid|igshid|_ga|trk|trackingId|ref|source)$/i.test(k)) x.searchParams.delete(k);
+      }
+      return x.href;
+    } catch (_) { return ''; }
+  }
+  /* A job link in a cell however it was written: a bare URL, a URL inside
+     text / markdown / HTML, or a host name without a scheme. */
+  function jobUrlIn(cell) {
+    const c = String(cell == null ? '' : cell).trim();
+    if (!c) return '';
+    for (const m of c.match(/https?:\/\/[^\s,"'<>)\]]+/gi) || []) if (plausibleJobUrl(m)) return cleanJobUrl(m);
+    if (/^[a-z0-9-]+(\.[a-z0-9-]+)+\/\S*$/i.test(c) && plausibleJobUrl('https://' + c)) return cleanJobUrl('https://' + c);
+    return '';
   }
 
   function addJob(url, title, company, notes) {
@@ -266,12 +324,17 @@
     if (updates.url) j.ats = detectAts(updates.url);
     return true;
   }
-  function deleteJob(id) { queue = queue.filter(j => j.id !== id); }
-  function deleteIds(ids) { queue = queue.filter(j => !ids.has(j.id)); }
+  /* Jobs deleted on this page. saveQueue() keeps jobs another writer added
+     to storage meanwhile — which also put back every job just deleted, so
+     Delete, Clear and Clear all never removed anything. */
+  const _removedIds = new Set();
+  function forget(jobs) { for (const j of jobs) _removedIds.add(j.id); }
+  function deleteJob(id) { forget(queue.filter(j => j.id === id)); queue = queue.filter(j => j.id !== id); }
+  function deleteIds(ids) { forget(queue.filter(j => ids.has(j.id))); queue = queue.filter(j => !ids.has(j.id)); }
   function setStatusForIds(ids, status) {
     for (const j of queue) if (ids.has(j.id)) j.status = status;
   }
-  function clearByStatus(status) { queue = queue.filter(j => j.status !== status); }
+  function clearByStatus(status) { forget(queue.filter(j => j.status === status)); queue = queue.filter(j => j.status !== status); }
 
   /* ───── Render ───── */
   function visibleJobs() {
@@ -434,35 +497,57 @@
   }
 
   /* ───── CSV import ───── */
-  function importCsv(text) {
-    const rows = parseCsv(text);
+  /* Like the Jobright build's importer: any delimiter, BOM stripped, header
+     row detected, and the job link taken from the column that actually
+     holds job links (by header — url / link / href / apply — and by what is
+     in it), else from whichever cell in the row has one. Rows without a
+     usable link are counted and dropped, never turned into a fake URL. */
+  function importCsv(text, sourceName) {
+    text = String(text || '').replace(/^\uFEFF/, '');
+    const rows = parseCsv(text, sniffDelimiter(text));
     if (!rows.length) { toast('CSV is empty', 'error'); return; }
-    /* First row could be header. Detect by looking for common header words. */
-    const first = rows[0].map(c => c.trim().toLowerCase());
-    const hasHeader = first.some(c => /\b(url|link|job_url|application_url)\b/.test(c));
-    const headerMap = {};
-    if (hasHeader) {
-      first.forEach((c, i) => {
-        if (/\b(url|link|job_url|application_url)\b/.test(c)) headerMap.url = i;
-        else if (/\btitle|job_title|position\b/.test(c)) headerMap.title = i;
-        else if (/\bcompany|employer\b/.test(c)) headerMap.company = i;
-        else if (/\bnotes?|comment|note\b/.test(c)) headerMap.notes = i;
-      });
-    } else {
-      headerMap.url = 0; headerMap.title = 1; headerMap.company = 2; headerMap.notes = 3;
+    const first = rows[0].map(c => String(c).trim().toLowerCase());
+    const firstHasUrl = rows[0].some(c => jobUrlIn(c));
+    const hasHeader = !firstHasUrl && rows.length > 1;
+    const data = hasHeader ? rows.slice(1) : rows;
+    const width = Math.max(...rows.slice(0, 200).map(r => r.length));
+    const sample = data.slice(0, 200);
+    const share = (i, test) => sample.length ? sample.filter(r => test(r[i])).length / sample.length : 0;
+    const col = {};
+    /* Link column: the header's word helps, the contents decide. */
+    let bestUrl = -1, bestScore = 0;
+    for (let i = 0; i < width; i++) {
+      const h = hasHeader ? (first[i] || '') : '';
+      let score = share(i, c => !!jobUrlIn(c));
+      if (/\b(url|link|href|apply|application|posting|job.?url)\b/.test(h)) score += 0.25;
+      if (/\b(src|logo|image|img|avatar|icon)\b/.test(h)) score -= 1;
+      if (score > bestScore) { bestScore = score; bestUrl = i; }
     }
-    if (headerMap.url == null) headerMap.url = 0;
+    if (bestUrl >= 0 && bestScore >= 0.3) col.url = bestUrl;
+    if (hasHeader) {
+      first.forEach((h, i) => {
+        if (i === col.url) return;
+        if (col.title == null && /\b(title|position|role|job.?title|job.?name|vacancy|opening)\b/.test(h)) col.title = i;
+        else if (col.company == null && /\b(company|employer|organi[sz]ation|business|hiring)\b/.test(h)) col.company = i;
+        else if (col.notes == null && /\b(notes?|comments?)\b/.test(h)) col.notes = i;
+      });
+    }
+    /* No title column named: the first column of plain text (a scraped
+       listing puts the job title first). */
+    if (col.title == null) {
+      for (let i = 0; i < width; i++) {
+        if (i === col.url || i === col.company) continue;
+        if (share(i, c => { const v = String(c || '').trim(); return v.length >= 3 && v.length <= 150 && !/https?:\/\//i.test(v); }) >= 0.6) { col.title = i; break; }
+      }
+    }
     let added = 0, dupes = 0, invalid = 0;
-    const dataRows = hasHeader ? rows.slice(1) : rows;
-    for (const r of dataRows) {
-      const url = (r[headerMap.url] || '').trim();
+    for (const r of data) {
+      const url = (col.url != null && jobUrlIn(r[col.url])) || r.map(jobUrlIn).find(Boolean) || '';
       if (!url) { invalid++; continue; }
-      const result = addJob(
-        url,
-        headerMap.title   != null ? r[headerMap.title]   : '',
-        headerMap.company != null ? r[headerMap.company] : '',
-        headerMap.notes   != null ? r[headerMap.notes]   : '',
-      );
+      const result = addJob(url,
+        col.title != null ? r[col.title] : '',
+        col.company != null ? r[col.company] : '',
+        col.notes != null ? r[col.notes] : '');
       if (result === 'duplicate') dupes++;
       else if (result) added++;
       else invalid++;
@@ -472,8 +557,12 @@
       const parts = [];
       if (added) parts.push(`${added} added`);
       if (dupes) parts.push(`${dupes} duplicates skipped`);
-      if (invalid) parts.push(`${invalid} invalid`);
-      toast('Import: ' + (parts.join(', ') || 'no changes'), added ? 'success' : 'info');
+      if (invalid) parts.push(`${invalid} without a job link`);
+      const msg = (sourceName ? sourceName + ': ' : 'Import: ') + (parts.join(', ') || 'no changes');
+      if (!added && invalid && invalid === data.length) {
+        toast(`${msg} — this file has no application links (only titles / companies), so nothing can be applied to`, 'error');
+      } else toast(msg, added ? 'success' : 'info');
+      dbg('CSV import', { source: sourceName || '', rows: data.length, header: hasHeader, columns: col, added, dupes, invalid });
     });
   }
   function exportCsv() {
@@ -948,9 +1037,21 @@
       const f = e.target.files[0];
       if (!f) return;
       const r = new FileReader();
-      r.onload = () => importCsv(r.result);
+      r.onload = () => importCsv(r.result, f.name);
       r.readAsText(f);
       e.target.value = ''; // allow re-import same file
+    });
+    /* Drop a CSV file — or text with links — anywhere on the page. */
+    document.addEventListener('dragover', (e) => { e.preventDefault(); });
+    document.addEventListener('drop', (e) => {
+      e.preventDefault();
+      const files = [...((e.dataTransfer && e.dataTransfer.files) || [])];
+      if (files.length) {
+        for (const f of files) { const r = new FileReader(); r.onload = () => importCsv(r.result, f.name); r.readAsText(f); }
+        return;
+      }
+      const t = e.dataTransfer && e.dataTransfer.getData('text/plain');
+      if (t) importCsv(t, 'Dropped text');
     });
     on('btnStart', 'click', startQueue);
     on('btnStop',  'click', stopQueue);
@@ -976,6 +1077,8 @@
     on('btnClearAll', 'click', async () => {
       if (!queue.length) return;
       if (!confirm(`Delete ALL ${queue.length} jobs? This cannot be undone.`)) return;
+      const stored = await new Promise(r => ST.get([KEY_QUEUE], d => r(Array.isArray(d[KEY_QUEUE]) ? d[KEY_QUEUE] : [])));
+      forget(stored); forget(queue);
       queue = []; selectedIds.clear();
       await saveQueue(); render();
       toast('Queue cleared', 'info');
@@ -1118,6 +1221,10 @@
       setRunnerIndicator(!!d[KEY_ACTIVE]);
       init();
       render();
+      if (_junkRemoved) {
+        saveQueue().then(render);
+        toast(`Removed ${_junkRemoved} entries that were not job links (left by an earlier CSV import)`, 'info');
+      }
       /* If a run was active when this manager page (re)loaded, we lost
          our in-memory tab map. Re-queue any 'running' jobs and refill
          slots so the run continues cleanly. */
