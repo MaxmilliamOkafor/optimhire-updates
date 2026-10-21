@@ -3344,7 +3344,60 @@
    * ────────────────────────────────────────────────────────────────── */
   const RESUME_INPUT_RE = /resume|r[ée]sum[ée]|cv\b|curriculum|upload.*resume|attach.*resume/i;
   /* Upload boxes that must never receive the CV. */
-  const NOT_RESUME_RE = /cover\s*letter|motivation|portfolio|transcript|certificat|photo|headshot|writing\s*sample|other\s*(documents?|attachments?)|additional\s*(documents?|files?)/i;
+  const NOT_RESUME_RE = /cover[\s_-]*letter|motivation|portfolio|transcript|certificat|photo|headshot|writing[\s_-]*sample|other[\s_-]*(documents?|attachments?)|additional[\s_-]*(documents?|files?)/i;
+
+  /* ── No CV in a cover-letter box ─────────────────────────────────────
+   * OptimHire's own filler collects upload boxes as questions; its answer
+   * service hands back the CV link for "Cover Letter", and the CV went
+   * into both boxes (Greenhouse showed Maxmilliam_Okafor.pdf twice). Every
+   * filler in this world attaches files by assigning input.files, so the
+   * guard sits there: a file that isn't a cover letter is not attached to
+   * a cover-letter box. A REQUIRED cover-letter box still gets it rather
+   * than blocking the application. */
+  (function guardCoverLetterBoxes() {
+    const COVER_BOX_RE = /cover[\s_-]*letter|motivation(al)?[\s_-]*letter|lettre[\s_-]*de[\s_-]*motivation|anschreiben|carta[\s_-]*de[\s_-]*presentaci/i;
+    const COVER_FILE_RE = /cover|letter|motivation|anschreiben/i;
+    const desc = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'files');
+    if (!desc || !desc.set) return;
+    /* The box's own heading: the nearest ancestor (a few levels up) that
+       holds a label-like element, or the group naming it. */
+    function head(inp) {
+      for (let n = inp.parentElement, i = 0; n && i < 5; n = n.parentElement, i++) {
+        const by = n.getAttribute && n.getAttribute('aria-labelledby');
+        const named = by && document.getElementById(by.split(/\s+/)[0]);
+        if (named) return named.textContent || '';
+        const h = n.querySelector('label, legend, .label, [class*="label" i], h3, h4');
+        if (h && !h.contains(inp)) return h.textContent || '';
+      }
+      return '';
+    }
+    function boxText(inp) {
+      const ids = (inp.getAttribute('aria-labelledby') || '').split(/\s+/).filter(Boolean)
+        .map(id => { const n = document.getElementById(id); return n ? n.textContent : ''; });
+      const lab = inp.id && document.querySelector(`label[for="${CSS.escape(inp.id)}"]`);
+      return [inp.id, inp.name, inp.getAttribute('aria-label'), inp.getAttribute('aria-describedby'), ...ids,
+              lab && lab.textContent, head(inp)].filter(Boolean).join(' ').slice(0, 400);
+    }
+    function required(inp) {
+      if (inp.required || inp.getAttribute('aria-required') === 'true') return true;
+      return /\*/.test(head(inp));
+    }
+    Object.defineProperty(HTMLInputElement.prototype, 'files', {
+      configurable: true,
+      enumerable: desc.enumerable,
+      get() { return desc.get.call(this); },
+      set(list) {
+        try {
+          if (this.type === 'file' && list && list.length && COVER_BOX_RE.test(boxText(this)) &&
+              !Array.prototype.some.call(list, f => COVER_FILE_RE.test(f.name || '')) && !required(this)) {
+            LOG(`Cover letter box: not attaching "${list[0].name}" — that's the CV, not a cover letter`);
+            return;
+          }
+        } catch (_) {}
+        desc.set.call(this, list);
+      },
+    });
+  })();
 
   async function fetchResumeFile(url, filename = 'resume.pdf') {
     if (!url) return null;
