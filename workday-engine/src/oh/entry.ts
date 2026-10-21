@@ -15,11 +15,18 @@
  * "Autofill this page" on a Workday page runs the engine too, stopping on
  * Review for you to submit (or submitting, with "+ submit").
  *
+ * Assist (SpeedyApply-style), while you browse Workday outside a run with
+ * "Auto-fill on supported ATS pages" on: each step is filled the moment it
+ * appears — My Information, My Experience, questions, disclosures — and
+ * nothing is pressed for you. Each step is filled once: going Back to one
+ * never refills it over your edits. You check, edit and press Save and
+ * Continue; the next step fills itself.
+ *
  * The engine's own messages (wd:cred:*, wd:progress …) are answered here, in
  * the page, from chrome.storage.local — the service worker never sees them.
  */
 import { autoResume, isActive, startRun, stopRun } from "../workday/engine.js";
-import { detectPage, hasWorkdayApp, isWorkdayHost, tenantHost } from "../workday/detect.js";
+import { activeStepName, detectPage, hasWorkdayApp, isWorkdayHost, tenantHost } from "../workday/detect.js";
 import { similarity } from "../workday/dom.js";
 import { normalizeLabel, normalizeProfile } from "../workday/store.js";
 import { setHooks, type OpenQuestion, type Outcome } from "../workday/ohHooks.js";
@@ -41,6 +48,7 @@ const SEEKER_KEY = "ohWdSeeker";          // your details from the last OptimHir
 interface Mode {
   auto: boolean;        // an OptimHire run: report the result to OptimHire
   submit: boolean;      // press Submit on Review
+  assist?: boolean;     // fill the step on screen only; you press Next
   startedAt: number;
   jobId: string;
 }
@@ -62,9 +70,25 @@ function clearMode() {
   try { sessionStorage.removeItem(MODE_KEY); } catch { /* storage blocked */ }
 }
 
-/* optimhire-patch.js stands down on a page the engine is working on. */
+/* Assist is on unless auto-fill, the engine or automation is switched off —
+   and never while a run (OptimHire's or the CSV queue) is going. */
+const ASSIST_KEYS = ["ohAutoTrigger", "ohWdEngineOff", "ohAutomationDisabled", "isAutoProcessStartJob", "isManuallyStartJob", "ohJobQueueActive"];
+let assistOn = false;
+function readAssist() {
+  ST.get(ASSIST_KEYS).then((d) => {
+    const running = !!(d.isAutoProcessStartJob || d.isManuallyStartJob || d.ohJobQueueActive);
+    assistOn = d.ohAutoTrigger !== false && d.ohWdEngineOff !== true && d.ohAutomationDisabled !== true && !running;
+  }, () => {});
+}
+readAssist();
+chrome.storage.onChanged.addListener((c, area) => {
+  if (area === "local" && ASSIST_KEYS.some((k) => k in c)) readAssist();
+});
+
+/* optimhire-patch.js stands down on a page the engine is working on — and,
+   with assist on, on Workday altogether (the engine fills it). */
 (window as Any).__ohWdEngine = {
-  owns: () => TOP && (!!readMode() || isActive()),
+  owns: () => TOP && (!!readMode() || isActive() || (assistOn && hasWorkdayApp())),
   takesManual: () => TOP && hasWorkdayApp(),
 };
 
@@ -343,6 +367,9 @@ async function buildProfile(ad?: Any): Promise<Profile> {
   return p;
 }
 
+/* Assist: as fast as Workday takes it. */
+const ASSIST_SETTINGS = (): WorkdaySettings => ({ ...SETTINGS, fieldDelayMs: 10 });
+
 const SETTINGS: WorkdaySettings = {
   ...DEFAULT_WD_SETTINGS,
   consentCreateAccountTerms: true,  // nobody at the PC to tick them
@@ -357,6 +384,16 @@ const SETTINGS: WorkdaySettings = {
 };
 
 /* ---------------- CV ---------------- */
+
+/** The CV marked primary among those on your OptimHire profile. */
+async function primaryCvUrl(): Promise<string> {
+  const { candidateDetails } = await ST.get("candidateDetails");
+  const list = parse(candidateDetails).developer_resume_object;
+  const all: Any[] = Array.isArray(list) ? list : typeof list === "string" ? (parse(list) as Any[]) : [];
+  if (!Array.isArray(all) || !all.length) return "";
+  const main = all.find((r) => String(r.is_primary) === "1") || all[0];
+  return String(main?.resume_url || "");
+}
 
 function toBase64(buf: ArrayBuffer): string {
   const bytes = new Uint8Array(buf);
@@ -471,15 +508,16 @@ async function installHooks(mode: Mode): Promise<void> {
   const profile = await buildProfile(ad);
   const src = await profileSources(ad);
   // OptimHire's tailored CV for this job, else the CV on your OptimHire profile.
-  const own = pick(ad?.seeker || {}, "resume") || pick(src, "resume", "resume_url", "resumeUrl", "cv_url", "cv");
+  const own = pick(ad?.seeker || {}, "resume") || pick(src, "resume", "resume_url", "resumeUrl", "cv_url", "cv") || (await primaryCvUrl());
   const cvUrl = mode.auto ? updatedResume || own : own || updatedResume;
   let cv: Promise<StoredDoc | undefined> | null = null;
   accountNoted = false;
   setHooks({
     profile: async () => profile,
-    settings: async () => SETTINGS,
+    settings: async () => (mode.assist ? ASSIST_SETTINGS() : SETTINGS),
     masterCv: () => (cv ??= fetchCv(cvUrl, profile).catch(() => undefined)),
     autoSubmit: () => mode.submit,
+    ...(mode.assist ? { advance: () => false } : {}),
     prefetch: (qs) => askOptimHire(qs),
     answer: hostAnswer,
     onPage: (run) => onPage(mode, run),
@@ -513,6 +551,7 @@ async function remember(run: RunState, outcome: Outcome, mode: Mode) {
 }
 
 async function finish(mode: Mode, run: RunState, outcome: Outcome) {
+  if (mode.assist) return;                 // the overlay says what it needs; nothing to report
   clearMode();
   say(`${outcome}${run.pauseReason ? ": " + run.pauseReason : ""}`);
   await remember(run, outcome, mode);
@@ -605,6 +644,20 @@ if (TOP && isWorkdayHost()) {
     }
     return false;
   });
+
+  /* Assist: a new step on screen (not in a run, nothing running) is filled once. */
+  const ASSIST_PAGES: PageKind[] = ["resumeUpload", "myInformation", "myExperience", "questions", "voluntaryDisclosures", "selfIdentify"];
+  const assisted = new Set<string>();
+  setInterval(() => {
+    if (!assistOn || readMode() || isActive() || !hasWorkdayApp()) return;
+    const page = detectPage();
+    if (!ASSIST_PAGES.includes(page)) return;
+    const key = `${page}|${activeStepName()}|${location.pathname}`;
+    if (assisted.has(key)) return;
+    assisted.add(key);
+    const mode: Mode = { auto: false, submit: false, assist: true, startedAt: Date.now(), jobId: "" };
+    void installHooks(mode).then(() => startRun(null));
+  }, 900);
 
   // A run interrupted by a reload (sign-in, session refresh) carries on; nothing else starts by itself.
   const boot = (tries = 0) => {

@@ -82,6 +82,7 @@ async function fill(ctx: Ctx, key: AidKey, value: string | undefined, root: Pare
   const c = containerOf(el);
   handled.add(c);
   if (!value) return false;
+  if (hooks.keepExisting?.() && readValue(kindOf(c) === "none" ? el : c)) return true; // [oh] yours stays
   await pace(ctx);
   let ok = await writeValue(kindOf(c) === "none" ? el : c, value).catch((e) => {
     if (e instanceof NeedsHuman) return false;
@@ -317,7 +318,9 @@ async function uploadDocuments(ctx: Ctx) {
   if (cv && cvInput) {
     const root = cvInput.closest("section, fieldset, [data-automation-id^='formField-']") ?? document;
     const names = uploadedFileNames(root);
-    if (!names.some((n) => n.includes(cv.name.slice(0, 12)))) {
+    if ((hooks.keepExisting?.() || (hooks.advance && !hooks.advance())) && names.length) {
+      handled.add(containerOf(cvInput)); // [oh] assist: a CV already attached (yours) is left as it is
+    } else if (!names.some((n) => n.includes(cv.name.slice(0, 12)))) {
       // Remove whatever the resume step / last application left behind.
       for (const del of qa(sel("fileDelete"), root).filter(isVisible)) {
         await humanClick(del);

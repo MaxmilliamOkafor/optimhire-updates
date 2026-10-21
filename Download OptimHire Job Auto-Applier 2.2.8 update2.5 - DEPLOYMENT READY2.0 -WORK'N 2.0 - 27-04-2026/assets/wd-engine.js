@@ -1731,6 +1731,7 @@ OPTIONS: ${JSON.stringify(options.slice(0, 150))}`
     const c = containerOf(el);
     handled.add(c);
     if (!value) return false;
+    if (hooks.keepExisting?.() && readValue(kindOf(c) === "none" ? el : c)) return true;
     await pace(ctx);
     let ok = await writeValue(kindOf(c) === "none" ? el : c, value).catch((e) => {
       if (e instanceof NeedsHuman) return false;
@@ -1930,7 +1931,9 @@ OPTIONS: ${JSON.stringify(options.slice(0, 150))}`
     if (cv && cvInput) {
       const root2 = cvInput.closest("section, fieldset, [data-automation-id^='formField-']") ?? document;
       const names = uploadedFileNames(root2);
-      if (!names.some((n) => n.includes(cv.name.slice(0, 12)))) {
+      if ((hooks.keepExisting?.() || hooks.advance && !hooks.advance()) && names.length) {
+        handled.add(containerOf(cvInput));
+      } else if (!names.some((n) => n.includes(cv.name.slice(0, 12)))) {
         for (const del of qa(sel("fileDelete"), root2).filter(isVisible)) {
           await humanClick(del);
           await sleep(300);
@@ -2170,6 +2173,7 @@ OPTIONS: ${JSON.stringify(options.slice(0, 150))}`
   var handlers = { resume: () => {
   }, stop: () => {
   } };
+  var hideTimer;
   function setOverlayHandlers(h) {
     handlers = h;
   }
@@ -2184,10 +2188,16 @@ OPTIONS: ${JSON.stringify(options.slice(0, 150))}`
     review: "Ready to submit",
     done: "Submitted",
     error: "Error",
-    idle: "Stopped"
+    idle: "Stopped",
+    filled: "Page filled — check it, then continue"
+    // [oh]
   };
   function renderOverlay(run) {
     if (!document.body) return;
+    if (hideTimer) {
+      clearTimeout(hideTimer);
+      hideTimer = void 0;
+    }
     if (!host) {
       host = document.createElement("div");
       host.id = "wd-autopilot-overlay";
@@ -2196,7 +2206,7 @@ OPTIONS: ${JSON.stringify(options.slice(0, 150))}`
       document.body.appendChild(host);
     }
     if (!root) return;
-    const color = { running: "#5bc08b", paused: "#e0a86a", review: "#c79a6a", done: "#5bc08b", error: "#e06a6a", idle: "#8892a8" }[run.status];
+    const color = { running: "#5bc08b", paused: "#e0a86a", review: "#c79a6a", done: "#5bc08b", error: "#e06a6a", idle: "#8892a8", filled: "#5bc08b" }[run.status];
     const last = run.log[run.log.length - 1]?.msg ?? "";
     root.innerHTML = `
     <style>
@@ -2227,7 +2237,7 @@ OPTIONS: ${JSON.stringify(options.slice(0, 150))}`
         if (a === "stop") handlers.stop();
       })
     );
-    if (run.status === "idle") setTimeout(removeOverlay, 4e3);
+    if (run.status === "idle" || run.status === "filled") hideTimer = window.setTimeout(removeOverlay, 4e3);
   }
 
   // src/workday/engine.ts
@@ -2349,11 +2359,19 @@ OPTIONS: ${JSON.stringify(options.slice(0, 150))}`
   function requiredFlagsHere(ctx) {
     return ctx.run.flags.filter((f) => f.page === ctx.page);
   }
+  function pageFilled(ctx) {
+    ctx.run.status = "filled";
+    ctx.run.pauseReason = void 0;
+    ctx.log("Page filled — check it, then continue");
+    void ctx.save();
+    return "stop";
+  }
   async function fillAndNext(ctx, handler) {
     if (handler) await handler(ctx);
     await genericFill(ctx);
     await ctx.save();
     const flags = requiredFlagsHere(ctx);
+    if (hooks.advance && !hooks.advance() && !flags.length) return pageFilled(ctx);
     if (flags.length) {
       throw new NeedsHuman(`Answer ${flags.length} field(s) on this page, then click Resume: ${flags.map((f) => f.label).join(", ").slice(0, 300)}`);
     }
@@ -2374,7 +2392,9 @@ OPTIONS: ${JSON.stringify(options.slice(0, 150))}`
     }
     ctx.log("Tailoring tool didn't respond in 90 s — continuing with the fallback CV", "warn");
   }
+  var ASSIST_PAGES = ["resumeUpload", "myInformation", "myExperience", "questions", "voluntaryDisclosures", "selfIdentify"];
   async function handlePage(ctx, page) {
+    if (hooks.advance && !hooks.advance() && !ASSIST_PAGES.includes(page)) return "stop";
     switch (page) {
       case "jobPosting": {
         if (ctx.job) chrome.runtime.sendMessage({ type: "wd:jobCaptured", job: ctx.job }).catch(() => {
@@ -2407,6 +2427,7 @@ OPTIONS: ${JSON.stringify(options.slice(0, 150))}`
         throw new NeedsHuman("Verify your email using the link Workday sent, sign in if asked, then click Resume.");
       case "resumeUpload":
         await resumeUpload(ctx);
+        if (hooks.advance && !hooks.advance()) return pageFilled(ctx);
         return clickNext(ctx);
       case "myInformation":
         return fillAndNext(ctx, myInformation);
@@ -2624,8 +2645,21 @@ OPTIONS: ${JSON.stringify(options.slice(0, 150))}`
     } catch {
     }
   }
+  var ASSIST_KEYS = ["ohAutoTrigger", "ohWdEngineOff", "ohAutomationDisabled", "isAutoProcessStartJob", "isManuallyStartJob", "ohJobQueueActive"];
+  var assistOn = false;
+  function readAssist() {
+    ST.get(ASSIST_KEYS).then((d) => {
+      const running = !!(d.isAutoProcessStartJob || d.isManuallyStartJob || d.ohJobQueueActive);
+      assistOn = d.ohAutoTrigger !== false && d.ohWdEngineOff !== true && d.ohAutomationDisabled !== true && !running;
+    }, () => {
+    });
+  }
+  readAssist();
+  chrome.storage.onChanged.addListener((c, area) => {
+    if (area === "local" && ASSIST_KEYS.some((k) => k in c)) readAssist();
+  });
   window.__ohWdEngine = {
-    owns: () => TOP && (!!readMode() || isActive()),
+    owns: () => TOP && (!!readMode() || isActive() || assistOn && hasWorkdayApp()),
     takesManual: () => TOP && hasWorkdayApp()
   };
   var say = (msg) => console.info(`[WD-Engine] ${msg}`);
@@ -2940,6 +2974,7 @@ OPTIONS: ${JSON.stringify(options.slice(0, 150))}`
     fillIn(p, base);
     return p;
   }
+  var ASSIST_SETTINGS = () => ({ ...SETTINGS, fieldDelayMs: 10 });
   var SETTINGS = {
     ...DEFAULT_WD_SETTINGS,
     consentCreateAccountTerms: true,
@@ -2955,6 +2990,14 @@ OPTIONS: ${JSON.stringify(options.slice(0, 150))}`
     fallbackToMasterCv: true,
     externalAutoRequest: false
   };
+  async function primaryCvUrl() {
+    const { candidateDetails } = await ST.get("candidateDetails");
+    const list = parse(candidateDetails).developer_resume_object;
+    const all = Array.isArray(list) ? list : typeof list === "string" ? parse(list) : [];
+    if (!Array.isArray(all) || !all.length) return "";
+    const main = all.find((r) => String(r.is_primary) === "1") || all[0];
+    return String(main?.resume_url || "");
+  }
   function toBase64(buf) {
     const bytes = new Uint8Array(buf);
     let bin = "";
@@ -3052,15 +3095,16 @@ OPTIONS: ${JSON.stringify(options.slice(0, 150))}`
     const ad = mode.auto ? parse(complexFormData).applicationDetails : void 0;
     const profile = await buildProfile(ad);
     const src = await profileSources(ad);
-    const own = pick(ad?.seeker || {}, "resume") || pick(src, "resume", "resume_url", "resumeUrl", "cv_url", "cv");
+    const own = pick(ad?.seeker || {}, "resume") || pick(src, "resume", "resume_url", "resumeUrl", "cv_url", "cv") || await primaryCvUrl();
     const cvUrl = mode.auto ? updatedResume || own : own || updatedResume;
     let cv = null;
     accountNoted = false;
     setHooks({
       profile: async () => profile,
-      settings: async () => SETTINGS,
+      settings: async () => mode.assist ? ASSIST_SETTINGS() : SETTINGS,
       masterCv: () => cv ??= fetchCv(cvUrl, profile).catch(() => void 0),
       autoSubmit: () => mode.submit,
+      ...mode.assist ? { advance: () => false } : {},
       prefetch: (qs) => askOptimHire(qs),
       answer: hostAnswer,
       onPage: (run) => onPage(mode, run),
@@ -3096,6 +3140,7 @@ OPTIONS: ${JSON.stringify(options.slice(0, 150))}`
     }
   }
   async function finish(mode, run, outcome) {
+    if (mode.assist) return;
     clearMode();
     say(`${outcome}${run.pauseReason ? ": " + run.pauseReason : ""}`);
     await remember(run, outcome, mode);
@@ -3191,6 +3236,18 @@ OPTIONS: ${JSON.stringify(options.slice(0, 150))}`
       }
       return false;
     });
+    const ASSIST_PAGES2 = ["resumeUpload", "myInformation", "myExperience", "questions", "voluntaryDisclosures", "selfIdentify"];
+    const assisted = /* @__PURE__ */ new Set();
+    setInterval(() => {
+      if (!assistOn || readMode() || isActive() || !hasWorkdayApp()) return;
+      const page = detectPage();
+      if (!ASSIST_PAGES2.includes(page)) return;
+      const key = `${page}|${activeStepName()}|${location.pathname}`;
+      if (assisted.has(key)) return;
+      assisted.add(key);
+      const mode = { auto: false, submit: false, assist: true, startedAt: Date.now(), jobId: "" };
+      void installHooks(mode).then(() => startRun(null));
+    }, 900);
     const boot = (tries = 0) => {
       const mode = readMode();
       if (!mode) return;

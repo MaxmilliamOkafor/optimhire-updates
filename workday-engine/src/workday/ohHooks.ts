@@ -23,6 +23,10 @@ export interface EngineHooks {
   masterCv?: () => Promise<StoredDoc | undefined>;
   /** Click Submit on Review instead of stopping there. */
   autoSubmit?: () => boolean;
+  /** false = fill the page on screen and stop: never press Next, Apply or sign in (you drive). */
+  advance?: () => boolean;
+  /** true = leave fields that already hold a value (what you typed, or Workday read from the CV). */
+  keepExisting?: () => boolean;
   /** Fetch answers for a page's open questions in one request, before they are resolved one by one. */
   prefetch?: (questions: OpenQuestion[]) => Promise<void>;
   /** The host's answer to one question (the user's own saved answers / answer service), or null. */

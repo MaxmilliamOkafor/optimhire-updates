@@ -203,7 +203,7 @@ export type PageKind =
   | "candidateHome"
   | "unknown";
 
-export type RunStatus = "idle" | "running" | "paused" | "review" | "done" | "error";
+export type RunStatus = "idle" | "running" | "paused" | "review" | "done" | "error" | "filled"; // [oh] filled: assist mode
 
 export interface Flag {
   label: string;
