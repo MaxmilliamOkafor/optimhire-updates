@@ -3759,7 +3759,9 @@
     if (/first.?name/.test(l))                            return p.first_name    || '';
     if (/last.?name/.test(l))                             return p.last_name     || '';
     if (/full.?name|your.?name/.test(l))                  return fullName;
-    if (/preferred.?name|display.?name|nickname/.test(l)) return fullName;
+    /* "Preferred Name" is what you are called — your first name, not both. */
+    if (/preferred.?name|nickname/.test(l))               return p.first_name || fullName;
+    if (/display.?name/.test(l))                          return fullName;
     /* Email: handle "Email", "Email Address", "E-mail", "E mail", "EMail".
        Note: label is pre-processed so non-alphanumerics become spaces, so
        "E-mail" becomes "e mail" — \se?mail covers both forms. */
@@ -7211,6 +7213,99 @@
     }
     await tryResumeUpload(p);
     await autoFillPage();
+    await successFactorsSelects(p);
+    await successFactorsResume(p);
+    await successFactorsTerms();
+  }
+
+  /* SuccessFactors' career site labels its boxes "City:*", "Citizenship 1:*"
+     and asks in plain <select>s starting at "No Selection" — which the
+     id-based map above and the generic pass mostly missed (an Ericsson form
+     came back with Citizenship 1, "How did you hear", Gender and the Terms
+     of Use all undone, while the optional Citizenship 2 got filled). Each
+     select is answered by what its label asks. */
+  const SF_EMPTY_RE = /^(no selection|select( one)?|please select|choose|--+|\s*)$/i;
+  function sfLabel(el) { return String(getLabel(el) || '').replace(/[*:]/g, ' ').replace(/\s+/g, ' ').trim(); }
+  function sfSelectEmpty(sel) {
+    const o = sel.options[sel.selectedIndex];
+    return !o || !o.value || SF_EMPTY_RE.test((o.text || '').trim());
+  }
+  function sfSet(sel, opt) {
+    sel.value = opt.value;
+    sel.dispatchEvent(new Event('input', { bubbles: true }));
+    sel.dispatchEvent(new Event('change', { bubbles: true }));
+  }
+  function sfAnswer(label, p, sel) {
+    const l = label.toLowerCase();
+    const opts = $$('option', sel).filter(o => o.value);
+    const find = re => opts.find(o => re.test(o.text));
+    if (/citizenship\s*2|second citizenship|additional (citizenship|nationality)|other nationality/.test(l)) return null;
+    if (/citizenship|nationality/.test(l)) return bestSelectOption(sel, p.citizenship || p.nationality || p.country, label);
+    if (/gender|\bsex\b|ethnic|race|disabilit|veteran|sexual orientation/.test(l)) return find(/prefer not|decline|not to (say|disclose|answer)|do not wish|don[’']?t wish|rather not/i) || null;
+    if (/conflict of interest|related to (an )?employee|relative|family member/.test(l)) return find(/^no\b/i) || null;
+    if (/how did you (hear|find|learn)|where did you (hear|see|find)|\bsource\b|referral source/.test(l)) {
+      return find(/linkedin/i) || find(/job ?board|internet|online|website|career(s)? site/i) || find(/^other/i) || null;
+    }
+    if (/state|province|county|region/.test(l) && !/country/.test(l)) return p.state ? bestSelectOption(sel, p.state, label) : null;
+    if (/country/.test(l)) return p.country ? bestSelectOption(sel, p.country, label) : null;
+    const g = guessValue(label, p, 'select');
+    return g ? bestSelectOption(sel, g, label) : null;
+  }
+  async function successFactorsSelects(p) {
+    const sels = $$('select').filter(isVisible);
+    let cit1 = '';
+    for (const sel of sels) {
+      const label = sfLabel(sel);
+      if (!label) continue;
+      if (/citizenship\s*1|^citizenship$|^nationality$/i.test(label) && !sfSelectEmpty(sel)) cit1 = sel.value;
+      if (!sfSelectEmpty(sel)) continue;
+      const opt = sfAnswer(label, p, sel);
+      if (!opt) continue;
+      sfSet(sel, opt);
+      if (/citizenship\s*1|^citizenship$|^nationality$/i.test(label)) cit1 = opt.value;
+      LOG(`SuccessFactors: "${label.slice(0, 60)}" → ${opt.text}`);
+      await sleep(120);
+    }
+    /* The optional second citizenship repeating the first: cleared. */
+    for (const sel of sels) {
+      if (!/citizenship\s*2|second citizenship/i.test(sfLabel(sel)) || !cit1 || sel.value !== cit1) continue;
+      const none = $$('option', sel).find(o => !o.value);
+      if (none) { sfSet(sel, none); LOG('SuccessFactors: Citizenship 2 only repeated Citizenship 1 — cleared'); }
+    }
+  }
+  /* "Upload a Resume" is a tile that opens an attach dialog; the file box
+     only exists once it is open. */
+  async function successFactorsResume(p) {
+    const done = $$('[id*="resume" i],[class*="attachment" i]').some(e => /\.(pdf|docx?|rtf|txt)\b/i.test(e.textContent || ''));
+    if (done) return;
+    const tile = $$('a,button,[role="button"],div,span').find(e => isVisible(e) && e.children.length <= 2 &&
+      /^upload (a |your )?(resume|cv)$/i.test((e.textContent || '').trim()));
+    if (!tile) return;
+    realClick(tile);
+    await sleep(700);
+    if (await tryResumeUpload(p)) LOG('SuccessFactors: CV attached through "Upload a Resume"');
+  }
+  /* "Terms of Use: Read the data privacy statement." — the statement opens in
+     a dialog whose Accept is the consent. Accepted once per page. */
+  let _sfTermsDone = '';
+  async function successFactorsTerms() {
+    if (_sfTermsDone === location.href) return;
+    const link = $$('a,button,[role="button"]').find(e => isVisible(e) &&
+      /data privacy statement|privacy (statement|policy|notice)|terms of use/i.test((e.textContent || '').trim()) &&
+      /terms of use|privacy|consent/i.test(((e.closest('div,tr,p,li') || e).textContent || '')));
+    if (!link) return;
+    realClick(link);
+    for (let i = 0; i < 15; i++) {
+      await sleep(200);
+      const accept = $$('button,[role="button"],input[type="button"],input[type="submit"],a').find(b => isVisible(b) &&
+        /^(i\s+)?(accept|agree)(\s+(and|&)\s+continue)?$/i.test((b.textContent || b.value || '').trim()));
+      if (accept) {
+        realClick(accept);
+        _sfTermsDone = location.href;
+        LOG('SuccessFactors: data privacy statement accepted');
+        return;
+      }
+    }
   }
 
   /* ── T30d: UKG / UltiPro autofill ───────────────────────── */
