@@ -8608,6 +8608,7 @@
   (function installQueueRunner() {
     const POLL_MS         = 2_000;
     const JOB_TIMEOUT_MS  = 180_000;  // 3 min hard cap per job
+    const WD_JOB_TIMEOUT_MS = 480_000; // Workday: many steps plus the account
     const NO_FORM_GRACE_MS = 18_000;  // if no fillable form by now → unsupported, skip
     const SUBMIT_GRACE_MS = 8_000;    // wait this long after submit before declaring success
     const CONFIRM_WAIT_MS = 30_000;   // keep looking for a REAL confirmation this long after submit
@@ -8852,6 +8853,25 @@
           _submitSeenAt = 0;
           _validErrSince = 0;
           LOG(`[Queue Runner] on job: ${job.title || job.url}`);
+        }
+
+        /* Workday: the Workday engine applies (sign-in, CV, every step,
+           Submit) and says how it went; this only reads its result. */
+        const wde = window.__ohWdEngine;
+        if (wde && wde.isWorkday && wde.isWorkday()) {
+          const r = wde.queueResult(job.id);
+          if (r) {
+            if (r.outcome === 'submitted') {
+              await qaCommit('queue job confirmed');
+              return advance(job, 'applied', '', { confirmed: true, confirmedBy: 'Workday confirmation' });
+            }
+            return advance(job, 'failed', `Workday: ${r.reason || r.outcome || 'could not finish'}`.slice(0, 200));
+          }
+          wde.startQueueJob(job);
+          if (job.lastActionTs && Date.now() - job.lastActionTs > WD_JOB_TIMEOUT_MS) {
+            return advance(job, 'failed', 'Workday: timed out');
+          }
+          return;
         }
 
         /* Proactively drive the autofill on this queue tab. The normal

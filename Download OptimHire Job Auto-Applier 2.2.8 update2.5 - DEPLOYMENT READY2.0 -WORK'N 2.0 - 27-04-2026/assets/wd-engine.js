@@ -2658,9 +2658,21 @@ OPTIONS: ${JSON.stringify(options.slice(0, 150))}`
   chrome.storage.onChanged.addListener((c, area) => {
     if (area === "local" && ASSIST_KEYS.some((k) => k in c)) readAssist();
   });
+  var QUEUE_RESULT_KEY = "ohWdQueueResult";
+  function queueResult(jobId) {
+    try {
+      const r = JSON.parse(sessionStorage.getItem(QUEUE_RESULT_KEY) || "null");
+      return r && r.jobId === jobId ? r : null;
+    } catch {
+      return null;
+    }
+  }
   window.__ohWdEngine = {
     owns: () => TOP && (!!readMode() || isActive() || assistOn && hasWorkdayApp()),
-    takesManual: () => TOP && hasWorkdayApp()
+    takesManual: () => TOP && hasWorkdayApp(),
+    isWorkday: () => TOP && isWorkdayHost(),
+    startQueueJob: (job) => void startQueueJob(job),
+    queueResult
   };
   var say = (msg) => console.info(`[WD-Engine] ${msg}`);
   var send = (msg) => chrome.runtime.sendMessage(msg).catch(() => void 0);
@@ -3139,14 +3151,29 @@ OPTIONS: ${JSON.stringify(options.slice(0, 150))}`
     } catch {
     }
   }
+  function plainReason(run, outcome) {
+    if (run.flags.length) {
+      const labels = run.flags.map((f) => f.label).join("; ");
+      return `${run.flags.length} question${run.flags.length === 1 ? "" : "s"} only you can answer: ${labels}`.slice(0, 240);
+    }
+    if (outcome === "review") return "filled, but no Submit button on Review";
+    return (run.pauseReason || "").replace(/,?\s*then click Resume\.?/gi, "").replace(/\s+:/, ":").trim();
+  }
   async function finish(mode, run, outcome) {
     if (mode.assist) return;
     clearMode();
+    if (mode.queue) {
+      try {
+        sessionStorage.setItem(QUEUE_RESULT_KEY, JSON.stringify({ jobId: mode.jobId, outcome, at: Date.now(), reason: plainReason(run, outcome) }));
+      } catch {
+      }
+    }
     say(`${outcome}${run.pauseReason ? ": " + run.pauseReason : ""}`);
     await remember(run, outcome, mode);
     const reason = run.pauseReason || "";
     if (run.page === "verifyEmail") await noteSite("verify");
     else if (outcome !== "submitted" && /sign-in was rejected|already have an account|failed twice/i.test(reason)) await noteSite("other-password");
+    if (mode.queue) return;
     if (!mode.auto) {
       send({ type: "OH_MANUAL_FILL_STATUS", state: outcome === "error" ? "error" : "done" });
       return;
@@ -3170,7 +3197,7 @@ OPTIONS: ${JSON.stringify(options.slice(0, 150))}`
       url: location.href,
       fromWdEngine: true,
       missingQuestions,
-      message: `Workday: ${reason || (outcome === "review" ? "filled, but no Submit button on Review" : "couldn't finish")}`.slice(0, 300)
+      message: `Workday: ${plainReason(run, outcome) || "couldn't finish"}`.slice(0, 300)
     });
   }
   async function startFromOptimHire(msg) {
@@ -3204,6 +3231,24 @@ OPTIONS: ${JSON.stringify(options.slice(0, 150))}`
     }
     await installHooks(mode);
     await startRun(null);
+  }
+  async function startQueueJob(job) {
+    const id = String(job?.id || "");
+    if (!id || isActive() || readMode()?.jobId === id || queueResult(id)) return;
+    const mode = { auto: false, queue: true, submit: true, startedAt: Date.now(), jobId: id };
+    writeMode(mode);
+    answerCache.clear();
+    say(`applying (CSV queue: ${String(job.title || job.url || id).slice(0, 60)})`);
+    try {
+      await installHooks(mode);
+      await startRun(null);
+    } catch (e) {
+      clearMode();
+      try {
+        sessionStorage.setItem(QUEUE_RESULT_KEY, JSON.stringify({ jobId: id, outcome: "error", reason: e?.message || String(e), at: Date.now() }));
+      } catch {
+      }
+    }
   }
   async function startManual(submit2) {
     if (isActive()) return;

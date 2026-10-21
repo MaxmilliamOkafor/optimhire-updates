@@ -49,6 +49,7 @@ interface Mode {
   auto: boolean;        // an OptimHire run: report the result to OptimHire
   submit: boolean;      // press Submit on Review
   assist?: boolean;     // fill the step on screen only; you press Next
+  queue?: boolean;      // a CSV queue job: the result goes back to the queue runner
   startedAt: number;
   jobId: string;
 }
@@ -85,11 +86,27 @@ chrome.storage.onChanged.addListener((c, area) => {
   if (area === "local" && ASSIST_KEYS.some((k) => k in c)) readAssist();
 });
 
+/* A CSV queue job's result, kept for the queue runner (survives a reload). */
+const QUEUE_RESULT_KEY = "ohWdQueueResult";
+function queueResult(jobId: string): Any | null {
+  try {
+    const r = JSON.parse(sessionStorage.getItem(QUEUE_RESULT_KEY) || "null");
+    return r && r.jobId === jobId ? r : null;
+  } catch {
+    return null;
+  }
+}
+
 /* optimhire-patch.js stands down on a page the engine is working on — and,
-   with assist on, on Workday altogether (the engine fills it). */
+   with assist on, on Workday altogether (the engine fills it). Its CSV
+   queue runner hands Workday jobs here (startQueueJob) and reads the
+   result (queueResult). */
 (window as Any).__ohWdEngine = {
   owns: () => TOP && (!!readMode() || isActive() || (assistOn && hasWorkdayApp())),
   takesManual: () => TOP && hasWorkdayApp(),
+  isWorkday: () => TOP && isWorkdayHost(),
+  startQueueJob: (job: Any) => void startQueueJob(job),
+  queueResult,
 };
 
 /* ---------------- OptimHire messaging ---------------- */
@@ -550,14 +567,30 @@ async function remember(run: RunState, outcome: Outcome, mode: Mode) {
   } catch { /* storage unavailable */ }
 }
 
+/** Why a run stopped, worded for a queue or a run log rather than for someone at the page. */
+function plainReason(run: RunState, outcome: Outcome): string {
+  if (run.flags.length) {
+    const labels = run.flags.map((f) => f.label).join("; ");
+    return `${run.flags.length} question${run.flags.length === 1 ? "" : "s"} only you can answer: ${labels}`.slice(0, 240);
+  }
+  if (outcome === "review") return "filled, but no Submit button on Review";
+  return (run.pauseReason || "").replace(/,?\s*then click Resume\.?/gi, "").replace(/\s+:/, ":").trim();
+}
+
 async function finish(mode: Mode, run: RunState, outcome: Outcome) {
   if (mode.assist) return;                 // the overlay says what it needs; nothing to report
   clearMode();
+  if (mode.queue) {
+    try {
+      sessionStorage.setItem(QUEUE_RESULT_KEY, JSON.stringify({ jobId: mode.jobId, outcome, at: Date.now(), reason: plainReason(run, outcome) }));
+    } catch { /* storage blocked */ }
+  }
   say(`${outcome}${run.pauseReason ? ": " + run.pauseReason : ""}`);
   await remember(run, outcome, mode);
   const reason = run.pauseReason || "";
   if (run.page === "verifyEmail") await noteSite("verify");
   else if (outcome !== "submitted" && /sign-in was rejected|already have an account|failed twice/i.test(reason)) await noteSite("other-password");
+  if (mode.queue) return;
   if (!mode.auto) {
     send({ type: "OH_MANUAL_FILL_STATUS", state: outcome === "error" ? "error" : "done" });
     return;
@@ -577,7 +610,7 @@ async function finish(mode: Mode, run: RunState, outcome: Outcome) {
   } else if (outcome === "review") errorType = "submit-failed";
   send({
     type: "COMPLEX_FORM_ERROR", errorType, url: location.href, fromWdEngine: true, missingQuestions,
-    message: `Workday: ${reason || (outcome === "review" ? "filled, but no Submit button on Review" : "couldn't finish")}`.slice(0, 300),
+    message: `Workday: ${plainReason(run, outcome) || "couldn't finish"}`.slice(0, 300),
   });
 }
 
@@ -607,6 +640,23 @@ async function startFromOptimHire(msg: Any): Promise<void> {
   if (!readMode()) { say("stopped before the form was started"); return; }
   await installHooks(mode);
   await startRun(null);
+}
+
+/** A CSV queue job on this Workday tab: applied unattended, the result kept for the queue runner. */
+async function startQueueJob(job: Any): Promise<void> {
+  const id = String(job?.id || "");
+  if (!id || isActive() || readMode()?.jobId === id || queueResult(id)) return;
+  const mode: Mode = { auto: false, queue: true, submit: true, startedAt: Date.now(), jobId: id };
+  writeMode(mode);
+  answerCache.clear();
+  say(`applying (CSV queue: ${String(job.title || job.url || id).slice(0, 60)})`);
+  try {
+    await installHooks(mode);
+    await startRun(null);
+  } catch (e) {
+    clearMode();
+    try { sessionStorage.setItem(QUEUE_RESULT_KEY, JSON.stringify({ jobId: id, outcome: "error", reason: (e as Error)?.message || String(e), at: Date.now() })); } catch { /* */ }
+  }
 }
 
 async function startManual(submit: boolean): Promise<void> {
