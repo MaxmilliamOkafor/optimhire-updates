@@ -550,6 +550,24 @@
     });
   } catch (_) {}
 
+  /* CSV queue entries that are not job links (an old import turned a scraped
+     page's cells into "jobs" like https://font-semibold/) can never be
+     opened; dropped once at start-up so every count is right. */
+  try {
+    chrome.storage.local.get(['ohJobQueue'], function (d) {
+      var q = d && Array.isArray(d.ohJobQueue) ? d.ohJobQueue : null;
+      if (!q || !q.length) return;
+      var ok = q.filter(function (j) {
+        try {
+          var u = new URL(String((j && j.url) || ''));
+          return /^https?:$/.test(u.protocol) && /^[a-z0-9-]+(\.[a-z0-9-]+)*\.[a-z]{2,}$/i.test(u.hostname) &&
+                 !/\.(png|jpe?g|gif|svg|webp|ico|css|js|pdf)(\?|$)/i.test(u.pathname);
+        } catch (_) { return false; }
+      });
+      if (ok.length < q.length) chrome.storage.local.set({ ohJobQueue: ok });
+    });
+  } catch (_) {}
+
   /* Auto-submit: keep OptimHire's "automatic apply" flag on (see 6 above). */
   var AUTO_FLAG = 'is_copilot_automatic_apply_to_job';
   var area = chrome.storage && chrome.storage.local;

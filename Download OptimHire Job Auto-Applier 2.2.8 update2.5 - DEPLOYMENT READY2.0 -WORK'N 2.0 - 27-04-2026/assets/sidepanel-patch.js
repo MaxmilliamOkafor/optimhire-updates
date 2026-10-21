@@ -2499,6 +2499,64 @@
      Lives in the otherwise-empty sidepanel space and surfaces the
      queue's live status. Opens the full Queue Manager in a new tab.
      ────────────────────────────────────────────────────────── */
+  /* The Job Queue card's look: one dark surface, one accent, a clear
+     primary action, real switches, quiet secondary text. */
+  var QC_CSS = [
+    '#oh-queue-card{--qc-bg:#12141c;--qc-raise:#1a1d27;--qc-line:#262a36;--qc-text:#e6e8ef;--qc-muted:#8b91a3;',
+    '--qc-accent:#6d5efc;--qc-accent-2:#5a4bea;--qc-ok:#3ecf8e;--qc-warn:#f5b44a;--qc-bad:#f26d6d;',
+    'position:fixed;bottom:44px;left:10px;right:10px;z-index:2147483646;box-sizing:border-box;padding:14px;',
+    'background:var(--qc-bg);border:1px solid var(--qc-line);border-radius:14px;box-shadow:0 10px 30px rgba(0,0,0,.45);',
+    'font:12px/1.4 Inter,-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;color:var(--qc-text);-webkit-font-smoothing:antialiased}',
+    '#oh-queue-card *{box-sizing:border-box}',
+    '#oh-queue-card button{font:inherit;color:inherit;margin:0}',
+    '#oh-queue-card svg{width:14px;height:14px;flex:none}',
+    '#oh-queue-card .qc-head{display:flex;align-items:center;gap:8px;margin-bottom:12px}',
+    '#oh-queue-card .qc-title{font-size:13.5px;font-weight:650;letter-spacing:.1px;flex:1}',
+    '#oh-queue-card .qc-chip{display:inline-flex;align-items:center;gap:6px;padding:2px 9px;border-radius:999px;font-size:10.5px;font-weight:600;color:var(--qc-ok);background:rgba(62,207,142,.12)}',
+    '#oh-queue-card .qc-chip i{width:6px;height:6px;border-radius:50%;background:currentColor;animation:qcPulse 1.6s ease-in-out infinite}',
+    '@keyframes qcPulse{50%{opacity:.35}}',
+    '#oh-queue-card .qc-icon{display:grid;place-items:center;width:24px;height:24px;border:0;border-radius:7px;background:transparent;color:var(--qc-muted);cursor:pointer}',
+    '#oh-queue-card .qc-icon:hover{background:var(--qc-raise);color:var(--qc-text)}',
+    '#oh-queue-card .qc-stats{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-bottom:12px}',
+    '#oh-queue-card .qc-stat{padding:9px 10px;border:1px solid var(--qc-line);border-radius:10px;background:var(--qc-raise)}',
+    '#oh-queue-card .qc-stat b{display:block;font-size:17px;font-weight:650;font-variant-numeric:tabular-nums;line-height:1.15}',
+    '#oh-queue-card .qc-stat span{font-size:10.5px;color:var(--qc-muted)}',
+    '#oh-queue-card .qc-ok b{color:var(--qc-ok)} #oh-queue-card .qc-bad b{color:var(--qc-bad)}',
+    '#oh-queue-card .qc-run{margin-bottom:12px;padding:10px;border:1px solid var(--qc-line);border-radius:10px;background:var(--qc-raise)}',
+    '#oh-queue-card .qc-run-top{display:flex;justify-content:space-between;align-items:baseline;gap:8px;font-size:11.5px;color:var(--qc-muted)}',
+    '#oh-queue-card .qc-run-top b{color:var(--qc-text);font-size:12px;font-variant-numeric:tabular-nums}',
+    '#oh-queue-card .qc-bar{height:4px;border-radius:2px;background:var(--qc-line);overflow:hidden;margin:8px 0 6px}',
+    '#oh-queue-card .qc-bar div{height:100%;width:0;background:var(--qc-accent);transition:width .4s}',
+    '#oh-queue-card .qc-run-tally,#oh-queue-card .qc-run-tier{font-size:10.5px;color:var(--qc-muted);line-height:1.5}',
+    '#oh-queue-card .qc-run-tier{margin-top:2px}',
+    '#oh-queue-card .qc-row{display:flex;gap:8px;margin-bottom:8px}',
+    '#oh-queue-card .qc-btn{flex:1;display:inline-flex;align-items:center;justify-content:center;gap:6px;height:34px;padding:0 12px;',
+    'border:1px solid var(--qc-line);border-radius:9px;background:var(--qc-raise);font-size:12px;font-weight:550;cursor:pointer;transition:background .15s,border-color .15s}',
+    '#oh-queue-card .qc-btn:hover{border-color:#353a4a;background:#20242f}',
+    '#oh-queue-card .qc-btn svg{color:var(--qc-muted)}',
+    '#oh-queue-card .qc-primary{background:var(--qc-accent);border-color:var(--qc-accent);color:#fff;font-weight:600}',
+    '#oh-queue-card .qc-primary:hover{background:var(--qc-accent-2);border-color:var(--qc-accent-2)}',
+    '#oh-queue-card .qc-square{flex:0 0 34px;padding:0} #oh-queue-card .qc-narrow{flex:0 0 auto}',
+    '#oh-queue-card .qc-sep{height:1px;background:var(--qc-line);margin:4px 0 6px}',
+    '#oh-queue-card .qc-switch{display:flex;width:100%;align-items:center;gap:10px;padding:7px 2px;border:0;background:transparent;text-align:left;cursor:pointer}',
+    '#oh-queue-card .qc-switch-text{flex:1;display:flex;flex-direction:column}',
+    '#oh-queue-card .qc-switch-text b{font-weight:550;font-size:12px}',
+    '#oh-queue-card .qc-switch-text small{font-size:10.5px;color:var(--qc-muted)}',
+    '#oh-queue-card .qc-toggle{position:relative;flex:none;width:32px;height:18px;border-radius:999px;background:#353a4a;transition:background .2s}',
+    '#oh-queue-card .qc-toggle::after{content:"";position:absolute;top:2px;left:2px;width:14px;height:14px;border-radius:50%;background:#fff;transition:transform .2s}',
+    '#oh-queue-card .qc-switch[aria-checked="true"] .qc-toggle{background:var(--qc-accent)}',
+    '#oh-queue-card .qc-switch[aria-checked="true"] .qc-toggle::after{transform:translateX(14px)}',
+    '#oh-queue-card .qc-foot{font-size:10.5px;color:var(--qc-muted);margin:2px 0 6px}',
+    '#oh-queue-card .qc-foot b{font-weight:600}',
+    '#oh-queue-card .qc-links{display:flex;justify-content:space-between;gap:8px}',
+    '#oh-queue-card .qc-link{display:inline-flex;align-items:center;gap:4px;padding:0;border:0;background:transparent;color:var(--qc-muted);font-size:11px;cursor:pointer}',
+    '#oh-queue-card .qc-link:hover{color:var(--qc-text)}',
+    '#oh-queue-card .qc-link svg{width:12px;height:12px}',
+    '#oh-queue-card button:focus-visible{outline:2px solid var(--qc-accent);outline-offset:2px}',
+    '.qc-pill{position:fixed;bottom:44px;right:10px;z-index:2147483646;cursor:pointer;padding:7px 14px;border-radius:999px;',
+    'background:#6d5efc;color:#fff;font:600 11.5px/1 Inter,-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;box-shadow:0 6px 18px rgba(0,0,0,.4)}'
+  ].join('');
+
   (function installJobQueueCard() {
     var KEY_QUEUE = 'ohJobQueue';
     var KEY_ACTIVE = 'ohJobQueueActive';
@@ -2511,77 +2569,61 @@
       /* Docked to the BOTTOM of the sidepanel (above the Help footer),
          in the large empty space — never over the OptimHire main card.
          Appended to <body>, entirely OUTSIDE the React tree (#__plasmo)
-         so it can't interfere with React's mount. */
-      card.style.cssText =
-        'position:fixed;bottom:44px;left:10px;right:10px;z-index:2147483646;' +
-        'padding:12px 14px;border:1px solid #2d2f3a;border-radius:10px;' +
-        'background:linear-gradient(135deg,#1a1040,#0f1117f5);backdrop-filter:blur(3px);' +
-        'box-shadow:0 4px 18px rgba(0,0,0,.5);' +
-        'font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,sans-serif;' +
-        'color:#e2e8f0;font-size:12px;';
+         so it can't interfere with React's mount. Styled by one scoped
+         stylesheet (QC_CSS) rather than inline styles. */
+      if (!document.getElementById('oh-qc-style')) {
+        var st = document.createElement('style');
+        st.id = 'oh-qc-style';
+        st.textContent = QC_CSS;
+        (document.head || document.documentElement).appendChild(st);
+      }
+      var ICON = {
+        log: '<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3 4h10M3 8h10M3 12h6" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" fill="none"/></svg>',
+        x: '<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M4 4l8 8M12 4l-8 8" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" fill="none"/></svg>',
+        bolt: '<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M9 1.5L3.5 9H8l-1 5.5L12.5 7H8z" fill="currentColor"/></svg>',
+        send: '<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M2 8l11-5-4 11-2-4.5z" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round" fill="none"/></svg>',
+        arrow: '<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M6 4l4 4-4 4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" fill="none"/></svg>',
+        down: '<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 3v8M4.5 7.5L8 11l3.5-3.5M3 13.5h10" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" fill="none"/></svg>'
+      };
       card.innerHTML =
-        '<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px">' +
-          '<div style="font-weight:600;color:#c4b5fd;font-size:13.5px">Job Queue Manager</div>' +
-          '<div style="display:flex;align-items:center;gap:6px">' +
-            '<span id="oh-qc-indicator" style="display:none;font-size:10.5px;color:#38bdf8;' +
-              'background:rgba(56,189,248,.15);padding:2px 8px;border-radius:10px;font-weight:600">RUNNING</span>' +
-            '<span id="oh-qc-collapse" title="Hide" style="cursor:pointer;color:#6b7280;font-size:15px;' +
-              'line-height:1;padding:0 4px">×</span>' +
-          '</div>' +
+        '<div class="qc-head">' +
+          '<div class="qc-title">Job Queue</div>' +
+          '<span id="oh-qc-indicator" class="qc-chip" style="display:none"><i></i>Running</span>' +
+          '<button id="oh-qc-collapse" class="qc-icon" title="Hide" aria-label="Hide">' + ICON.x + '</button>' +
         '</div>' +
-        '<div id="oh-qc-stats" style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px">' +
-          '<span style="background:#2d2f3a;padding:3px 8px;border-radius:6px;color:#94a3b8" id="oh-qc-pending">0 pending</span>' +
-          '<span style="background:rgba(74,222,128,.15);padding:3px 8px;border-radius:6px;color:#4ade80" id="oh-qc-applied">0 applied</span>' +
-          '<span style="background:rgba(239,68,68,.15);padding:3px 8px;border-radius:6px;color:#f87171" id="oh-qc-failed">0 failed</span>' +
+        '<div id="oh-qc-stats" class="qc-stats">' +
+          '<div class="qc-stat"><b id="oh-qc-pending">0</b><span>Pending</span></div>' +
+          '<div class="qc-stat qc-ok"><b id="oh-qc-applied">0</b><span>Applied</span></div>' +
+          '<div class="qc-stat qc-bad"><b id="oh-qc-failed">0</b><span>Failed</span></div>' +
         '</div>' +
         /* Live OptimHire run: where it is in its queue, as it applies. */
-        '<div id="oh-qc-run" style="display:none;margin:-4px 0 10px;padding:8px 10px;border:1px solid #2d2f3a;' +
-          'border-radius:8px;background:#0f1117">' +
-          '<div style="display:flex;justify-content:space-between;align-items:baseline;gap:8px">' +
-            '<span id="oh-qc-run-label" style="color:#c4b5fd;font-weight:600;font-size:11.5px">OptimHire queue</span>' +
-            '<span id="oh-qc-run-pos" style="color:#e2e8f0;font-weight:700;font-size:12.5px">—</span>' +
-          '</div>' +
-          '<div style="height:5px;background:#1e2030;border-radius:3px;overflow:hidden;margin:6px 0 5px">' +
-            '<div id="oh-qc-run-bar" style="height:100%;width:0%;background:linear-gradient(90deg,#6366f1,#8b5cf6);transition:width .4s"></div>' +
-          '</div>' +
-          '<div id="oh-qc-run-tally" style="font-size:10.5px;color:#94a3b8;line-height:1.5">—</div>' +
-          '<div id="oh-qc-run-tier" style="display:none;font-size:10.5px;color:#a78bfa;margin-top:2px"></div>' +
+        '<div id="oh-qc-run" class="qc-run" style="display:none">' +
+          '<div class="qc-run-top"><span id="oh-qc-run-label">OptimHire queue</span><b id="oh-qc-run-pos">—</b></div>' +
+          '<div class="qc-bar"><div id="oh-qc-run-bar"></div></div>' +
+          '<div id="oh-qc-run-tally" class="qc-run-tally">—</div>' +
+          '<div id="oh-qc-run-tier" class="qc-run-tier" style="display:none"></div>' +
         '</div>' +
-        '<div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:6px">' +
-          '<button id="oh-qc-open" style="flex:1;background:linear-gradient(135deg,#6366f1,#8b5cf6);' +
-            'color:#fff;border:none;padding:8px 12px;border-radius:8px;font-size:12px;font-weight:600;cursor:pointer">' +
-            'Open Queue Manager</button>' +
-          '<button id="oh-qc-debug" title="Open the debug log viewer" style="background:#2d2f3a;' +
-            'color:#e2e8f0;border:1px solid #3a3d4a;padding:8px 10px;border-radius:8px;font-size:12px;cursor:pointer">' +
-            '🐞</button>' +
+        '<div class="qc-row">' +
+          '<button id="oh-qc-open" class="qc-btn qc-primary">Open Queue Manager</button>' +
+          '<button id="oh-qc-debug" class="qc-btn qc-square" title="Debug log" aria-label="Debug log">' + ICON.log + '</button>' +
         '</div>' +
-        '<button id="oh-qc-export" title="Export every job URL OptimHire auto-apply has gone through this session — CSV (re-importable into the Queue Manager) or a plain URL list" ' +
-          'style="width:100%;background:#0f1117;color:#c4b5fd;border:1px solid #3a3d4a;' +
-          'padding:7px 10px;border-radius:8px;font-size:11.5px;cursor:pointer">' +
-          '⬇ Export queue job URLs (0)</button>' +
-        '<div style="display:flex;gap:6px;margin-top:6px">' +
-          '<button id="oh-qc-fill" title="Fill the job application on the tab you are currently viewing, using our autofill engine (works on any site, no unlock needed)" ' +
-            'style="flex:1;background:#0f1117;color:#4ade80;border:1px solid #3a3d4a;' +
-            'padding:7px 10px;border-radius:8px;font-size:11.5px;cursor:pointer;font-weight:600">' +
-            '⚡ Autofill this page</button>' +
-          '<button id="oh-qc-fillsubmit" title="Autofill this page AND click its submit button" ' +
-            'style="background:#0f1117;color:#c4b5fd;border:1px solid #3a3d4a;' +
-            'padding:7px 10px;border-radius:8px;font-size:11.5px;cursor:pointer">' +
-            '+ submit</button>' +
+        '<div class="qc-row">' +
+          '<button id="oh-qc-fill" class="qc-btn" title="Fill the application on the tab you are viewing (works on any site)">' + ICON.bolt + 'Autofill this page</button>' +
+          '<button id="oh-qc-fillsubmit" class="qc-btn qc-narrow" title="Autofill this page and press its submit button">' + ICON.send + 'Fill &amp; submit</button>' +
         '</div>' +
-        '<button id="oh-qc-master" title="Hard stop: makes the extension completely inert — no auto-clicking, no auto-submitting, no background loops — until you turn it back on" ' +
-          'style="width:100%;margin-top:6px;background:#2d1620;color:#f87171;border:1px solid #7f1d1d;' +
-          'padding:7px 10px;border-radius:8px;font-size:11.5px;cursor:pointer;font-weight:600">' +
-          '■ Automation: ON (click to disable)</button>' +
-        '<div id="oh-qc-truth" title="OptimHire’s ‘X applied’ counter also counts SKIPS. This shows how many actually got a real submission confirmation." ' +
-          'style="margin-top:7px;font-size:10.5px;color:#94a3b8;line-height:1.5;text-align:center">' +
-          'Real outcome: — submitted · — skipped</div>' +
-        '<div id="oh-qc-qamem" title="Answers learned from applications that were confirmed as submitted. Click to review or forget them." ' +
-          'style="margin-top:3px;font-size:10.5px;color:#94a3b8;text-align:center;cursor:pointer">' +
-          '🧠 Remembered answers: —</div>' +
-        '<div id="oh-qc-prio" title="Apply to jobs on company ATS sites (Greenhouse, Lever, Workday…) first, then other job boards, and Reed last — for OptimHire\'s queue and the CSV Job Queue. Click to switch." ' +
-          'style="margin-top:3px;font-size:10.5px;color:#94a3b8;text-align:center;cursor:pointer">' +
-          '⇅ ATS jobs first, Reed last: —</div>';
+        '<div class="qc-sep"></div>' +
+        '<button id="oh-qc-master" class="qc-switch" role="switch" aria-checked="true" ' +
+          'title="Hard stop: makes the extension completely inert — no auto-clicking, no auto-submitting, no background loops — until you turn it back on">' +
+          '<span class="qc-switch-text"><b>Automation</b><small id="oh-qc-master-sub">Applies and submits for you</small></span><span class="qc-toggle"></span></button>' +
+        '<button id="oh-qc-prio" class="qc-switch" role="switch" aria-checked="true" ' +
+          'title="Apply to jobs on company ATS sites (Greenhouse, Lever, Workday…) first, then other job boards, and Reed last — for OptimHire\'s queue and the CSV Job Queue.">' +
+          '<span class="qc-switch-text"><b>ATS jobs first</b><small>Then other boards, Reed last</small></span><span class="qc-toggle"></span></button>' +
+        '<div class="qc-sep"></div>' +
+        '<div id="oh-qc-truth" class="qc-foot" title="OptimHire’s ‘X applied’ counter also counts skips. This counts real submission confirmations.">Results: — submitted · — skipped</div>' +
+        '<div class="qc-links">' +
+          '<button id="oh-qc-qamem" class="qc-link" title="Answers learned from applications confirmed as submitted. Review or forget them.">Remembered answers ' + ICON.arrow + '</button>' +
+          '<button id="oh-qc-export" class="qc-link" title="Export every job URL OptimHire auto-apply has gone through — CSV (re-importable into the Queue Manager) or a plain list">' + ICON.down + 'Export URLs</button>' +
+        '</div>';
       /* Always append to <body> as a fixed overlay — never insert as a
          sibling of #__plasmo (that risked disturbing React). */
       document.body.appendChild(card);
@@ -2677,13 +2719,8 @@
           pill = document.createElement('div');
           pill.id = 'oh-qc-pill';
           pill.title = 'Show Job Queue';
-          pill.textContent = 'Queue';
-          pill.style.cssText =
-            'position:fixed;bottom:44px;right:10px;z-index:2147483646;cursor:pointer;' +
-            'padding:6px 12px;border:1px solid #2d2f3a;border-radius:14px;' +
-            'background:linear-gradient(135deg,#6366f1,#8b5cf6);color:#fff;' +
-            'font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,sans-serif;' +
-            'font-size:11px;font-weight:600;box-shadow:0 3px 12px rgba(0,0,0,.4)';
+          pill.textContent = 'Job Queue';
+          pill.className = 'qc-pill';
           pill.addEventListener('click', function () {
             card.style.display = '';
             pill.remove();
@@ -2812,10 +2849,10 @@
       if (tally) {
         var eta = s.live && s.ratePerHr > 0 && s.left ? ' · ~' + s.ratePerHr + '/hr, done in ' + fmtDur(s.left / s.ratePerHr * 3600000) : '';
         tally.innerHTML =
-          '<b style="color:#4ade80">✅ ' + s.submitted + ' submitted</b> · ' +
-          '<span style="color:#fbbf24">⏭ ' + s.skipped + ' skipped</span> · ' +
-          '<span>🚫 ' + s.closed + ' closed</span>' +
-          (s.error ? ' · <span style="color:#f87171">⚠ ' + s.error + ' errors</span>' : '') + eta;
+          '<b style="color:var(--qc-ok)">' + s.submitted + ' submitted</b> · ' +
+          '<span style="color:var(--qc-warn)">' + s.skipped + ' skipped</span> · ' +
+          '<span>' + s.closed + ' closed</span>' +
+          (s.error ? ' · <span style="color:var(--qc-bad)">' + s.error + ' errors</span>' : '') + eta;
       }
       var tierEl = document.getElementById('oh-qc-run-tier');
       if (tierEl) {
@@ -2835,7 +2872,7 @@
     var _qaCount = null;
     function paintQaCount() {
       var el = document.getElementById('oh-qc-qamem');
-      if (el && _qaCount != null) el.textContent = '🧠 Remembered answers: ' + _qaCount;
+      if (el && _qaCount != null) el.innerHTML = 'Remembered answers <b style="color:var(--qc-text);font-weight:600">' + _qaCount + '</b>';
     }
     function setQaCount(mem) {
       _qaCount = (mem && typeof mem === 'object') ? Object.keys(mem).length : 0;
@@ -2855,9 +2892,9 @@
           var p = document.getElementById('oh-qc-pending');
           var a = document.getElementById('oh-qc-applied');
           var f = document.getElementById('oh-qc-failed');
-          if (p) p.textContent = c.pending + ' pending';
-          if (a) a.textContent = c.applied + ' applied';
-          if (f) f.textContent = c.failed + ' failed';
+          if (p) p.textContent = String(c.pending);
+          if (a) a.textContent = String(c.applied);
+          if (f) f.textContent = String(c.failed);
           var ind = document.getElementById('oh-qc-indicator');
           if (ind) ind.style.display = d[KEY_ACTIVE] ? '' : 'none';
         });
@@ -2866,7 +2903,7 @@
                                   'ohPreferAts', 'ohQueueTier'], function (d) {
           try {
             var pl = document.getElementById('oh-qc-prio');
-            if (pl) pl.textContent = '⇅ ATS jobs first, Reed last: ' + (d && d.ohPreferAts === false ? 'OFF' : 'ON');
+            if (pl) pl.setAttribute('aria-checked', d && d.ohPreferAts === false ? 'false' : 'true');
           } catch (_) {}
           _queueTier = (d && d.ohPreferAts !== false && d.ohQueueTier) || null;
           var map = (d && d.ohHarvestedJobs) || {};
@@ -2881,16 +2918,14 @@
             else if (oc === 'closed' || oc === 'error') other++;
           }
           var btn = document.getElementById('oh-qc-export');
-          if (btn) btn.textContent = '⬇ Export queue job URLs (' + n + ')';
+          if (btn) btn.lastChild.textContent = 'Export URLs (' + n + ')';
           var mb = document.getElementById('oh-qc-master');
           if (mb) {
             chrome.storage.local.get(['ohAutomationDisabled'], function (dd) {
               var off = !!(dd && dd.ohAutomationDisabled === true);
-              mb.textContent = off ? '▶ Automation: OFF (click to enable)'
-                                   : '■ Automation: ON (click to disable)';
-              mb.style.background = off ? '#0f2a16' : '#2d1620';
-              mb.style.color      = off ? '#4ade80' : '#f87171';
-              mb.style.borderColor= off ? '#166534' : '#7f1d1d';
+              mb.setAttribute('aria-checked', off ? 'false' : 'true');
+              var sub = document.getElementById('oh-qc-master-sub');
+              if (sub) sub.textContent = off ? 'Off — the extension does nothing until you turn it on' : 'Applies and submits for you';
             });
           }
           var truth = document.getElementById('oh-qc-truth');
@@ -2908,10 +2943,10 @@
               .map(function (k) { return why[k] + ' × ' + k; });
             truth.title = whyList.length ? 'Not submitted — why:\n' + whyList.join('\n') :
               'OptimHire’s ‘X applied’ counter also counts SKIPS. This shows how many actually got a real submission confirmation.';
-            truth.innerHTML = 'Real outcome: ' +
-              '<b style="color:#4ade80">' + sub + ' submitted</b> · ' +
-              '<b style="color:#fbbf24">' + skip + ' skipped</b>' +
-              (other ? ' · <span style="color:#f87171">' + other + ' closed/err</span>' : '');
+            truth.innerHTML = 'Results: ' +
+              '<b style="color:var(--qc-ok)">' + sub + ' submitted</b> · ' +
+              '<b style="color:var(--qc-warn)">' + skip + ' skipped</b>' +
+              (other ? ' · <span style="color:var(--qc-bad)">' + other + ' closed or errors</span>' : '');
           }
         });
       } catch (_) {}

@@ -368,14 +368,17 @@
       if (j.status === 'applied') { if (j.confirmed) confirmed++; else unconfirmed++; }
     }
     const el = document.getElementById('stats');
+    /* Each tile filters the table to its status (click again for all). */
+    const tile = (f, cls, n, label, title) =>
+      `<button type="button" class="stat ${cls}${view.filter === f && f !== 'all' ? ' on' : ''}" data-f="${f}"${title ? ` title="${title}"` : ''}><b>${n}</b>${label}</button>`;
     el.innerHTML = '' +
-      `<div class="stat"><b>${c.all}</b>Total</div>` +
-      `<div class="stat s-pending"><b>${c.pending}</b>Pending</div>` +
-      `<div class="stat s-running"><b>${c.running}</b>Running</div>` +
-      `<div class="stat s-applied" title="Applications with a real on-page confirmation — these are the ones that genuinely went through"><b>${confirmed}</b>✅ Confirmed</div>` +
-      `<div class="stat s-skipped" title="Submit was clicked but no confirmation appeared — NOT proof it was received. Verify these manually."><b>${unconfirmed}</b>⚠ Unconfirmed</div>` +
-      `<div class="stat s-failed"><b>${c.failed}</b>Failed</div>` +
-      `<div class="stat s-skipped"><b>${c.skipped}</b>Skipped</div>`;
+      tile('all', '', c.all, 'Total') +
+      tile('pending', 's-pending', c.pending, 'Pending') +
+      tile('running', 's-running', c.running, 'Running') +
+      tile('applied', 's-applied', confirmed, 'Confirmed', 'Applications with a real on-page confirmation — these are the ones that genuinely went through') +
+      tile('applied', 's-unconfirmed', unconfirmed, 'Unconfirmed', 'Submit was clicked but no confirmation appeared — not proof it was received. Check these yourself.') +
+      tile('failed', 's-failed', c.failed, 'Failed') +
+      tile('skipped', 's-skipped', c.skipped, 'Skipped');
   }
   function renderAtsFilter() {
     const el = document.getElementById('atsFilter');
@@ -436,7 +439,7 @@
     empty.classList.add('hidden');
     document.getElementById('jobsTable').style.display = '';
     if (!visible.length) {
-      tbody.innerHTML = `<tr><td colspan="10" class="empty" style="padding:30px">No jobs match the current filter.</td></tr>`;
+      tbody.innerHTML = `<tr><td colspan="8" class="empty" style="padding:30px">No jobs match the current filter.</td></tr>`;
       syncSelectAll(visible);
       return;
     }
@@ -445,23 +448,29 @@
       const rowCls = j.status === 'running' ? 'running-row' :
                      j.status === 'applied' ? 'applied-row' :
                      j.status === 'failed' ? 'failed-row' : '';
+      const url = safeJobUrl(j.url);
+      let host = '';
+      try { host = new URL(url).hostname.replace(/^www\./, ''); } catch (_) {}
+      const unconfirmed = j.status === 'applied' && !j.confirmed;
+      const badgeCls = unconfirmed ? 'unconfirmed' : j.status;
+      const badgeTxt = unconfirmed ? 'Unconfirmed' : j.status === 'applied' ? 'Applied' : j.status.charAt(0).toUpperCase() + j.status.slice(1);
+      const badgeTip = j.status === 'applied' ? (j.confirmed ? esc(j.confirmedBy || 'confirmation page detected') : 'No confirmation was detected — check it yourself') : '';
+      const title = j.title || host || 'Untitled job';
+      const meta = [j.company ? esc(j.company) : '', url ? `<a href="${esc(url)}" target="_blank" rel="noopener" title="${esc(j.url)}">${esc(truncate(host + new URL(url).pathname, 70))}</a>` : `<span title="Invalid URL">${esc(truncate(String(j.url || ''), 60))}</span>`]
+        .filter(Boolean).join(' · ');
       return `<tr class="${rowCls}" data-id="${j.id}">
         <td class="checkbox-cell"><input type="checkbox" class="row-check" data-id="${j.id}" ${checked}></td>
-        <td>${idx + 1}</td>
-        <td><span class="badge b-${j.status}" title="${j.status === 'applied' ? (j.confirmed ? esc(j.confirmedBy || 'confirmation page detected') : 'No confirmation was detected — verify manually') : ''}">${j.status}${j.status === 'applied' ? (j.confirmed ? ' ✅' : ' ⚠') : ''}</span></td>
-        <td class="url-col">${safeJobUrl(j.url)
-          ? `<a href="${esc(safeJobUrl(j.url))}" target="_blank" rel="noopener" title="${esc(j.url)}">${esc(truncate(j.url, 60))}</a>`
-          : `<span title="Invalid URL">${esc(truncate(String(j.url || ''), 60))}</span>`}</td>
-        <td>${esc(j.title || '—')}</td>
-        <td>${esc(j.company || '—')}</td>
+        <td class="num">${idx + 1}</td>
+        <td><div class="job"><span class="job-title" title="${esc(title)}">${esc(title)}</span><span class="job-meta">${meta}</span>${j.status === 'failed' && j.lastError ? `<span class="job-err" title="${esc(j.lastError)}">${esc(j.lastError)}</span>` : ''}</div></td>
+        <td><span class="badge b-${badgeCls}" title="${badgeTip}">${badgeTxt}</span></td>
         <td><span class="ats-tag">${esc(j.ats || 'Other')}</span></td>
-        <td>${j.attempts || 0}</td>
-        <td title="${j.lastError ? esc(j.lastError) : ''}">${fmtTs(j.lastActionTs || j.appliedAt || j.addedAt)}</td>
-        <td class="row-actions">
-          <button class="btn-small" data-action="open" data-id="${j.id}">Open</button>
-          <button class="btn-small" data-action="edit" data-id="${j.id}">Edit</button>
-          <button class="btn-small btn-danger" data-action="delete" data-id="${j.id}">Delete</button>
-        </td>
+        <td class="num">${j.attempts || 0}</td>
+        <td class="when" title="${j.lastError ? esc(j.lastError) : ''}">${fmtTs(j.lastActionTs || j.appliedAt || j.addedAt)}</td>
+        <td class="row-actions"><div>
+          <button data-action="open" data-id="${j.id}" title="Open" aria-label="Open">${ICONS.open}</button>
+          <button data-action="edit" data-id="${j.id}" title="Edit" aria-label="Edit">${ICONS.edit}</button>
+          <button class="btn-danger" data-action="delete" data-id="${j.id}" title="Delete" aria-label="Delete">${ICONS.trash}</button>
+        </div></td>
       </tr>`;
     });
     tbody.innerHTML = rows.join('');
@@ -469,6 +478,11 @@
     syncSelectAll(visible);
   }
   function truncate(s, n) { return s.length > n ? s.slice(0, n - 1) + '…' : s; }
+  const ICONS = {
+    open: '<svg class="i" viewBox="0 0 16 16" aria-hidden="true"><path d="M9 3h4v4M13 3L7.5 8.5M12 9.5V13H3V4h3.5" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" fill="none"/></svg>',
+    edit: '<svg class="i" viewBox="0 0 16 16" aria-hidden="true"><path d="M10.5 3.5l2 2L6 12H4v-2z" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round" fill="none"/></svg>',
+    trash: '<svg class="i" viewBox="0 0 16 16" aria-hidden="true"><path d="M3 4.5h10M6.5 4.5V3h3v1.5M4.5 4.5l.6 8.5h5.8l.6-8.5" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" fill="none"/></svg>',
+  };
 
   /* ───── Toast ───── */
   function toast(msg, kind) {
@@ -1085,6 +1099,15 @@
     });
 
     on('searchInput',  'input',  (e) => { view.search = e.target.value; render(); });
+    on('stats', 'click', (e) => {
+      const t = e.target.closest && e.target.closest('.stat[data-f]');
+      if (!t) return;
+      const f = t.getAttribute('data-f');
+      view.filter = (view.filter === f || f === 'all') ? 'all' : f;
+      const sf = document.getElementById('statusFilter');
+      if (sf) sf.value = view.filter;
+      render();
+    });
     on('statusFilter', 'change', (e) => { view.filter = e.target.value; render(); });
     on('atsFilter',    'change', (e) => { view.ats    = e.target.value; render(); });
 
@@ -1139,7 +1162,9 @@
 
     /* Row delegated clicks */
     document.getElementById('jobsTbody').addEventListener('click', async (e) => {
-      const a = e.target.dataset.action; const id = e.target.dataset.id;
+      /* The click lands on the icon inside the button. */
+      const btn = e.target.closest && e.target.closest('button[data-action]');
+      const a = btn && btn.dataset.action; const id = btn && btn.dataset.id;
       if (!a || !id) return;
       if (a === 'open') {
         const j = queue.find(x => x.id === id);
