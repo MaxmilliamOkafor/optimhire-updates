@@ -298,6 +298,13 @@
         <button id="wdProfileRemove" class="btn-small">Remove</button>
       </div>
       <input type="file" id="wdProfileFile" accept=".json,application/json" style="display:none">
+      <h2 style="margin-top:14px">Emailed verification codes</h2>
+      <label style="display:flex;gap:8px;align-items:flex-start;font-weight:normal">
+        <input type="checkbox" id="gmailCodesOn" style="width:auto;margin-top:3px">
+        <span>Read verification codes from my signed-in Gmail. Oracle ("Confirm Your Identity"), Workday and others
+        email a code mid-application; with this on it is read from your Gmail in this browser and typed for you.
+        Read-only: only mail from the last few minutes that reads like a verification email, nothing is kept.</span>
+      </label>
       <div class="modal-actions">
         <button id="wdClose">Close</button>
         <button id="wdSave" class="btn-primary">Save</button>

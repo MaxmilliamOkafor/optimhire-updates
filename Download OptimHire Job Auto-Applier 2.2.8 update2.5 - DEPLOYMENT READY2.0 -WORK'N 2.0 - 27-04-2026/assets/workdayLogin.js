@@ -8,7 +8,8 @@
  * sign-in itself is done by the Workday engine (assets/wd-engine.js), or by
  * assets/optimhire-patch.js when the engine is off.
  *
- * Also: the Workday engine's on/off switch (ohWdEngineOff) and the optional
+ * Also: reading emailed verification codes from the signed-in Gmail
+ * (ohGmailCodes, opt-in — oh-bg.js 10), the Workday engine's on/off switch (ohWdEngineOff) and the optional
  * full profile it uses (ohWorkdayProfile — work history, education, skills),
  * imported from the Workday extension's profile JSON.
  */
@@ -79,8 +80,9 @@
     return p && typeof p === 'object' && (p.personal || Array.isArray(p.work)) ? p : null;
   }
   function renderEngine() {
-    ST.get(['ohWdEngineOff', 'ohWorkdayProfile'], function (d) {
+    ST.get(['ohWdEngineOff', 'ohWorkdayProfile', 'ohGmailCodes'], function (d) {
       $('wdEngineOn').checked = !(d && d.ohWdEngineOff === true);
+      $('gmailCodesOn').checked = !!(d && d.ohGmailCodes === true);
       var p = d && d.ohWorkdayProfile;
       var name = p && p.personal ? [p.personal.firstName, p.personal.lastName].filter(Boolean).join(' ') : '';
       $('wdProfileState').textContent = p
@@ -138,6 +140,11 @@
     $('wdEngineOn').addEventListener('change', function () {
       ST.set({ ohWdEngineOff: !$('wdEngineOn').checked }, function () {
         toast($('wdEngineOn').checked ? 'Workday engine on' : 'Workday engine off — OptimHire fills Workday', 'success');
+      });
+    });
+    $('gmailCodesOn').addEventListener('change', function () {
+      ST.set({ ohGmailCodes: $('gmailCodesOn').checked }, function () {
+        toast($('gmailCodesOn').checked ? 'Verification codes will be read from your signed-in Gmail' : 'Verification codes: off', 'success');
       });
     });
     $('wdProfileImport').addEventListener('click', function () { $('wdProfileFile').value = ''; $('wdProfileFile').click(); });

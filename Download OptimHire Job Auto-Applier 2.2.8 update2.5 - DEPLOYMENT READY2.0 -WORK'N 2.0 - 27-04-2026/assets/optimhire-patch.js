@@ -1844,6 +1844,278 @@
     rescueLocationNow = tick;
   })();
 
+  /* ── Oracle Recruiting Cloud (…/hcmUI/CandidateExperience) ───────────
+   * Oracle's application (JPMorgan, Goldman Sachs, Dell, EY…) has pieces
+   * the generic filler doesn't handle — ideas from the Jobright build:
+   *   • "Confirm Your Identity": a code is emailed, then typed one digit
+   *     per box. With "Read verification codes from my signed-in Gmail" on
+   *     (Queue Manager → Workday sign-in) the code is read from your Gmail
+   *     (oh-bg.js 10), typed and VERIFY pressed; "Keep me signed in" is
+   *     ticked. Off, a run skips the job at once instead of waiting.
+   *   • Pill buttons ("Female | Male | Prefer not to say", "I consent"):
+   *     a required group left unanswered is answered — equality questions
+   *     with "prefer not to say", consent with "I consent", the rest from
+   *     your profile's answers.
+   *   • Typeaheads that show "No results were found." (a value typed but
+   *     never picked): searched again by its first word and the closest
+   *     suggestion picked. The postal code is SW1W 0RH, as asked.
+   *   • Address Line 1 holding a country name while Line 2 holds the
+   *     street: put right. */
+  (function installOracleCx() {
+    if (window.top !== window.self) return;
+    const isOracle = () => /(^|\.)oraclecloud\.com$/i.test(location.hostname) || /\/hcmUI\/CandidateExperience/i.test(location.pathname);
+    if (!isOracle()) return;
+    const ORACLE_POSTCODE = 'SW1W 0RH';
+    const SETTLE_MS = 3500;                 // leave OptimHire's own fill time to finish first
+    const txt = el => ((el && (el.innerText || el.textContent)) || '').replace(/\s+/g, ' ').trim();
+    const firstSeen = new Map();
+    const settled = key => { const t = firstSeen.get(key); if (!t) { firstSeen.set(key, Date.now()); return false; } return Date.now() - t >= SETTLE_MS; };
+    let busy = false, pin = { since: 0, typed: '', resent: false, gaveUp: false };
+
+    async function active() {
+      if (Date.now() - _manualTriggerTs < 90_000) return true;
+      return (await isAutomationActive()) && (await isActiveJobTab());
+    }
+
+    /* ── identity code ── */
+    const PIN_RE = /confirm your identity|verification code (was|has been) sent|we (sent|emailed) (you )?a (verification |security |one-time )?code|enter the (verification |security )?code/i;
+    function codeBoxes() {
+      const ins = $$('input').filter(i => isVisible(i) && !/^(hidden|checkbox|radio|submit|button|email|password|file)$/i.test(i.type || ''));
+      const singles = ins.filter(i => i.getAttribute('maxlength') === '1');
+      if (singles.length >= 4) return singles;
+      const one = ins.find(i => /one-time-code/i.test(i.getAttribute('autocomplete') || '') ||
+        /\b(code|pin|otp|passcode)\b/i.test([i.name, i.id, i.getAttribute('aria-label'), i.placeholder].join(' ')));
+      return one ? [one] : [];
+    }
+    const onPinScreen = () => PIN_RE.test(txt(document.body).slice(0, 4000)) && codeBoxes().length > 0;
+    async function typeCode(code) {
+      const keep = $$('input[type="checkbox"]').find(c => !c.checked && /keep me signed in/i.test(txt(c.closest('label,div,span')) || ''));
+      if (keep) realClick(keep);
+      const boxes = codeBoxes();
+      if (boxes.length === 1) { boxes[0].focus(); nativeSet(boxes[0], code); }
+      else {
+        for (let i = 0; i < boxes.length && i < code.length; i++) {
+          boxes[i].focus();
+          nativeSet(boxes[i], code[i]);
+          boxes[i].dispatchEvent(new KeyboardEvent('keyup', { key: code[i], bubbles: true }));
+          await sleep(90);
+        }
+      }
+      await sleep(400);
+      const verify = $$('button,[role="button"],input[type="submit"]').find(b => isVisible(b) && !b.disabled &&
+        /^(verify|confirm|submit|continue|next)$/i.test(txt(b) || b.value || ''));
+      if (verify) realClick(verify);
+    }
+    async function skipForCode(why) {
+      if (pin.gaveUp) return;
+      pin.gaveUp = true;
+      LOG(`Oracle: ${why}`);
+      if (Date.now() - _manualTriggerTs < 90_000) return;        // you are here: it's yours to type
+      requestSkipCurrent(`Oracle: ${why}`);
+    }
+    async function handlePin() {
+      if (!pin.since) { pin = { since: Date.now(), typed: '', resent: false, gaveUp: false }; LOG('Oracle: "Confirm Your Identity" — a code was emailed'); }
+      if (pin.gaveUp) return;
+      const { ohGmailCodes } = await ST.get('ohGmailCodes');
+      if (ohGmailCodes !== true) return skipForCode('it wants the code it emailed — turn on "Read verification codes from my signed-in Gmail" in the Queue Manager to have it typed for you');
+      let r = null;
+      try {
+        r = await chrome.runtime.sendMessage({ type: 'OH_MAIL_FIND_CODE', hosts: [location.hostname],
+          companies: [txt($('h1,[class*="job-title" i]')).slice(0, 60)], since: pin.since });
+      } catch (_) {}
+      if (r && r.ok && r.code && r.code !== pin.typed) {
+        pin.typed = r.code;
+        LOG('Oracle: code found in your Gmail — typing it');
+        await typeCode(r.code);
+        return;
+      }
+      if (r && r.reason === 'gmail-not-signed-in') return skipForCode('Gmail is not signed in in this browser, so the emailed code can\'t be read');
+      if (!pin.resent && Date.now() - pin.since > 50_000) {
+        pin.resent = true;
+        const again = $$('a,button,[role="button"]').find(b => isVisible(b) && /send (a )?new code|resend( code)?/i.test(txt(b)));
+        if (again) { realClick(again); LOG('Oracle: no code yet — pressed "Send New Code"'); }
+      }
+      if (Date.now() - pin.since > 120_000) return skipForCode('no verification code arrived within 2 minutes');
+    }
+
+    /* ── pill buttons ── */
+    const PILL_SKIP_RE = /^(next|back|submit|continue|apply|cancel|close|save|verify|sign in|send new code|edit|add|remove|delete|upload|browse|attach|review|done|ok)\b/i;
+    const isPicked = b => b.getAttribute('aria-pressed') === 'true' || b.getAttribute('aria-checked') === 'true' ||
+      b.getAttribute('aria-selected') === 'true' || /(^|[\s_-])(selected|active|checked|is-selected)([\s_-]|$)/i.test(b.className || '');
+    function pillGroups() {
+      const byBox = new Map();
+      for (const b of $$('button,[role="radio"]')) {
+        if (!isVisible(b) || b.closest('header,nav,footer,[role="dialog"]')) continue;
+        const t = txt(b);
+        if (!t || t.length > 60 || PILL_SKIP_RE.test(t) || b.type === 'submit') continue;
+        let box = b.parentElement;
+        if (box && box.querySelectorAll('button,[role="radio"]').length < 2) box = box.parentElement;
+        if (!box) continue;
+        if (!byBox.has(box)) byBox.set(box, []);
+        byBox.get(box).push(b);
+      }
+      return [...byBox.entries()].filter(([, bs]) => bs.length >= 2 && bs.length <= 12);
+    }
+    function questionOf(box) {
+      const by = box.getAttribute('aria-labelledby');
+      const named = by && document.getElementById(by.split(/\s+/)[0]);
+      if (named && txt(named)) return txt(named);
+      for (let n = box, i = 0; n && i < 4; n = n.parentElement, i++) {
+        for (let sib = n.previousElementSibling; sib; sib = sib.previousElementSibling) {
+          const t = txt(sib);
+          if (t && t.length >= 3 && t.length <= 600 && !sib.querySelector('button,input,select,textarea')) return t;
+        }
+      }
+      return '';
+    }
+    const PREFER_NOT_RE = /prefer not|decline|do not wish|don[’']?t wish|not to (say|answer|disclose)|rather not|choose not|i do not want/i;
+    const EQUALITY_RE = /gender|transgender|sexual orientation|pronoun|disabilit|veteran|ethnic|\brace\b|religio|marital|\bsex\b|lgbt/i;
+    function choosePill(q, pills, p) {
+      const names = pills.map(b => txt(b).toLowerCase());
+      if (EQUALITY_RE.test(q)) { const i = names.findIndex(n => PREFER_NOT_RE.test(n)); if (i >= 0) return pills[i]; }
+      if (/consent|agree|acknowledge|accept/i.test(q)) {
+        const i = names.findIndex(n => /^(i\s+)?(consent|agree|accept|acknowledge|yes)\b/.test(n) && !/\b(not|don[’']?t)\b/.test(n));
+        if (i >= 0) return pills[i];
+      }
+      const a = String(guessValue(q, p, 'radio') || '').trim().toLowerCase();
+      if (!a) return null;
+      let i = names.findIndex(n => n === a);
+      if (i < 0) i = names.findIndex(n => n.startsWith(a) || a.startsWith(n));
+      if (i < 0 && /^(yes|no)\b/.test(a)) i = names.findIndex(n => n.split(/\W/)[0] === a.split(/\W/)[0]);
+      return i >= 0 ? pills[i] : null;
+    }
+    async function answerPills(p) {
+      let n = 0;
+      for (const [box, pills] of pillGroups()) {
+        if (pills.some(isPicked)) continue;
+        const q = questionOf(box);
+        if (!q || !(/\*/.test(q) || EQUALITY_RE.test(q))) continue;
+        if (!settled('pill|' + q)) continue;
+        const pick = choosePill(q.replace(/\*/g, ''), pills, p);
+        if (!pick) continue;
+        realClick(pick);
+        n++;
+        LOG(`Oracle: "${q.slice(0, 70)}" → ${txt(pick)}`);
+        await sleep(250);
+      }
+      return n;
+    }
+
+    /* ── typeaheads ── */
+    const NO_RESULTS_RE = /no results (were )?found|no matches/i;
+    function listFor(inp) {
+      const id = inp.getAttribute('aria-controls') || inp.getAttribute('aria-owns') || inp.getAttribute('list');
+      return id ? document.getElementById(id) : null;
+    }
+    function optionsFor(inp) {
+      const list = listFor(inp);
+      const scope = list || inp.closest('[class*="select" i],[class*="combobox" i],[class*="typeahead" i],.input-row,.apply-flow-input') || document;
+      return $$('[role="option"],li[class*="list-item" i],li[class*="option" i]', scope)
+        .filter(o => isVisible(o) && !NO_RESULTS_RE.test(txt(o)));
+    }
+    function showsNoResults(inp) {
+      const list = listFor(inp);
+      if (list && isVisible(list) && NO_RESULTS_RE.test(txt(list))) return true;
+      const box = inp.closest('[class*="select" i],[class*="combobox" i],[class*="typeahead" i],.input-row,.apply-flow-input');
+      return !!(box && $$('*', box).some(e => e.children.length === 0 && isVisible(e) && NO_RESULTS_RE.test(txt(e))));
+    }
+    const words = s => String(s || '').toLowerCase().split(/[^a-z0-9]+/).filter(w => w.length > 1);
+    function closest(opts, wanted) {
+      const w = new Set(words(wanted));
+      let best = null, score = -1;
+      for (const o of opts) {
+        const ow = words(txt(o));
+        const sc = ow.filter(x => w.has(x)).length / Math.max(1, Math.max(ow.length, w.size));
+        if (sc > score) { score = sc; best = o; }
+      }
+      return best;
+    }
+    async function search(inp, queries, wanted) {
+      for (const qy of queries) {
+        if (!qy) continue;
+        inp.focus();
+        nativeSet(inp, '');
+        await sleep(80);
+        nativeSet(inp, qy);
+        inp.dispatchEvent(new KeyboardEvent('keydown', { key: qy.slice(-1), bubbles: true }));
+        inp.dispatchEvent(new KeyboardEvent('keyup', { key: qy.slice(-1), bubbles: true }));
+        let opts = [];
+        for (let i = 0; i < 15 && !opts.length; i++) { await sleep(200); opts = optionsFor(inp); }
+        if (!opts.length) continue;
+        const pick = closest(opts, wanted) || opts[0];
+        realClick(pick);
+        await sleep(350);
+        return txt(pick);
+      }
+      return '';
+    }
+    const isPostal = inp => /postal|zip|post ?code|eircode/i.test(getLabel(inp) || inp.name || inp.id || '');
+    async function fixTypeaheads() {
+      let n = 0;
+      for (const inp of $$('input[role="combobox"],input[aria-autocomplete="list"],input[aria-autocomplete="both"]').filter(isVisible)) {
+        const label = getLabel(inp) || '';
+        if (isPostal(inp)) {
+          if ((inp.value || '').trim().toUpperCase() === ORACLE_POSTCODE && !showsNoResults(inp)) continue;
+          if (!settled('postal')) continue;
+          const got = await search(inp, [ORACLE_POSTCODE, ORACLE_POSTCODE.split(' ')[0]], ORACLE_POSTCODE);
+          if (!got) { nativeSet(inp, ORACLE_POSTCODE); inp.blur(); }
+          LOG(`Oracle: postal code → ${got || ORACLE_POSTCODE}`);
+          n++;
+          continue;
+        }
+        const v = (inp.value || '').trim();
+        if (!v) continue;
+        /* Suggestions left open under a box nobody is typing in: the value
+           was typed but never picked. Pick the closest. */
+        const open = optionsFor(inp);
+        if (!showsNoResults(inp) && open.length && document.activeElement !== inp && settled('open|' + label)) {
+          const pick = closest(open, v);
+          if (pick) { realClick(pick); LOG(`Oracle: "${label.slice(0, 40)}" — picked the suggestion "${txt(pick)}" for "${v}"`); n++; await sleep(300); }
+          continue;
+        }
+        if (!showsNoResults(inp) || !settled('ta|' + label)) continue;
+        const ws = words(v);
+        const queries = [ws[0], v.slice(0, 4)];
+        if (EQUALITY_RE.test(label)) queries.push('decline', 'prefer not', 'not to');
+        const got = await search(inp, queries, v);
+        LOG(`Oracle: "${label.slice(0, 40)}" had no match for "${v}" → ${got || 'still no suggestion'}`);
+        if (got) n++;
+      }
+      return n;
+    }
+
+    /* ── address lines ── */
+    const COUNTRY_ONLY_RE = /^(united kingdom|great britain|england|ireland|republic of ireland|united states( of america)?|usa|us|uk|canada|germany|france|india|nigeria|australia|netherlands|spain|italy|portugal|poland)$/i;
+    function fixAddress(p) {
+      const fields = $$('input').filter(isVisible);
+      const line1 = fields.find(i => /address (line )?1|street address|^address$/i.test(getLabel(i) || ''));
+      const line2 = fields.find(i => /address (line )?2/i.test(getLabel(i) || ''));
+      if (!line1 || !COUNTRY_ONLY_RE.test((line1.value || '').trim())) return;
+      const street = (p.street || '').trim() || (line2 && /\d/.test(line2.value || '') ? line2.value.trim() : '');
+      if (!street) return;
+      nativeSet(line1, street);
+      if (line2 && line2.value.trim() === street) nativeSet(line2, '');
+      LOG(`Oracle: Address Line 1 had the country ("${line1.value}") — street put there instead`);
+    }
+
+    async function tick() {
+      if (busy || wdEngineOwns()) return;
+      if (!(await active())) return;
+      busy = true;
+      try {
+        if (onPinScreen()) { await handlePin(); return; }
+        pin.since = 0;
+        const p = await getProfile();
+        fixAddress(p);
+        await answerPills(p);
+        await fixTypeaheads();
+      } catch (e) {
+        LOG('Oracle helper error', e);
+      } finally { busy = false; }
+    }
+    setInterval(tick, 1500);
+  })();
+
   /* ── Auto-submit when OptimHire says "Review and submit the form" ────
    * OptimHire fills the form with its own engine and then stops, showing
    * "Review and submit the form" / "Form filled", waiting for a human to

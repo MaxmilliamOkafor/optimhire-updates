@@ -63,6 +63,15 @@
  *    doesn't answer within 8 s the message goes to OptimHire's filler as
  *    before. ohWdEngineOff: true in storage turns it off.
  *
+ * 10. Verification codes from the Gmail you are signed in to (opt-in:
+ *    ohGmailCodes, Queue Manager → Workday sign-in). Oracle's "Confirm Your
+ *    Identity" (and Workday / others) email a code; a content script asks
+ *    OH_MAIL_FIND_CODE and this reads Gmail's own unread-inbox feed
+ *    (mail.google.com/mail/feed/atom — what Gmail notifiers read): only mail
+ *    from the last 15 minutes, newer than the code screen, that reads like a
+ *    verification email. Read-only; nothing is stored. Ported from the
+ *    Jobright build (ua-mailbox.js).
+ *
  * Wiring: manifest.json background.service_worker points here. On an
  * OptimHire update, copy the new index.js in and keep this entry point.
  * Same directory as index.js on purpose, so nothing that resolves paths
@@ -465,6 +474,78 @@
           return { base64: btoa(bin), mime: mime };
         });
       }).then(reply, function () { reply(null); });
+      return true;
+    });
+  } catch (_) {}
+
+  /* 10. Verification codes from the signed-in Gmail. */
+  var MAIL_MAX_AGE_MS = 15 * 60000;
+  var MAIL_LABELS = ['', '%5Esq_ig_i_notification'];      // the inbox, and Gmail's "Updates" tab
+  var VERIFY_WORDS_RE = /verif|confirm|identity|one.?time|passcode|security code|your code|code requested|pin\b|otp\b|sign.?in code|log.?in code/i;
+  var CODE_NEAR_RE = /(?:code|pin|passcode|otp)[^0-9]{0,80}?\b(\d{4,8})\b/i;
+  function xmlText(x) {
+    return String(x || '').replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, '$1').replace(/&amp;/g, '&').replace(/&lt;/g, '<')
+      .replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&#39;|&apos;/g, "'").replace(/\s+/g, ' ').trim();
+  }
+  function xmlTag(block, name) {
+    var m = block.match(new RegExp('<' + name + '\\b[^>]*>([\\s\\S]*?)</' + name + '>', 'i'));
+    return m ? xmlText(m[1]) : '';
+  }
+  function parseAtom(xml) {
+    var out = [], re = /<entry\b[\s\S]*?<\/entry>/gi, m;
+    while ((m = re.exec(String(xml || '')))) {
+      var b = m[0], author = (b.match(/<author\b[\s\S]*?<\/author>/i) || [''])[0];
+      out.push({ title: xmlTag(b, 'title'), summary: xmlTag(b, 'summary'),
+                 issued: Date.parse(xmlTag(b, 'issued') || xmlTag(b, 'modified')) || 0,
+                 from: (xmlTag(author, 'name') + ' ' + xmlTag(author, 'email')).trim() });
+    }
+    return out;
+  }
+  async function findCodeInGmail(hints) {
+    var since = Number(hints.since) || 0;
+    var cutoff = Math.max(Date.now() - MAIL_MAX_AGE_MS, since - 60000);
+    var tokens = [];
+    (hints.hosts || []).concat(hints.companies || []).forEach(function (h) {
+      String(h || '').toLowerCase().split(/[^a-z0-9]+/).forEach(function (w) {
+        if (w.length > 2 && !/^(www|com|net|org|jobs|careers|apply|oraclecloud|oracle|fa|ocs|myworkdayjobs|wd\d+|hcmui)$/.test(w) && tokens.indexOf(w) < 0) tokens.push(w);
+      });
+    });
+    var found = [], signedIn = false;
+    for (var u = 0; u < 4; u++) {
+      for (var li = 0; li < MAIL_LABELS.length; li++) {
+        var res;
+        try { res = await _fetch('https://mail.google.com/mail/u/' + u + '/feed/atom/' + MAIL_LABELS[li], { credentials: 'include', cache: 'no-store' }); }
+        catch (_) { continue; }
+        if (!res.ok) { if (li === 0) break; continue; }
+        var xml = await res.text();
+        if (!/<feed\b/i.test(xml)) { if (li === 0) break; continue; }
+        signedIn = true;
+        parseAtom(xml).forEach(function (e) {
+          if (e.issued && e.issued < cutoff) return;
+          var text = e.title + ' ' + e.summary;
+          if (!VERIFY_WORDS_RE.test(text)) return;
+          var m = text.match(CODE_NEAR_RE) || text.match(/\b(\d{6})\b/);
+          if (!m) return;
+          var hay = (e.from + ' ' + text).toLowerCase();
+          found.push({ code: m[1], issued: e.issued, tie: tokens.some(function (t) { return hay.indexOf(t) >= 0; }) ? 1 : 0 });
+        });
+      }
+    }
+    if (!signedIn) return { ok: false, reason: 'gmail-not-signed-in' };
+    if (!found.length) return { ok: false, reason: 'no-message' };
+    found.sort(function (a, b) { return (b.tie - a.tie) || (b.issued - a.issued); });
+    return { ok: true, code: found[0].code, tie: !!found[0].tie };
+  }
+  try {
+    chrome.runtime.onMessage.addListener(function (msg, sender, reply) {
+      if (!msg || msg.type !== 'OH_MAIL_FIND_CODE' || sender.id !== chrome.runtime.id) return;
+      chrome.storage.local.get(['ohGmailCodes'], function (d) {
+        if (!d || d.ohGmailCodes !== true) { reply({ ok: false, reason: 'off' }); return; }
+        var hosts = Array.isArray(msg.hosts) ? msg.hosts.slice(0, 6) : [];
+        if (!hosts.length && sender.tab && sender.tab.url) { try { hosts.push(new URL(sender.tab.url).hostname); } catch (_) {} }
+        findCodeInGmail({ hosts: hosts, companies: (msg.companies || []).slice(0, 3), since: msg.since })
+          .then(reply, function (e) { reply({ ok: false, reason: String((e && e.message) || e) }); });
+      });
       return true;
     });
   } catch (_) {}
