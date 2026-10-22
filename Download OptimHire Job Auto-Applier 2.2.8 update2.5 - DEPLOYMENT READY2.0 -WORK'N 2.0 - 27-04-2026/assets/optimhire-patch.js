@@ -4397,8 +4397,10 @@
     } catch (_) { return null; }
   }
 
-  /* Queue Manager → "Tailor CV to each job" (ohTailorCv — off unless you turn
-     it on): on a CSV job the CV uploaded is your CV with its skills and each
+  /* "Tailor CV to each job" (ohTailorCv — off unless you turn it on; Queue
+     Manager / the panel's card; OptimHire's own runs then use its "Optimize My
+     Resume" step, oh-bg.js 13; Workday keeps your own CV either way): on a CSV
+     job the CV uploaded is your CV with its skills and each
      role's bullets ordered by this page's job description — nothing reworded
      or added (the Workday engine's keyword tailoring + PDF, assets/wd-cvtext.js,
      loaded only then). Your own CV whenever that can't be done: no job
@@ -4443,6 +4445,7 @@
   function tailoredResumeFile(url, filename) {
     const key = location.href.split('#')[0];
     if (!_tailoredFiles.has(key)) _tailoredFiles.set(key, (async () => {
+      if (CURRENT_ATS === 'Workday' || /myworkday(jobs|site)?\.com$|workdayjobs\.com$/i.test(HOST)) return null;   // Workday keeps your own CV
       const d = await ST.get(['ohTailorCv', 'ohJobQueueActive', 'ohJobQueue', 'ohCvProfile', 'ohWorkdayProfile']);
       if (d.ohTailorCv !== true || !d.ohJobQueueActive) return null;
       const here = await tabUrl();

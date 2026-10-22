@@ -94,7 +94,7 @@
   'use strict';
   var KEYS = ['copilotTabId', 'isAutoProcessStartJob', 'isManuallyStartJob', 'autoApplyState',
               'ohRunStats', 'ohJobQueueActive', 'ohJobQueue', 'ohAutomationDisabled', 'ohPreferAts',
-              'ohAutoApplyEngaged', 'ohAutoApplyEngagedTs', 'ohAutoPressTs', 'preferredJobsite', 'ohWdEngineOff', 'ohPauseOthers'];
+              'ohAutoApplyEngaged', 'ohAutoApplyEngagedTs', 'ohAutoPressTs', 'preferredJobsite', 'ohWdEngineOff', 'ohPauseOthers', 'ohTailorCv'];
   var state = { tab: null, live: false, loaded: false };
   var ohSuccessWatch = null;      // OptimHire's handler, once it registers it
   var registered = null;          // { fn, tab } currently registered with Chrome
@@ -464,10 +464,38 @@
       });
     });
   }
+  /* 13. Your own CV unless "Tailor CV to each job" is on (ohTailorCv — Queue Manager / the
+     panel's card). Off: before OptimHire starts a job, its "Optimize My Resume" step is set
+     to skip (its own "hide for 24 h", resumeHide24Hr, kept fresh), so the CV on your profile
+     is the one uploaded. On: that hide is lifted again (only if it was set here) and OptimHire
+     tailors as it always did. Workday jobs keep your own CV either way (the Workday engine). */
+  var _ownCvSent = new WeakSet();
+  function keepOwnCv() {
+    if (snap.ohTailorCv === true) return Promise.resolve();
+    return new Promise(function (resolve) {
+      try { chrome.storage.local.set({ resumeHide24Hr: { hideFor24hr: true, hideTimestamp: Date.now() }, ohResumeHideByUs: true }, function () { void chrome.runtime.lastError; resolve(); }); }
+      catch (_) { resolve(); }
+    });
+  }
+  try {
+    chrome.storage.onChanged.addListener(function (c, area) {
+      if (area !== 'local' || !c.ohTailorCv || c.ohTailorCv.newValue !== true) return;
+      chrome.storage.local.get(['ohResumeHideByUs'], function (d) {
+        if (d && d.ohResumeHideByUs) chrome.storage.local.remove(['resumeHide24Hr', 'ohResumeHideByUs']);
+      });
+    });
+  } catch (_) {}
+
   if (tabsApi && typeof tabsApi.sendMessage === 'function') {
     var origSend = tabsApi.sendMessage.bind(tabsApi);
     tabsApi.sendMessage = function (tabId, msg) {
       var args = arguments;
+      if (msg && typeof msg === 'object' && (msg.type === 'FILL_COMPLEX_FORM' || msg.type === 'MANUALLY_FORM_SUBMIT') &&
+          snap.ohTailorCv !== true && typeof args[args.length - 1] !== 'function' && !_ownCvSent.has(msg)) {
+        _ownCvSent.add(msg);
+        var again = Array.prototype.slice.call(args);
+        return keepOwnCv().then(function () { return tabsApi.sendMessage.apply(tabsApi, again); });
+      }
       try {
         if (msg && msg.type === 'FILL_COMPLEX_FORM' && typeof tabId === 'number' &&
             typeof args[args.length - 1] !== 'function' && snap.ohAutomationDisabled !== true && snap.ohWdEngineOff !== true) {

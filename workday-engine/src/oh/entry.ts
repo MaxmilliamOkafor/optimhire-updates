@@ -4,9 +4,9 @@
  * (built to assets/wd-engine.js).
  *
  * During an OptimHire run oh-bg.js hands each Workday job here (oh:wd:start)
- * instead of to OptimHire's own filler. This then does what OptimHire does
- * for any site — its job-closed check, its "Optimize My Resume" screen —
- * and lets the engine apply: sign in / create the account, upload the CV,
+ * instead of to OptimHire's own filler. This then runs OptimHire's job-closed
+ * check and lets the engine apply: sign in / create the account, upload your
+ * own CV (Workday never gets a tailored copy),
  * fill every step, answer questions (Q&A memory first, then OptimHire's
  * answer service, then the profile rules) and press Submit. The result goes
  * back to OptimHire as COMPLEX_FORM_SUCCESS / COMPLEX_FORM_ERROR, so its
@@ -27,10 +27,9 @@
  * the page, from chrome.storage.local — the service worker never sees them.
  */
 import { autoResume, isActive, startRun, stopRun } from "../workday/engine.js";
-import { activeStepName, detectPage, hasWorkdayApp, isWorkdayHost, scrapeJob, tenantHost } from "../workday/detect.js";
+import { activeStepName, detectPage, hasWorkdayApp, isWorkdayHost, tenantHost } from "../workday/detect.js";
 import { similarity } from "../workday/dom.js";
-import { getJob, getLastJobKey, getRun, normalizeLabel, normalizeProfile } from "../workday/store.js";
-import { tailoredCv } from "../cv/tailorcv.js";
+import { normalizeLabel, normalizeProfile } from "../workday/store.js";
 import { setHooks, type OpenQuestion, type Outcome } from "../workday/ohHooks.js";
 import type { ControlKind } from "../workday/controls.js";
 import { DEFAULT_WD_SETTINGS, type PageKind, type Profile, type RunState, type StoredDoc, type WorkdaySettings } from "../workday/types.js";
@@ -44,7 +43,6 @@ const MODE_KEY = "ohWdRun";               // sessionStorage: this tab's engine r
 const MODE_TTL = 20 * 60_000;
 const LOG_KEY = "ohWdEngineLog";          // chrome.storage.local: last runs, for diagnostics
 const LOGIN_KEY = "ohWorkdayLogin";       // shared with the Queue Manager's "Workday sign-in"
-const RESUME_IFRAME = "optimhire-resume-score-record";
 const SEEKER_KEY = "ohWdSeeker";          // your details from the last OptimHire job, for "Autofill this page"
 const CV_KEY = "ohCvProfile";             // roles / education / skills read from your CV (by its URL)
 
@@ -586,70 +584,6 @@ async function fetchCv(url: string, p: Profile): Promise<StoredDoc | undefined> 
   return { fileName: `${who}-Resume.${ext}`, mime: MIME[ext] || mime || "application/pdf", base64 };
 }
 
-/* ---------------- your CV tailored to this job (optional) ---------------- */
-
-/* Queue Manager → "Tailor CV to each job" (ohTailorCv, off unless you turn it on): a CSV job uploads
-   your CV with its skills and bullets ordered by this job's description — made once per job; your own
-   CV whenever that can't be done (no roles read from your CV, no job description). */
-let tailored: { key: string; doc: Promise<StoredDoc | undefined> } | null = null;
-async function tailoredForJob(profile: Profile): Promise<StoredDoc | undefined> {
-  if ((await ST.get("ohTailorCv")).ohTailorCv !== true) return undefined;
-  // The run's CV is settled when it starts — on the job posting itself, whose description is read here.
-  const run = await getRun(tenantHost());
-  const last = await getLastJobKey(tenantHost());
-  const here = location.href.replace(/[?#].*$/, "").replace(/\/apply.*$/, "");
-  const saved = (run?.jobKey ? await getJob(run.jobKey) : undefined) ?? (last ? await getJob(last) : undefined);
-  const job = scrapeJob() ?? (saved && saved.url.replace(/[?#].*$/, "") === here ? saved : undefined);   // never another job's description
-  if (!job) return undefined;
-  if (tailored?.key !== job.key) {
-    tailored = {
-      key: job.key,
-      doc: within(cvReady, 30_000).then(() => {
-        const doc = tailoredCv(profile, { title: job.title, description: job.description, location: job.location, url: job.url });
-        say(doc ? `CV tailored to this job (${doc.keywords.slice(0, 6).join(", ")})` : "CV not tailored (no roles read from your CV or no job description) — your own CV");
-        return doc ?? undefined;
-      }, () => undefined),
-    };
-  }
-  return tailored.doc;
-}
-
-/* ---------------- OptimHire's "Optimize My Resume" screen ---------------- */
-
-/** The same tailoring step OptimHire runs on every other site (resume-auto.js presses through it). */
-async function tailorResume(): Promise<void> {
-  const d = await ST.get(["resumeHide24Hr", "candidateDetails", "active_copilot_job_id", "complexFormData", "ohWdSkipTailor"]);
-  if (d.ohWdSkipTailor === true) return;
-  const h = d.resumeHide24Hr;
-  if (h?.hideFor24hr && h.hideTimestamp && Date.now() - h.hideTimestamp < 864e5) return;   // your "hide for 24 h"
-  if (!document.body || document.getElementById(RESUME_IFRAME)) return;
-  const f = document.createElement("iframe");
-  f.id = RESUME_IFRAME;
-  f.src = chrome.runtime.getURL("tabs/resumeScoreRecord.html");
-  f.style.cssText = "position:fixed;top:0;left:0;width:100%;height:100%;border:none;z-index:2147483647;background:transparent";
-  const overflow = document.body.style.overflow;
-  document.body.style.overflow = "hidden";
-  f.addEventListener("load", () => {
-    setTimeout(() => {
-      f.contentWindow?.postMessage(
-        { type: "INIT_RESUME_SCORE_RECORD_DATA", payload: { candidateDetails: d.candidateDetails, active_copilot_job_id: d.active_copilot_job_id, complexFormData: d.complexFormData } },
-        "*"
-      );
-    }, 500);
-  });
-  const onMsg = (e: MessageEvent) => {
-    if (e.data && e.data.action === "closeResumeScreen") f.remove();
-  };
-  window.addEventListener("message", onMsg);
-  document.body.appendChild(f);
-  await ST.set({ opneResumeModel: true });
-  const start = Date.now();
-  while (f.isConnected && Date.now() - start < 150_000) await new Promise((r) => setTimeout(r, 300));
-  window.removeEventListener("message", onMsg);
-  f.remove();
-  document.body.style.overflow = overflow;
-}
-
 /* ---------------- answers: Q&A memory, then OptimHire ---------------- */
 
 const answerCache = new Map<string, string>();
@@ -695,9 +629,10 @@ async function installHooks(mode: Mode): Promise<void> {
   const { complexFormData, updatedResume } = await ST.get(["complexFormData", "updatedResume"]);
   const ad = mode.auto ? parse(complexFormData).applicationDetails : undefined;
   const src = await profileSources(ad);
-  // OptimHire's tailored CV for this job, else the CV on your OptimHire profile.
+  // The CV on your OptimHire profile.
   const own = pick(ad?.seeker || {}, "resume") || pick(src, "resume", "resume_url", "resumeUrl", "cv_url", "cv") || (await primaryCvUrl());
-  const cvUrl = mode.auto ? updatedResume || own : own || updatedResume;
+  // Workday keeps your own CV (OptimHire's tailored one only when your profile has none).
+  const cvUrl = own || updatedResume;
   // Your history is read from your own CV (the same every job), not a per-job tailored copy.
   const profile = await buildProfile(ad, own || cvUrl);
   let cv: Promise<StoredDoc | undefined> | null = null;
@@ -705,10 +640,7 @@ async function installHooks(mode: Mode): Promise<void> {
   setHooks({
     profile: async () => profile,
     settings: async () => (mode.assist ? ASSIST_SETTINGS() : SETTINGS),
-    masterCv: async () => {
-      const own = await (cv ??= fetchCv(cvUrl, profile).catch(() => undefined));
-      return (mode.queue && (await tailoredForJob(profile))) || own;
-    },
+    masterCv: () => (cv ??= fetchCv(cvUrl, profile).catch(() => undefined)),
     autoSubmit: () => mode.submit,
     ...(mode.assist ? { advance: () => false } : {}),
     prefetch: (qs) => askOptimHire(qs),
@@ -820,7 +752,6 @@ async function startFromOptimHire(msg: Any): Promise<void> {
   const checkCi = ci && typeof ci === "object" ? { ...ci, requiresLogin: false } : ci;
   const st = (await within(chrome.runtime.sendMessage({ type: "CHECK_APPLICATION_STATUS", complexInstructions: checkCi, applicationDetails: ad }), 30_000).catch(() => null)) as Any;
   if (st?.isJobClose) { clearMode(); say("OptimHire says the job is closed"); return; }
-  await tailorResume();
   if (!readMode()) { say("stopped before the form was started"); return; }
   if (toApplyManually()) return;
   await installHooks(mode);

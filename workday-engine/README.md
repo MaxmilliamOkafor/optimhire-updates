@@ -10,8 +10,8 @@ OptimHire hands every job to a filler with `FILL_COMPLEX_FORM`. For a Workday ta
 adapter (`src/oh/entry.ts`) then:
 
 1. runs OptimHire's own job-closed check (`CHECK_APPLICATION_STATUS`);
-2. shows OptimHire's "Optimize My Resume" screen, as on every other site, and uses
-   the tailored CV it produces (`updatedResume`), else the CV on your OptimHire profile;
+2. uses your own CV — the one on your OptimHire profile (Workday never gets a
+   tailored copy; OptimHire's "Optimize My Resume" step is not shown here);
 3. builds the engine's profile from OptimHire's details for you (name, e-mail,
    phone, address, LinkedIn, salary…), plus the full profile you can import in the
    Queue Manager (work history, education, skills);
@@ -23,11 +23,13 @@ adapter (`src/oh/entry.ts`) then:
    counts, auto-skip and next job work as before. Each run is kept in
    `ohWdEngineLog` (it shows up in your diagnostics).
 
-CSV-queue jobs upload your own CV unchanged. With Queue Manager → "Tailor CV to
-each job" on (`ohTailorCv`), they upload a copy instead: your skills and each role's
-bullets ordered by the job description's keywords (`tailor.ts` keyword mode — nothing
-reworded or added), rendered by `render.ts` / `pdf.ts`. Other job sites get the same
-copy through `assets/wd-cvtext.js` (`window.__ohCv.tailor`, `src/cv/tailorcv.ts`).
+Other job sites upload your own CV too, unless "Tailor CV to each job" is on
+(`ohTailorCv`, Queue Manager / the panel's card): then OptimHire's own runs use its
+"Optimize My Resume" step, and CSV-queue jobs a copy of your CV with your skills and
+each role's bullets ordered by the job description's keywords (`tailor.ts` keyword
+mode — nothing reworded or added), rendered by `render.ts` / `pdf.ts` and built in
+`assets/wd-cvtext.js` (`window.__ohCv.tailor`, `src/cv/tailorcv.ts`). Workday keeps
+your own CV either way.
 
 "Autofill this page" on a Workday page runs the engine too and stops on Review (or
 asks you for what it can't answer). `ohWdEngineOff: true` (the switch in Queue

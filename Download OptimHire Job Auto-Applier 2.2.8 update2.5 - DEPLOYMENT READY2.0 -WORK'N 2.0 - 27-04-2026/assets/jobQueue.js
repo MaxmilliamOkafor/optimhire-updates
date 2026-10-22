@@ -830,8 +830,8 @@
     /* Off: every job gets your own CV, unchanged. On: a copy ordered to the job (oh: optimhire-patch.js, wd-engine.js). */
     on('tailorCv', 'change', (e) => {
       ST.set({ ohTailorCv: !!e.target.checked });
-      toast(e.target.checked ? 'Each job gets your CV with its skills and bullets ordered to the job description'
-                             : 'Each job gets your own CV, unchanged', 'info');
+      toast(e.target.checked ? 'CV tailored to each job (Workday keeps your own)'
+                             : 'Your own CV on every job, unchanged', 'info');
     });
 
     /* Watch storage so the running indicator + statuses stay live AND

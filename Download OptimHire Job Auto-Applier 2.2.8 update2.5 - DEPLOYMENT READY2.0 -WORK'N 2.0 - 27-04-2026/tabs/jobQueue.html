@@ -222,7 +222,7 @@
         <label class="switch-inline" title="Apply to jobs on company ATS sites (Greenhouse, Lever, Workday…) first, then company career sites, then job boards, and Reed last. Also applies to OptimHire's own auto-apply queue.">
           <input type="checkbox" id="preferAts" checked><span class="sw"></span>ATS first, Reed last
         </label>
-        <label class="switch-inline" title="Off: every job gets your own CV, unchanged. On: each job gets a copy of your CV with your skills and each role's bullets ordered by how well they match that job's description — nothing reworded or added — as a plain, ATS-friendly PDF. Your own CV is used whenever a job has no description to match.">
+        <label class="switch-inline" title="Off: your own CV, unchanged, on every job (OptimHire's &quot;Optimize My Resume&quot; step is skipped). On: OptimHire's runs use its &quot;Optimize My Resume&quot;; CSV jobs get a copy of your CV with your skills and each role's bullets ordered by how well they match the job description — nothing reworded or added — as a plain, ATS-friendly PDF (your own CV when a job has no description). Workday jobs always keep your own CV.">
           <input type="checkbox" id="tailorCv"><span class="sw"></span>Tailor CV to each job
         </label>
         <button id="btnStop" class="btn-danger" disabled><svg class="i" viewBox="0 0 16 16" aria-hidden="true"><rect x="4" y="4" width="8" height="8" rx="1.5" fill="currentColor"/></svg>Stop</button>
