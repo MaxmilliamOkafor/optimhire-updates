@@ -6937,7 +6937,8 @@
     try {
       const d = await ST.get([WD_LOGIN_KEY]);
       const login = Object.assign({ sites: {} }, d[WD_LOGIN_KEY] || {});
-      login.sites = Object.assign({}, login.sites, { [HOST]: { state, ts: Date.now() } });
+      const prev = (login.sites || {})[HOST] || {};     // merged: the site's own password / tries are kept
+      login.sites = Object.assign({}, login.sites, { [HOST]: Object.assign({}, prev, { state, ts: Date.now() }) });
       await ST.set({ [WD_LOGIN_KEY]: login });
     } catch (_) {}
   }

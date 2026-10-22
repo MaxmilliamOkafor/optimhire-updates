@@ -8,6 +8,12 @@
  * sign-in itself is done by the Workday engine (assets/wd-engine.js), or by
  * assets/optimhire-patch.js when the engine is off.
  *
+ * Per site: an account made before with another password, or locked, is not
+ * signed in to again (lockout-safe) until you give that site's password here
+ * or press Retry; your other passwords (otherPasswords) are tried once each;
+ * with emailed codes on, the password is reset from the emailed link
+ * (resetByEmail, on unless switched off).
+ *
  * Also: reading emailed verification codes from the signed-in Gmail
  * (ohGmailCodes, opt-in — oh-bg.js 10), the Workday engine's on/off switch (ohWdEngineOff) and the optional
  * full profile it uses (ohWorkdayProfile — work history, education, skills),
@@ -45,9 +51,10 @@
     return pw.length >= 8 && /[A-Z]/.test(pw) && /[a-z]/.test(pw) && /\d/.test(pw) && /[^A-Za-z0-9]/.test(pw);
   }
   var STATE_TEXT = {
-    'account': 'account ready',
-    'verify': 'wants its e-mail link clicked first — skipped',
-    'other-password': 'has an account with another password — skipped',
+    'account': 'Account ready',
+    'verify': 'Wants its e-mail link clicked — skipped (turn on emailed codes to do it for you)',
+    'other-password': 'Account made before with another password — not tried again until you give it here',
+    'locked': 'Account locked — reset its password, then Retry',
   };
 
   function renderSites() {
@@ -58,9 +65,24 @@
     if (!hosts.length) { box.innerHTML = '<div class="qa-empty">No Workday site visited yet.</div>'; return; }
     box.innerHTML = '<table><thead><tr><th>Workday site</th><th>State</th><th></th></tr></thead><tbody>' +
       hosts.map(function (h) {
-        return '<tr><td>' + esc(h) + '</td><td>' + esc(STATE_TEXT[sites[h].state] || sites[h].state) + '</td>' +
-          '<td><button class="btn-small" data-wd-forget="' + esc(h) + '" title="Try this site again from scratch">Retry</button></td></tr>';
+        var st = sites[h].state, stuck = st === 'other-password' || st === 'locked';
+        var own = sites[h].password && sites[h].password !== login.password ? ' <small>(its own password saved)</small>' : '';
+        return '<tr><td>' + esc(h) + '</td><td>' + esc(STATE_TEXT[st] || st) + own +
+          (stuck ? '<div class="qa-tools" style="margin:6px 0 0"><input type="text" autocomplete="off" spellcheck="false" placeholder="This site\'s password" data-wd-pw="' + esc(h) + '">' +
+                   '<button class="btn-small" data-wd-pwsave="' + esc(h) + '">Save</button></div>' : '') +
+          '</td><td><button class="btn-small" data-wd-forget="' + esc(h) + '" title="Try this site again from scratch">Retry</button></td></tr>';
       }).join('') + '</tbody></table>';
+  }
+  /* A site's own password: tried first on its next job. */
+  function saveSitePassword(host) {
+    var input = document.querySelector('[data-wd-pw="' + (window.CSS && CSS.escape ? CSS.escape(host) : host) + '"]');
+    var pw = input ? input.value.trim() : '';
+    if (pw.length < 6) { toast('Enter that site\'s password', 'error'); return; }
+    var site = Object.assign({}, login.sites[host] || {});
+    site.password = pw; site.state = 'other-password'; site.tried = []; site.triedAt = 0;
+    login.sites[host] = site;
+    var o = {}; o[KEY] = login;
+    ST.set(o, function () { toast('Saved — its next job signs in with it', 'success'); renderSites(); });
   }
 
   function load(cb) {
@@ -109,6 +131,8 @@
     load(function () {
       $('wdEmail').value = login.email || '';
       $('wdPassword').value = login.password || '';
+      $('wdOtherPw').value = (login.otherPasswords || []).join('\n');
+      $('wdResetOn').checked = login.resetByEmail !== false;
       renderSites();
       renderEngine();
       $('wdModal').classList.remove('hidden');
@@ -120,6 +144,8 @@
     if (!strong(pw)) { toast('Password needs 8+ characters with upper, lower, a number and a symbol', 'error'); return; }
     login.email = $('wdEmail').value.trim();
     login.password = pw;
+    login.otherPasswords = $('wdOtherPw').value.split(/\n/).map(function (x) { return x.trim(); }).filter(function (x) { return x.length >= 6; }).slice(0, 5);
+    login.resetByEmail = $('wdResetOn').checked;
     var o = {}; o[KEY] = login;
     ST.set(o, function () { toast('Workday sign-in saved', 'success'); close(); });
   }
@@ -150,6 +176,14 @@
         toast($('gmailCodesOn').checked ? 'Verification codes will be read from your signed-in Gmail' : 'Verification codes: off', 'success');
       });
     });
+    $('wdResetOn').addEventListener('change', function () {
+      var on = $('wdResetOn').checked;
+      load(function () {
+        login.resetByEmail = on;
+        var o = {}; o[KEY] = login;
+        ST.set(o, function () { toast(on ? 'Passwords will be reset by email when they don\'t work' : 'Passwords are never reset for you', 'success'); });
+      });
+    });
     $('wdProfileImport').addEventListener('click', function () { $('wdProfileFile').value = ''; $('wdProfileFile').click(); });
     $('wdProfileFile').addEventListener('change', function () { var f = this.files && this.files[0]; if (f) importProfile(f); });
     $('wdProfileRemove').addEventListener('click', function () {
@@ -160,6 +194,8 @@
       if (e.target === modal) { close(); return; }
       var f = e.target && e.target.closest && e.target.closest('[data-wd-forget]');
       if (f) forget(f.getAttribute('data-wd-forget'));
+      var sv = e.target && e.target.closest && e.target.closest('[data-wd-pwsave]');
+      if (sv) saveSitePassword(sv.getAttribute('data-wd-pwsave'));
     });
     document.addEventListener('keydown', function (e) { if (e.key === 'Escape' && !modal.classList.contains('hidden')) close(); });
   }

@@ -241,8 +241,19 @@ async function handlePage(ctx: Ctx, page: PageKind): Promise<StepResult> {
     case "createAccount":
       await handleCreateAccount(ctx);
       return "continue";
-    case "verifyEmail":
+    case "verifyEmail": {
+      // [oh] The host can open the emailed link (your Gmail, opt-in); then the run signs in.
+      const r = (await chrome.runtime
+        .sendMessage({ type: "wd:auth:mailVerify", tenantHost: ctx.run.tenantHost, email: ctx.profile.personal.email, since: Date.now() - 10 * 60_000 })
+        .catch(() => null)) as { ok?: boolean } | null;
+      if (r?.ok) {
+        ctx.log("Email verified from the link Workday sent — signing in");
+        location.reload();
+        await sleep(15000);
+        return "continue";
+      }
       throw new NeedsHuman("Verify your email using the link Workday sent, sign in if asked, then click Resume.");
+    }
     case "resumeUpload":
       await resumeUpload(ctx);
       if (hooks.advance && !hooks.advance()) return pageFilled(ctx); // [oh]

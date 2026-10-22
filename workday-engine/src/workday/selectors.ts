@@ -32,6 +32,7 @@ export const AID = {
   signInSubmit: ["signInSubmitButton"],
   clickFilter: ["click_filter"],
   forgotPassword: ["forgotPasswordLink"],
+  forgotPasswordSubmit: ["forgotPasswordSubmitButton", "resetPasswordSubmitButton", "passwordResetSubmitButton"], // [oh]
 
   // Wizard chrome
   progressActive: ["progressBarActiveStep"],

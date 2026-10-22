@@ -455,6 +455,8 @@
     signInSubmit: ["signInSubmitButton"],
     clickFilter: ["click_filter"],
     forgotPassword: ["forgotPasswordLink"],
+    forgotPasswordSubmit: ["forgotPasswordSubmitButton", "resetPasswordSubmitButton", "passwordResetSubmitButton"],
+    // [oh]
     // Wizard chrome
     progressActive: ["progressBarActiveStep"],
     progressBar: ["progressBar"],
@@ -1390,6 +1392,47 @@
   }
 
   // src/workday/auth.ts
+  function isLocked(errs) {
+    return LOCKED_RX.test(errs) && !/(might|may|could) be locked|possibly locked/i.test(errs);
+  }
+  var FORGOT_RX = /forgot (your )?password|passwort vergessen|mot de passe oubli|olvid\S* (su |tu )?contraseña|esqueceu (a |sua )?senha|password dimenticata|wachtwoord vergeten|nie pamiętasz hasła/i;
+  async function askHost(msg) {
+    try {
+      return await chrome.runtime.sendMessage(msg) ?? null;
+    } catch {
+      return null;
+    }
+  }
+  async function resetByEmail(ctx, email) {
+    const link = byAid("forgotPassword") ?? buttonByText(FORGOT_RX);
+    if (!link || !email) return 'no "Forgot your password?" link here';
+    ctx.log("This employer already has an account with another password (or it is locked) — resetting it by email");
+    await humanClick(link);
+    await waitStable(600);
+    const em = byAid("email") ?? qa('input[type="email"]').find(isVisible) ?? null;
+    if (em) {
+      await setText(em, email);
+      await pace(ctx);
+    }
+    const btn = byAid("forgotPasswordSubmit") ?? buttonByText(/^(submit|reset( my)? password|send( reset)?( link| email)?|request( reset)?|continue|next)\b/i);
+    if (!btn) return "the reset form has no submit button";
+    const since = Date.now();
+    await humanClick(btn);
+    await sleep(400);
+    await waitStable(700, 15e3);
+    const r = await askHost({ type: "wd:auth:mailReset", tenantHost: ctx.run.tenantHost, email, since });
+    if (!r?.ok) return r?.reason || "the reset email didn't arrive";
+    ctx.log("Password reset from the emailed link — signing in with it");
+    const back = byAid("signInLink") ?? buttonByText(/^(back to |return to )?sign in$/i);
+    if (back) {
+      await humanClick(back);
+      await waitStable(600);
+    } else {
+      location.reload();
+      await sleep(15e3);
+    }
+    return null;
+  }
   async function getCreds(host2) {
     return await chrome.runtime.sendMessage({ type: "wd:cred:get", tenantHost: host2 });
   }
@@ -1420,6 +1463,12 @@
     if (captchaPresent()) throw new NeedsHuman("Solve the CAPTCHA, then click Resume.");
     const host2 = ctx.run.tenantHost;
     const creds = await getCreds(host2);
+    if (creds.blocked) throw new NeedsHuman(creds.blocked);
+    if (creds.reset) {
+      const why = await resetByEmail(ctx, emailFor(ctx, creds));
+      if (why) throw new NeedsHuman(`Couldn't reset the password by email (${why}). Reset it from the sign-in page, then retry the site in Queue Manager → Workday & sign-in.`);
+      return;
+    }
     const cred = creds.cred ?? (ctx.settings.useMasterPassword ? creds.master : null);
     if (!cred) {
       const create = byAid("createAccountLink") ?? buttonByText(CREATE_ACCOUNT_TEXT_RX);
@@ -1431,7 +1480,7 @@
       }
       throw new NeedsHuman("No saved password for this employer. Sign in yourself (it will be remembered if you use Create Account here), then click Resume.");
     }
-    if (ctx.run.authAttempts >= 2) {
+    if (ctx.run.authAttempts >= 5) {
       throw new NeedsHuman("Sign-in failed twice. Use 'Forgot password' or update the saved password in Workday settings, then click Resume.");
     }
     ctx.run.authAttempts++;
@@ -1445,9 +1494,18 @@
     await pace(ctx);
     await submit("signInSubmit", SIGN_IN_TEXT_RX);
     const errs = errorMessages().map((e) => e.text).join(" ");
-    if (AUTH_FAILED_RX.test(errs) || LOCKED_RX.test(errs)) {
-      if (LOCKED_RX.test(errs)) throw new NeedsHuman("This account is locked. Reset the password from the sign-in page, then click Resume.");
+    const locked = isLocked(errs);
+    if (AUTH_FAILED_RX.test(errs) || locked) {
       ctx.log(`Sign-in rejected: ${errs}`, "warn");
+      const next = await askHost({ type: "wd:auth:rejected", tenantHost: host2, password: cred.password, locked });
+      if (next?.retry) return;
+      if (next?.reset) {
+        const why = await resetByEmail(ctx, cred.email || emailFor(ctx, creds));
+        if (!why) return;
+        throw new NeedsHuman(`Couldn't reset the password by email (${why}). Reset it from the sign-in page, then retry the site in Queue Manager → Workday & sign-in.`);
+      }
+      if (next?.reason) throw new NeedsHuman(next.reason);
+      if (locked) throw new NeedsHuman("This account is locked. Reset the password from the sign-in page, then click Resume.");
       if (!creds.cred && ctx.run.createAttempts < 2) {
         const create = byAid("createAccountLink");
         if (create) {
@@ -1467,6 +1525,7 @@
     if (captchaPresent()) throw new NeedsHuman("Solve the CAPTCHA, then click Resume.");
     const host2 = ctx.run.tenantHost;
     const creds = await getCreds(host2);
+    if (creds.blocked) throw new NeedsHuman(creds.blocked);
     if (creds.cred && ctx.run.authAttempts < 2) {
       const link = byAid("signInLink") ?? buttonByText(SIGN_IN_TEXT_RX);
       if (link) {
@@ -1569,8 +1628,8 @@
   }
   function countryInText(text2, p) {
     const t = norm(text2);
-    const candidates = [...p.answers.authorizedCountries, p.personal.address.country, "united states", "united kingdom", "canada", "ireland", "germany", "france", "india", "australia", "netherlands", "spain", "singapore"];
-    return candidates.find((c) => c && t.includes(norm(c))) ?? null;
+    const candidates2 = [...p.answers.authorizedCountries, p.personal.address.country, "united states", "united kingdom", "canada", "ireland", "germany", "france", "india", "australia", "netherlands", "spain", "singapore"];
+    return candidates2.find((c) => c && t.includes(norm(c))) ?? null;
   }
   function authorizedFor(label, ctx) {
     const p = ctx.profile;
@@ -2453,8 +2512,16 @@ OPTIONS: ${JSON.stringify(options.slice(0, 150))}`
       case "createAccount":
         await handleCreateAccount(ctx);
         return "continue";
-      case "verifyEmail":
+      case "verifyEmail": {
+        const r = await chrome.runtime.sendMessage({ type: "wd:auth:mailVerify", tenantHost: ctx.run.tenantHost, email: ctx.profile.personal.email, since: Date.now() - 10 * 6e4 }).catch(() => null);
+        if (r?.ok) {
+          ctx.log("Email verified from the link Workday sent — signing in");
+          location.reload();
+          await sleep(15e3);
+          return "continue";
+        }
         throw new NeedsHuman("Verify your email using the link Workday sent, sign in if asked, then click Resume.");
+      }
       case "resumeUpload":
         await resumeUpload(ctx);
         if (hooks.advance && !hooks.advance()) return pageFilled(ctx);
@@ -2699,7 +2766,8 @@ OPTIONS: ${JSON.stringify(options.slice(0, 150))}`
     }
   }
   window.__ohWdEngine = {
-    owns: () => TOP && (!!readMode() || isActive() || assistOn && hasWorkdayApp()),
+    // …and the pages of Workday's emailed links, which the background fills in its own tab.
+    owns: () => TOP && (!!readMode() || isActive() || assistOn && hasWorkdayApp() || /passwordreset|resetpassword|\/activate\b|verifyemail|verifyaccount/i.test(location.pathname)),
     takesManual: () => TOP && hasWorkdayApp(),
     isWorkday: () => TOP && isWorkdayHost(),
     startQueueJob: (job) => void startQueueJob(job),
@@ -2742,23 +2810,61 @@ OPTIONS: ${JSON.stringify(options.slice(0, 150))}`
     return "Oh" + Array.from(r, (n) => abc[n % abc.length]).join("") + "!7q";
   }
   async function workdayLogin() {
-    const d = await ST.get([LOGIN_KEY, "appAccountEmail", "appAccountPassword"]);
+    const d = await ST.get([LOGIN_KEY, "appAccountEmail", "appAccountPassword", "ohGmailCodes"]);
     const login = Object.assign({ sites: {} }, d[LOGIN_KEY] || {});
     if (!login.password) {
       login.password = d.appAccountPassword || makePassword();
       await ST.set({ [LOGIN_KEY]: login });
     }
     const email = login.email || d.appAccountEmail || (await profileSources()).email || "";
-    return { email, password: login.password, login };
+    return { email, password: login.password, login, d };
   }
-  async function noteSite(state) {
+  async function noteSite(state, extra = {}, host2 = tenantHost()) {
     try {
       const d = await ST.get(LOGIN_KEY);
       const login = Object.assign({ sites: {} }, d[LOGIN_KEY] || {});
-      login.sites = Object.assign({}, login.sites, { [tenantHost()]: { state, ts: Date.now() } });
+      const prev = (login.sites || {})[host2] || {};
+      login.sites = Object.assign({}, login.sites, { [host2]: Object.assign({}, prev, { state, ts: Date.now() }, extra) });
       await ST.set({ [LOGIN_KEY]: login });
     } catch {
     }
+  }
+  var DAY = 24 * 36e5;
+  var MAX_TRIES = 3;
+  var RESET_EVERY = 30 * 6e4;
+  var OTHER_PW = "Your Workday account at this employer has a different password. Add it in Queue Manager → Workday & sign-in (or turn on emailed codes there so it can be reset), and its jobs will go through.";
+  var LOCKED = "Your Workday account at this employer is locked. Reset its password from the sign-in page (or turn on emailed codes in Queue Manager → Workday & sign-in so it is reset for you), then press Retry there.";
+  var offered = /* @__PURE__ */ new Map();
+  function pwTag(p) {
+    let h = 2166136261;
+    for (let i = 0; i < p.length; i++) h = Math.imul(h ^ p.charCodeAt(i), 16777619);
+    return (h >>> 0).toString(36);
+  }
+  function candidates(login, d, site) {
+    const all = [site.password, login.password, d.appAccountPassword, ...Array.isArray(login.otherPasswords) ? login.otherPasswords : []];
+    return [...new Set(all.filter((p) => typeof p === "string" && p.length >= 6))];
+  }
+  function triedToday(site) {
+    return site.triedAt && Date.now() - site.triedAt < DAY && Array.isArray(site.tried) ? site.tried : [];
+  }
+  function resetsToday(site) {
+    return (Array.isArray(site.resets) ? site.resets : []).filter((t) => Date.now() - t < DAY);
+  }
+  function mayReset(login, d, site, email) {
+    const r = resetsToday(site);
+    return d.ohGmailCodes === true && login.resetByEmail !== false && !!email && r.length < 2 && !(r.length && Date.now() - Math.max(...r) < RESET_EVERY);
+  }
+  function mailLink(kind, host2, email, since, password) {
+    return new Promise((resolve) => {
+      try {
+        chrome.runtime.sendMessage({ type: "OH_WD_MAIL_LINK", kind, host: host2, email, since, password }, (r) => {
+          void chrome.runtime.lastError;
+          resolve(r || { ok: false, reason: "no answer" });
+        });
+      } catch {
+        resolve({ ok: false, reason: "extension reloaded" });
+      }
+    });
   }
   function createTried(host2, add = false) {
     try {
@@ -2772,18 +2878,59 @@ OPTIONS: ${JSON.stringify(options.slice(0, 150))}`
   async function answerWd(msg) {
     switch (msg.type) {
       case "wd:cred:get": {
-        const { email, password, login } = await workdayLogin();
+        const { email, password, login, d } = await workdayLogin();
         const host2 = String(msg.tenantHost || tenantHost());
         const site = (login.sites || {})[host2] || {};
         const master = email && password ? { email, password } : null;
-        if (site.state === "account" || site.state === "verify") return { cred: master, master };
         const page = detectPage();
+        const tried = triedToday(site);
+        const next = candidates(login, d, site).find((p) => !tried.includes(pwTag(p)));
+        const offer = (p) => {
+          offered.set(host2, p);
+          return { cred: { email, password: p }, master };
+        };
+        if (site.state === "locked") return mayReset(login, d, site, email) ? { cred: null, master, reset: true } : { cred: null, master, blocked: LOCKED };
+        if (site.state === "other-password") {
+          if (next && tried.length < MAX_TRIES) return offer(next);
+          return mayReset(login, d, site, email) ? { cred: null, master, reset: true } : { cred: null, master, blocked: OTHER_PW };
+        }
+        if (site.state === "account" || site.state === "verify") return offer(site.password || password);
         if (page === "createAccount") createTried(host2, true);
         if (page === "signIn" && !createTried(host2)) return { cred: null, master: null };
+        if (page === "signIn" && next) return offer(next);
         return { cred: null, master };
       }
+      case "wd:auth:rejected": {
+        const { email, login, d } = await workdayLogin();
+        const host2 = String(msg.tenantHost || tenantHost());
+        const site = (login.sites || {})[host2] || {};
+        const tried = [.../* @__PURE__ */ new Set([...triedToday(site), pwTag(String(msg.password || ""))])];
+        const locked = !!msg.locked;
+        await noteSite(locked ? "locked" : "other-password", { tried, triedAt: site.triedAt && Date.now() - site.triedAt < DAY ? site.triedAt : Date.now() }, host2);
+        const fresh = { ...site, tried };
+        const more = candidates(login, d, fresh).some((p) => !tried.includes(pwTag(p)));
+        if (!locked && more && tried.length < MAX_TRIES) return { retry: true };
+        if (mayReset(login, d, fresh, email)) return { reset: true };
+        return { reason: locked ? LOCKED : OTHER_PW };
+      }
+      case "wd:auth:mailReset": {
+        const { email, password } = await workdayLogin();
+        const host2 = String(msg.tenantHost || tenantHost());
+        const site = ((await workdayLogin()).login.sites || {})[host2] || {};
+        await noteSite(site.state === "locked" ? "locked" : "other-password", { resets: [...resetsToday(site), Date.now()] }, host2);
+        const r = await mailLink("reset", host2, String(msg.email || email), Number(msg.since) || Date.now(), password);
+        if (r.ok || r.submitted) await noteSite("account", { password, tried: [], triedAt: 0 }, host2);
+        return r.ok || r.submitted ? { ok: true } : { ok: false, reason: r.reason || "no reset email" };
+      }
+      case "wd:auth:mailVerify": {
+        const { email } = await workdayLogin();
+        const host2 = String(msg.tenantHost || tenantHost());
+        const r = await mailLink("verify", host2, String(msg.email || email), Number(msg.since) || Date.now() - 6e5);
+        if (r.ok) await noteSite("account", {}, host2);
+        return { ok: !!r.ok, reason: r.reason };
+      }
       case "wd:cred:set":
-        await noteSite("account");
+        await noteSite("account", { password: String(msg.password || "") || void 0 });
         return { ok: true };
       case "wd:cred:generate":
         return { password: (await workdayLogin()).password };
@@ -3204,7 +3351,9 @@ OPTIONS: ${JSON.stringify(options.slice(0, 150))}`
   function onPage(mode, run) {
     if (!accountNoted && !AUTH_PAGES.includes(run.page) && run.done.some((p) => p === "signIn" || p === "createAccount")) {
       accountNoted = true;
-      void noteSite("account");
+      const host2 = tenantHost();
+      const pw = offered.get(host2);
+      void noteSite("account", { ...pw ? { password: pw } : {}, tried: [], triedAt: 0 }, host2);
     }
     if (mode.auto && PROGRESS[run.page]) send({ type: "COMPLEX_FORM_PROGRESS", progress: PROGRESS[run.page], message: `Workday: ${PAGE_NAME[run.page]}` });
   }
@@ -3248,7 +3397,7 @@ OPTIONS: ${JSON.stringify(options.slice(0, 150))}`
     await remember(run, outcome, mode);
     const reason = run.pauseReason || "";
     if (run.page === "verifyEmail") await noteSite("verify");
-    else if (outcome !== "submitted" && /sign-in was rejected|already have an account|failed twice/i.test(reason)) await noteSite("other-password");
+    else if (outcome !== "submitted" && /sign-in was rejected|already have an account|failed twice/i.test(reason)) await noteSite("other-password", { tried: [], triedAt: Date.now() });
     if (mode.queue) return;
     if (!mode.auto) {
       send({ type: "OH_MANUAL_FILL_STATUS", state: outcome === "error" ? "error" : "done" });

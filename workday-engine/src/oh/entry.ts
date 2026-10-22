@@ -104,7 +104,8 @@ function queueResult(jobId: string): Any | null {
    queue runner hands Workday jobs here (startQueueJob) and reads the
    result (queueResult). */
 (window as Any).__ohWdEngine = {
-  owns: () => TOP && (!!readMode() || isActive() || (assistOn && hasWorkdayApp())),
+  // …and the pages of Workday's emailed links, which the background fills in its own tab.
+  owns: () => TOP && (!!readMode() || isActive() || (assistOn && hasWorkdayApp()) || /passwordreset|resetpassword|\/activate\b|verifyemail|verifyaccount/i.test(location.pathname)),
   takesManual: () => TOP && hasWorkdayApp(),
   isWorkday: () => TOP && isWorkdayHost(),
   startQueueJob: (job: Any) => void startQueueJob(job),
@@ -141,24 +142,74 @@ function makePassword(): string {
 }
 
 /** One e-mail + password for every Workday site (ohWorkdayLogin), made once and kept. */
-async function workdayLogin(): Promise<{ email: string; password: string; login: Any }> {
-  const d = await ST.get([LOGIN_KEY, "appAccountEmail", "appAccountPassword"]);
+async function workdayLogin(): Promise<{ email: string; password: string; login: Any; d: Any }> {
+  const d = await ST.get([LOGIN_KEY, "appAccountEmail", "appAccountPassword", "ohGmailCodes"]);
   const login: Any = Object.assign({ sites: {} }, d[LOGIN_KEY] || {});
   if (!login.password) {
     login.password = d.appAccountPassword || makePassword();
     await ST.set({ [LOGIN_KEY]: login });
   }
   const email = login.email || d.appAccountEmail || (await profileSources()).email || "";
-  return { email, password: login.password, login };
+  return { email, password: login.password, login, d };
 }
 
-async function noteSite(state: string) {
+/** One employer's Workday sign-in record (ohWorkdayLogin.sites[host]), merged — never replaced. */
+async function noteSite(state: string, extra: Any = {}, host = tenantHost()) {
   try {
     const d = await ST.get(LOGIN_KEY);
     const login: Any = Object.assign({ sites: {} }, d[LOGIN_KEY] || {});
-    login.sites = Object.assign({}, login.sites, { [tenantHost()]: { state, ts: Date.now() } });
+    const prev = (login.sites || {})[host] || {};
+    login.sites = Object.assign({}, login.sites, { [host]: Object.assign({}, prev, { state, ts: Date.now() }, extra) });
     await ST.set({ [LOGIN_KEY]: login });
   } catch { /* storage unavailable */ }
+}
+
+/* Signing in to an employer whose account was made before (by you, another tool, or with another
+   password): each of your passwords is tried once — at most MAX_TRIES failed sign-ins per employer a
+   day, across all its jobs, well under Workday's lockout — then the password is reset from the
+   emailed link (your Gmail, opt-in), and an employer that still can't be signed in to is not tried
+   again by its next jobs until you add its password or press Retry in the Queue Manager. */
+const DAY = 24 * 3600_000;
+const MAX_TRIES = 3;
+const RESET_EVERY = 30 * 60_000;
+const OTHER_PW =
+  "Your Workday account at this employer has a different password. Add it in Queue Manager → Workday & sign-in (or turn on emailed codes there so it can be reset), and its jobs will go through.";
+const LOCKED =
+  "Your Workday account at this employer is locked. Reset its password from the sign-in page (or turn on emailed codes in Queue Manager → Workday & sign-in so it is reset for you), then press Retry there.";
+const offered = new Map<string, string>(); // host → the password last offered (saved once it works)
+
+/** A short tag for a password already tried (the password itself is not stored again). */
+function pwTag(p: string): string {
+  let h = 2166136261;
+  for (let i = 0; i < p.length; i++) h = Math.imul(h ^ p.charCodeAt(i), 16777619);
+  return (h >>> 0).toString(36);
+}
+function candidates(login: Any, d: Any, site: Any): string[] {
+  const all = [site.password, login.password, d.appAccountPassword, ...(Array.isArray(login.otherPasswords) ? login.otherPasswords : [])];
+  return [...new Set(all.filter((p) => typeof p === "string" && p.length >= 6))] as string[];
+}
+function triedToday(site: Any): string[] {
+  return site.triedAt && Date.now() - site.triedAt < DAY && Array.isArray(site.tried) ? site.tried : [];
+}
+/** Reset by email: your Gmail is read (opt-in), at most twice per employer a day, 30 min apart. */
+function resetsToday(site: Any): number[] {
+  return (Array.isArray(site.resets) ? site.resets : []).filter((t: number) => Date.now() - t < DAY);
+}
+function mayReset(login: Any, d: Any, site: Any, email: string): boolean {
+  const r = resetsToday(site);
+  return d.ohGmailCodes === true && login.resetByEmail !== false && !!email && r.length < 2 && !(r.length && Date.now() - Math.max(...r) < RESET_EVERY);
+}
+function mailLink(kind: "reset" | "verify", host: string, email: string, since: number, password?: string): Promise<Any> {
+  return new Promise((resolve) => {
+    try {
+      chrome.runtime.sendMessage({ type: "OH_WD_MAIL_LINK", kind, host, email, since, password }, (r: Any) => {
+        void chrome.runtime.lastError;
+        resolve(r || { ok: false, reason: "no answer" });
+      });
+    } catch {
+      resolve({ ok: false, reason: "extension reloaded" });
+    }
+  });
 }
 
 /** Sites where account creation was tried this tab session (it may have found an existing account). */
@@ -175,21 +226,63 @@ function createTried(host: string, add = false): boolean {
 async function answerWd(msg: Any): Promise<unknown> {
   switch (msg.type) {
     case "wd:cred:get": {
-      const { email, password, login } = await workdayLogin();
+      const { email, password, login, d } = await workdayLogin();
       const host = String(msg.tenantHost || tenantHost());
       const site = (login.sites || {})[host] || {};
       const master = email && password ? { email, password } : null;
-      // A site we already have an account on signs in with the shared password.
-      if (site.state === "account" || site.state === "verify") return { cred: master, master };
       const page = detectPage();
+      const tried = triedToday(site);
+      const next = candidates(login, d, site).find((p) => !tried.includes(pwTag(p)));
+      const offer = (p: string) => {
+        offered.set(host, p);
+        return { cred: { email, password: p }, master };
+      };
+      if (site.state === "locked") return mayReset(login, d, site, email) ? { cred: null, master, reset: true } : { cred: null, master, blocked: LOCKED };
+      if (site.state === "other-password") {
+        if (next && tried.length < MAX_TRIES) return offer(next);
+        return mayReset(login, d, site, email) ? { cred: null, master, reset: true } : { cred: null, master, blocked: OTHER_PW };
+      }
+      // A site we already have an account on signs in with its password (the shared one unless another worked).
+      if (site.state === "account" || site.state === "verify") return offer(site.password || password);
       if (page === "createAccount") createTried(host, true);
       // A new site: no password to offer on the sign-in form, so the engine goes to Create Account
-      // first; once that found an account already there, signing in with the shared password is next.
+      // first; once that found an account already there, your passwords are tried one by one.
       if (page === "signIn" && !createTried(host)) return { cred: null, master: null };
+      if (page === "signIn" && next) return offer(next);
       return { cred: null, master };
     }
+    case "wd:auth:rejected": {
+      const { email, login, d } = await workdayLogin();
+      const host = String(msg.tenantHost || tenantHost());
+      const site = (login.sites || {})[host] || {};
+      const tried = [...new Set([...triedToday(site), pwTag(String(msg.password || ""))])];
+      const locked = !!msg.locked;
+      await noteSite(locked ? "locked" : "other-password", { tried, triedAt: site.triedAt && Date.now() - site.triedAt < DAY ? site.triedAt : Date.now() }, host);
+      const fresh = { ...site, tried };
+      const more = candidates(login, d, fresh).some((p) => !tried.includes(pwTag(p)));
+      if (!locked && more && tried.length < MAX_TRIES) return { retry: true };
+      if (mayReset(login, d, fresh, email)) return { reset: true };
+      return { reason: locked ? LOCKED : OTHER_PW };
+    }
+    case "wd:auth:mailReset": {
+      const { email, password } = await workdayLogin();
+      const host = String(msg.tenantHost || tenantHost());
+      const site = ((await workdayLogin()).login.sites || {})[host] || {};
+      await noteSite(site.state === "locked" ? "locked" : "other-password", { resets: [...resetsToday(site), Date.now()] }, host);
+      const r = await mailLink("reset", host, String(msg.email || email), Number(msg.since) || Date.now(), password);
+      // Reset (or submitted without a clear "done"): sign in with your Workday password next.
+      if (r.ok || r.submitted) await noteSite("account", { password, tried: [], triedAt: 0 }, host);
+      return r.ok || r.submitted ? { ok: true } : { ok: false, reason: r.reason || "no reset email" };
+    }
+    case "wd:auth:mailVerify": {
+      const { email } = await workdayLogin();
+      const host = String(msg.tenantHost || tenantHost());
+      const r = await mailLink("verify", host, String(msg.email || email), Number(msg.since) || Date.now() - 600_000);
+      if (r.ok) await noteSite("account", {}, host);
+      return { ok: !!r.ok, reason: r.reason };
+    }
     case "wd:cred:set":
-      await noteSite("account");
+      await noteSite("account", { password: String(msg.password || "") || undefined });
       return { ok: true };
     case "wd:cred:generate":
       return { password: (await workdayLogin()).password };
@@ -606,7 +699,9 @@ function onPage(mode: Mode, run: RunState) {
   // Past the sign-in: this site has an account with the shared password.
   if (!accountNoted && !AUTH_PAGES.includes(run.page) && run.done.some((p) => p === "signIn" || p === "createAccount")) {
     accountNoted = true;
-    void noteSite("account");
+    const host = tenantHost();
+    const pw = offered.get(host);
+    void noteSite("account", { ...(pw ? { password: pw } : {}), tried: [], triedAt: 0 }, host);   // the password that worked is this site's
   }
   if (mode.auto && PROGRESS[run.page]) send({ type: "COMPLEX_FORM_PROGRESS", progress: PROGRESS[run.page], message: `Workday: ${PAGE_NAME[run.page]}` });
 }
@@ -646,7 +741,7 @@ async function finish(mode: Mode, run: RunState, outcome: Outcome) {
   await remember(run, outcome, mode);
   const reason = run.pauseReason || "";
   if (run.page === "verifyEmail") await noteSite("verify");
-  else if (outcome !== "submitted" && /sign-in was rejected|already have an account|failed twice/i.test(reason)) await noteSite("other-password");
+  else if (outcome !== "submitted" && /sign-in was rejected|already have an account|failed twice/i.test(reason)) await noteSite("other-password", { tried: [], triedAt: Date.now() });
   if (mode.queue) return;
   if (!mode.auto) {
     send({ type: "OH_MANUAL_FILL_STATUS", state: outcome === "error" ? "error" : "done" });

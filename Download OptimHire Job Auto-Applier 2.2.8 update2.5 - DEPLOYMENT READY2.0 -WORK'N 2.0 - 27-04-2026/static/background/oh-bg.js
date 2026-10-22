@@ -71,6 +71,10 @@
  *    from the last 15 minutes, newer than the code screen, that reads like a
  *    verification email. Read-only; nothing is stored. Ported from the
  *    Jobright build (ua-mailbox.js).
+ *    10b. The same feed gives the Workday engine the links in Workday's
+ *    emails: a password reset for an account made before with another
+ *    password (or locked) — the link is opened in a background tab and your
+ *    Workday password set there — and "verify your email".
  *
  * 11. Other job-autofill extensions (ATS TAILOR, Job Genie, Simplify…) are
  *    paused while a run is going — two fillers on one form undo each other —
@@ -547,9 +551,11 @@
     var out = [], re = /<entry\b[\s\S]*?<\/entry>/gi, m;
     while ((m = re.exec(String(xml || '')))) {
       var b = m[0], author = (b.match(/<author\b[\s\S]*?<\/author>/i) || [''])[0];
+      var lk = b.match(/<link\b[^>]*\bhref="([^"]+)"/i);
       out.push({ title: xmlTag(b, 'title'), summary: xmlTag(b, 'summary'),
                  issued: Date.parse(xmlTag(b, 'issued') || xmlTag(b, 'modified')) || 0,
-                 from: (xmlTag(author, 'name') + ' ' + xmlTag(author, 'email')).trim() });
+                 from: (xmlTag(author, 'name') + ' ' + xmlTag(author, 'email')).trim(),
+                 link: lk ? xmlText(lk[1]) : '' });
     }
     return out;
   }
@@ -597,6 +603,171 @@
         if (!hosts.length && sender.tab && sender.tab.url) { try { hosts.push(new URL(sender.tab.url).hostname); } catch (_) {} }
         findCodeInGmail({ hosts: hosts, companies: (msg.companies || []).slice(0, 3), since: msg.since })
           .then(reply, function (e) { reply({ ok: false, reason: String((e && e.message) || e) }); });
+      });
+      return true;
+    });
+  } catch (_) {}
+
+  /* 10b. Links in Workday emails, for the Workday engine: a password reset (your account at an
+     employer was made before with another password, or is locked) and "verify your email". The
+     email is found in the same Gmail feed (same opt-in), opened in a background tab to read its
+     link, and the link is opened in another background tab: for a reset, your Workday password is
+     set there. Both tabs are closed afterwards; nothing is kept. */
+  var LINK_MAIL_RE = { reset: /password|reset|passwort|mot de passe|contraseña|senha|wachtwoord|hasło/i,
+                       verify: /verif|activat|confirm|bestätig|vérifi|welcome|account/i };
+  var LINK_HREF_RE = { reset: /reset|password|passwort|token|recover/i, verify: /verif|activat|confirm|token/i };
+  var WD_LINK_RE = /myworkday(jobs|site)?\.com|workdayjobs\.com|\.workday\.com/i;
+  function keepAlive() { try { chrome.runtime.getPlatformInfo(function () {}); } catch (_) {} }
+  function sleepMs(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
+  async function gmailEntries(kind, hosts, since) {
+    var tokens = [];
+    (hosts || []).forEach(function (h) {
+      String(h || '').toLowerCase().split(/[^a-z0-9]+/).forEach(function (w) {
+        if (w.length > 2 && !/^(www|com|net|org|jobs|careers|myworkdayjobs|myworkdaysite|myworkday|workday|wd\d+)$/.test(w) && tokens.indexOf(w) < 0) tokens.push(w);
+      });
+    });
+    var out = [], signedIn = false;
+    for (var u = 0; u < 4; u++) {
+      for (var li = 0; li < MAIL_LABELS.length; li++) {
+        var res;
+        try { res = await _fetch('https://mail.google.com/mail/u/' + u + '/feed/atom/' + MAIL_LABELS[li], { credentials: 'include', cache: 'no-store' }); }
+        catch (_) { continue; }
+        if (!res.ok) { if (li === 0) break; continue; }
+        var xml = await res.text();
+        if (!/<feed\b/i.test(xml)) { if (li === 0) break; continue; }
+        signedIn = true;
+        parseAtom(xml).forEach(function (e) {
+          if (!e.link || (e.issued && e.issued < since - 120000)) return;
+          var text = e.title + ' ' + e.summary;
+          if (!LINK_MAIL_RE[kind].test(text)) return;
+          var hay = (e.from + ' ' + text).toLowerCase();
+          var tie = (tokens.some(function (t) { return hay.indexOf(t) >= 0; }) ? 2 : 0) + (/workday/.test(hay) ? 1 : 0);
+          if (tie) out.push({ link: e.link, issued: e.issued, tie: tie });
+        });
+      }
+    }
+    out.sort(function (a, b) { return (b.tie - a.tie) || (b.issued - a.issued); });
+    return { signedIn: signedIn, entries: out };
+  }
+  /* Open a page in a background tab, run fn there (with args), close it. */
+  async function inTab(url, fn, args) {
+    var tab = await chrome.tabs.create({ url: url, active: false });
+    try {
+      for (var i = 0; i < 60; i++) {
+        var t = await chrome.tabs.get(tab.id).catch(function () { return null; });
+        if (!t) return null;
+        if (t.status === 'complete') break;
+        await sleepMs(500);
+      }
+      var r = await chrome.scripting.executeScript({ target: { tabId: tab.id }, func: fn, args: args || [] });
+      return r && r[0] ? r[0].result : null;
+    } catch (e) {
+      return { ok: false, reason: String((e && e.message) || e).slice(0, 120) };
+    } finally {
+      try { await chrome.tabs.remove(tab.id); } catch (_) {}
+    }
+  }
+  /* In the Gmail message tab: every link once the message has rendered. */
+  function scrapeLinks() {
+    return new Promise(function (resolve) {
+      var n = 0;
+      var t = setInterval(function () {
+        var links = Array.prototype.map.call(document.querySelectorAll('a[href]'), function (a) {
+          return { href: a.href, text: (a.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 80) };
+        });
+        if (links.some(function (l) { return /myworkday|workdayjobs|workday\.com/i.test(l.href); }) || ++n > 40) { clearInterval(t); resolve(links); }
+      }, 500);
+    });
+  }
+  /* On Workday's reset page: your password in both boxes, then submit. */
+  function fillReset(password, email) {
+    return new Promise(function (resolve) {
+      var vis = function (el) { return !!(el && el.getClientRects().length && getComputedStyle(el).visibility !== 'hidden'); };
+      var setVal = function (el, v) {
+        var d = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value');
+        el.focus(); d.set.call(el, v);
+        ['input', 'change', 'blur'].forEach(function (ty) { el.dispatchEvent(new Event(ty, { bubbles: true })); });
+      };
+      var click = function (el) {
+        var f = el.parentElement && el.parentElement.querySelector('[data-automation-id="click_filter"]');
+        var t = f && vis(f) ? f : el;
+        ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'].forEach(function (ty) { t.dispatchEvent(new MouseEvent(ty, { bubbles: true, cancelable: true, view: window })); });
+      };
+      var DONE_RE = /(password|passwort|mot de passe|contraseña|senha|wachtwoord|hasło)\b[^.]{0,40}\b(reset|changed|updated|geändert|zurückgesetzt|modifié|réinitialisé|cambiad|restablecid|alterad|redefinid|gewijzigd)|successfully|erfolgreich|succès|éxito|sucesso/i;
+      var n = 0, sent = false;
+      var tick = setInterval(function () {
+        n++;
+        var body = (document.body && document.body.innerText) || '';
+        var pws = Array.prototype.filter.call(document.querySelectorAll('input[type="password"]'), vis);
+        if (sent) {
+          if (DONE_RE.test(body)) { clearInterval(tick); resolve({ ok: true }); }
+          else if (n > 24) {
+            var err = document.querySelector('[data-automation-id="errorMessage"],[role="alert"]');
+            clearInterval(tick);
+            resolve(err && err.textContent.trim() ? { ok: false, reason: err.textContent.trim().slice(0, 140) } : { ok: false, submitted: true, reason: 'no confirmation' });
+          }
+          return;
+        }
+        if (!pws.length) {
+          if (n > 40) { clearInterval(tick); resolve({ ok: false, reason: /expired|invalid|no longer valid/i.test(body) ? 'the reset link has expired' : 'no reset form on the emailed link' }); }
+          return;
+        }
+        var em = Array.prototype.find.call(document.querySelectorAll('input[type="email"],input[data-automation-id="email"]'), vis);
+        if (em && !em.value && email) setVal(em, email);
+        pws.forEach(function (p) { setVal(p, password); });
+        var btn = Array.prototype.filter.call(document.querySelectorAll('[data-automation-id*="ubmit" i],button,[role="button"],input[type="submit"]'), vis)
+          .find(function (b) { return /^(submit|reset|change|update|save|set|continue|confirm|ok)\b/i.test((b.textContent || b.value || '').trim()); });
+        if (!btn) return;
+        sent = true; n = 0;
+        setTimeout(function () { click(btn); }, 300);
+      }, 500);
+    });
+  }
+  /* On the emailed verify link: press Verify / Activate / Continue if the page asks. */
+  function pressVerify() {
+    return new Promise(function (resolve) {
+      var n = 0;
+      var t = setInterval(function () {
+        n++;
+        var b = Array.prototype.find.call(document.querySelectorAll('button,[role="button"],a,input[type="submit"]'), function (x) {
+          return x.getClientRects().length && /^(verify|activate|confirm|continue)\b/i.test((x.textContent || x.value || '').trim());
+        });
+        if (b) { b.click(); }
+        if (b || n > 8) { clearInterval(t); setTimeout(function () { resolve({ ok: true }); }, 2500); }
+      }, 500);
+    });
+  }
+  async function workdayMailLink(msg) {
+    var kind = msg.kind === 'verify' ? 'verify' : 'reset';
+    var since = Number(msg.since) || Date.now();
+    var seen = {}, start = Date.now(), signedIn = false;
+    while (Date.now() - start < 150000) {
+      keepAlive();
+      var r = await gmailEntries(kind, [msg.host], since);
+      signedIn = signedIn || r.signedIn;
+      if (!r.signedIn) return { ok: false, reason: 'not signed in to Gmail in this browser' };
+      for (var i = 0; i < r.entries.length; i++) {
+        var e = r.entries[i];
+        if (seen[e.link]) continue;
+        seen[e.link] = 1;
+        var links = await inTab(e.link, scrapeLinks, []) || [];
+        if (!Array.isArray(links)) continue;
+        var hit = links.find(function (l) { return WD_LINK_RE.test(l.href) && LINK_HREF_RE[kind].test(l.href + ' ' + l.text); });
+        if (!hit) continue;
+        if (kind === 'verify') { await inTab(hit.href, pressVerify, []); return { ok: true }; }
+        var done = await inTab(hit.href, fillReset, [String(msg.password || ''), String(msg.email || '')]);
+        return done || { ok: false, reason: 'the reset page did not load' };
+      }
+      await sleepMs(6000);
+    }
+    return { ok: false, reason: kind === 'verify' ? 'no verification email arrived' : 'no reset email arrived' };
+  }
+  try {
+    chrome.runtime.onMessage.addListener(function (msg, sender, reply) {
+      if (!msg || msg.type !== 'OH_WD_MAIL_LINK' || sender.id !== chrome.runtime.id) return;
+      chrome.storage.local.get(['ohGmailCodes'], function (d) {
+        if (!d || d.ohGmailCodes !== true) { reply({ ok: false, reason: 'emailed codes are off' }); return; }
+        workdayMailLink(msg).then(reply, function (e) { reply({ ok: false, reason: String((e && e.message) || e) }); });
       });
       return true;
     });
