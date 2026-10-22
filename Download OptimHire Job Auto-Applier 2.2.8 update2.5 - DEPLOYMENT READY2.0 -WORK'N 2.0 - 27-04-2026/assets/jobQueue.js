@@ -111,9 +111,21 @@
   }
 
   /* ───── CSV parsing / writing ───── */
-  /** RFC-4180-ish CSV parser. Handles quoted fields with commas, embedded
+  /* Real exports are comma, semicolon (European Excel), tab (pasted
+     spreadsheets) or pipe delimited; the first line decides. */
+  function sniffDelimiter(text) {
+    const line = text.split(/\r?\n/).find(l => l.trim()) || '';
+    let best = ',', bestN = 0;
+    for (const d of [',', ';', '\t', '|']) {
+      const n = line.split(d).length - 1;
+      if (n > bestN) { bestN = n; best = d; }
+    }
+    return bestN ? best : ',';
+  }
+  /** RFC-4180 CSV parser. Handles quoted fields with delimiters, embedded
       newlines, and "" escapes. Returns array of row arrays. */
-  function parseCsv(text) {
+  function parseCsv(text, delim) {
+    delim = delim || ',';
     const rows = [];
     let row = [], field = '', inQuotes = false;
     for (let i = 0; i < text.length; i++) {
@@ -124,7 +136,7 @@
         else { field += ch; }
       } else {
         if (ch === '"') { inQuotes = true; }
-        else if (ch === ',') { row.push(field); field = ''; }
+        else if (ch === delim) { row.push(field); field = ''; }
         else if (ch === '\r') { /* skip */ }
         else if (ch === '\n') { row.push(field); rows.push(row); row = []; field = ''; }
         else { field += ch; }
@@ -158,6 +170,15 @@
          choice was never restored and silently reset to 1. */
       ST.get([KEY_QUEUE, KEY_ACTIVE, KEY_CURRENT, KEY_STARTTS, KEY_CONCURRENCY, 'ohPreferAts'], (d) => {
         queue = Array.isArray(d[KEY_QUEUE]) ? d[KEY_QUEUE] : [];
+        /* Entries an earlier import made from cells that were not links
+           (https://font-semibold/, a job title as a host name…) can never be
+           opened; they are removed once, with a note. */
+        const junk = queue.filter(j => !plausibleJobUrl(j.url));
+        if (junk.length) {
+          forget(junk);
+          queue = queue.filter(j => plausibleJobUrl(j.url));
+          _junkRemoved = junk.length;
+        }
         res(d);
       });
     });
@@ -193,9 +214,10 @@
           out.attempts = Math.max(mine.attempts || 0, theirs.attempts || 0);
           return out;
         });
-        /* Keep any job that exists in storage but not in our cache. */
+        /* Keep any job that exists in storage but not in our cache — unless
+           it was deleted here. */
         const mineIds = new Set(queue.map(j => j.id));
-        for (const j of stored) if (!mineIds.has(j.id)) merged.push(j);
+        for (const j of stored) if (!mineIds.has(j.id) && !_removedIds.has(j.id)) merged.push(j);
         queue = merged;
         ST.set({ [KEY_QUEUE]: merged }, res);
       });
@@ -209,6 +231,8 @@
       }));
     });
   }
+
+  let _junkRemoved = 0;
 
   /* ───── CRUD ───── */
   function uid() { return 'j_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 8); }
@@ -231,6 +255,40 @@
       const x = new URL(u);
       return /^https?:$/.test(x.protocol) ? x.href : '';
     } catch (_) { return ''; }
+  }
+
+  /* A link a job can actually be applied at: http(s), a real host name
+     (with a dot), and not an image or other asset. A scraped page export
+     carries logo images and CSS class names; those used to become "jobs"
+     like https://font-semibold/ that could never be opened. */
+  const ASSET_RE = /\.(png|jpe?g|gif|svg|webp|ico|bmp|css|js|woff2?|ttf|mp4|pdf)(\?|#|$)/i;
+  function plausibleJobUrl(u) {
+    try {
+      const x = new URL(String(u || '').trim());
+      if (!/^https?:$/.test(x.protocol)) return false;
+      if (!/^[a-z0-9-]+(\.[a-z0-9-]+)*\.[a-z]{2,}$/i.test(x.hostname)) return false;
+      return !ASSET_RE.test(x.pathname) && !/(^|\.)(media|cdn|static|img|images)\./i.test(x.hostname + '.');
+    } catch (_) { return false; }
+  }
+  /* The same posting with tracking noise is still the same posting. */
+  function cleanJobUrl(u) {
+    try {
+      const x = new URL(String(u).trim());
+      x.hash = '';
+      for (const k of [...x.searchParams.keys()]) {
+        if (/^(utm_[\w-]*|fbclid|gclid|msclkid|mc_cid|mc_eid|igshid|_ga|trk|trackingId|ref|source)$/i.test(k)) x.searchParams.delete(k);
+      }
+      return x.href;
+    } catch (_) { return ''; }
+  }
+  /* A job link in a cell however it was written: a bare URL, a URL inside
+     text / markdown / HTML, or a host name without a scheme. */
+  function jobUrlIn(cell) {
+    const c = String(cell == null ? '' : cell).trim();
+    if (!c) return '';
+    for (const m of c.match(/https?:\/\/[^\s,"'<>)\]]+/gi) || []) if (plausibleJobUrl(m)) return cleanJobUrl(m);
+    if (/^[a-z0-9-]+(\.[a-z0-9-]+)+\/\S*$/i.test(c) && plausibleJobUrl('https://' + c)) return cleanJobUrl('https://' + c);
+    return '';
   }
 
   function addJob(url, title, company, notes) {
@@ -266,12 +324,17 @@
     if (updates.url) j.ats = detectAts(updates.url);
     return true;
   }
-  function deleteJob(id) { queue = queue.filter(j => j.id !== id); }
-  function deleteIds(ids) { queue = queue.filter(j => !ids.has(j.id)); }
+  /* Jobs deleted on this page. saveQueue() keeps jobs another writer added
+     to storage meanwhile — which also put back every job just deleted, so
+     Delete, Clear and Clear all never removed anything. */
+  const _removedIds = new Set();
+  function forget(jobs) { for (const j of jobs) _removedIds.add(j.id); }
+  function deleteJob(id) { forget(queue.filter(j => j.id === id)); queue = queue.filter(j => j.id !== id); }
+  function deleteIds(ids) { forget(queue.filter(j => ids.has(j.id))); queue = queue.filter(j => !ids.has(j.id)); }
   function setStatusForIds(ids, status) {
     for (const j of queue) if (ids.has(j.id)) j.status = status;
   }
-  function clearByStatus(status) { queue = queue.filter(j => j.status !== status); }
+  function clearByStatus(status) { forget(queue.filter(j => j.status === status)); queue = queue.filter(j => j.status !== status); }
 
   /* ───── Render ───── */
   function visibleJobs() {
@@ -305,14 +368,17 @@
       if (j.status === 'applied') { if (j.confirmed) confirmed++; else unconfirmed++; }
     }
     const el = document.getElementById('stats');
+    /* Each tile filters the table to its status (click again for all). */
+    const tile = (f, cls, n, label, title) =>
+      `<button type="button" class="stat ${cls}${view.filter === f && f !== 'all' ? ' on' : ''}" data-f="${f}"${title ? ` title="${title}"` : ''}><b>${n}</b>${label}</button>`;
     el.innerHTML = '' +
-      `<div class="stat"><b>${c.all}</b>Total</div>` +
-      `<div class="stat s-pending"><b>${c.pending}</b>Pending</div>` +
-      `<div class="stat s-running"><b>${c.running}</b>Running</div>` +
-      `<div class="stat s-applied" title="Applications with a real on-page confirmation — these are the ones that genuinely went through"><b>${confirmed}</b>✅ Confirmed</div>` +
-      `<div class="stat s-skipped" title="Submit was clicked but no confirmation appeared — NOT proof it was received. Verify these manually."><b>${unconfirmed}</b>⚠ Unconfirmed</div>` +
-      `<div class="stat s-failed"><b>${c.failed}</b>Failed</div>` +
-      `<div class="stat s-skipped"><b>${c.skipped}</b>Skipped</div>`;
+      tile('all', '', c.all, 'Total') +
+      tile('pending', 's-pending', c.pending, 'Pending') +
+      tile('running', 's-running', c.running, 'Running') +
+      tile('applied', 's-applied', confirmed, 'Confirmed', 'Applications with a real on-page confirmation — these are the ones that genuinely went through') +
+      tile('applied', 's-unconfirmed', unconfirmed, 'Unconfirmed', 'Submit was clicked but no confirmation appeared — not proof it was received. Check these yourself.') +
+      tile('failed', 's-failed', c.failed, 'Failed') +
+      tile('skipped', 's-skipped', c.skipped, 'Skipped');
   }
   function renderAtsFilter() {
     const el = document.getElementById('atsFilter');
@@ -373,7 +439,7 @@
     empty.classList.add('hidden');
     document.getElementById('jobsTable').style.display = '';
     if (!visible.length) {
-      tbody.innerHTML = `<tr><td colspan="10" class="empty" style="padding:30px">No jobs match the current filter.</td></tr>`;
+      tbody.innerHTML = `<tr><td colspan="8" class="empty" style="padding:30px">No jobs match the current filter.</td></tr>`;
       syncSelectAll(visible);
       return;
     }
@@ -382,23 +448,29 @@
       const rowCls = j.status === 'running' ? 'running-row' :
                      j.status === 'applied' ? 'applied-row' :
                      j.status === 'failed' ? 'failed-row' : '';
+      const url = safeJobUrl(j.url);
+      let host = '';
+      try { host = new URL(url).hostname.replace(/^www\./, ''); } catch (_) {}
+      const unconfirmed = j.status === 'applied' && !j.confirmed;
+      const badgeCls = unconfirmed ? 'unconfirmed' : j.status;
+      const badgeTxt = unconfirmed ? 'Unconfirmed' : j.status === 'applied' ? 'Applied' : j.status.charAt(0).toUpperCase() + j.status.slice(1);
+      const badgeTip = j.status === 'applied' ? (j.confirmed ? esc(j.confirmedBy || 'confirmation page detected') : 'No confirmation was detected — check it yourself') : '';
+      const title = j.title || host || 'Untitled job';
+      const meta = [j.company ? esc(j.company) : '', url ? `<a href="${esc(url)}" target="_blank" rel="noopener" title="${esc(j.url)}">${esc(truncate(host + new URL(url).pathname, 70))}</a>` : `<span title="Invalid URL">${esc(truncate(String(j.url || ''), 60))}</span>`]
+        .filter(Boolean).join(' · ');
       return `<tr class="${rowCls}" data-id="${j.id}">
         <td class="checkbox-cell"><input type="checkbox" class="row-check" data-id="${j.id}" ${checked}></td>
-        <td>${idx + 1}</td>
-        <td><span class="badge b-${j.status}" title="${j.status === 'applied' ? (j.confirmed ? esc(j.confirmedBy || 'confirmation page detected') : 'No confirmation was detected — verify manually') : ''}">${j.status}${j.status === 'applied' ? (j.confirmed ? ' ✅' : ' ⚠') : ''}</span></td>
-        <td class="url-col">${safeJobUrl(j.url)
-          ? `<a href="${esc(safeJobUrl(j.url))}" target="_blank" rel="noopener" title="${esc(j.url)}">${esc(truncate(j.url, 60))}</a>`
-          : `<span title="Invalid URL">${esc(truncate(String(j.url || ''), 60))}</span>`}</td>
-        <td>${esc(j.title || '—')}</td>
-        <td>${esc(j.company || '—')}</td>
+        <td class="num">${idx + 1}</td>
+        <td><div class="job"><span class="job-title" title="${esc(title)}">${esc(title)}</span><span class="job-meta">${meta}</span>${j.status === 'failed' && j.lastError ? `<span class="job-err" title="${esc(j.lastError)}">${esc(j.lastError)}</span>` : ''}</div></td>
+        <td><span class="badge b-${badgeCls}" title="${badgeTip}">${badgeTxt}</span></td>
         <td><span class="ats-tag">${esc(j.ats || 'Other')}</span></td>
-        <td>${j.attempts || 0}</td>
-        <td title="${j.lastError ? esc(j.lastError) : ''}">${fmtTs(j.lastActionTs || j.appliedAt || j.addedAt)}</td>
-        <td class="row-actions">
-          <button class="btn-small" data-action="open" data-id="${j.id}">Open</button>
-          <button class="btn-small" data-action="edit" data-id="${j.id}">Edit</button>
-          <button class="btn-small btn-danger" data-action="delete" data-id="${j.id}">Delete</button>
-        </td>
+        <td class="num">${j.attempts || 0}</td>
+        <td class="when" title="${j.lastError ? esc(j.lastError) : ''}">${fmtTs(j.lastActionTs || j.appliedAt || j.addedAt)}</td>
+        <td class="row-actions"><div>
+          <button data-action="open" data-id="${j.id}" title="Open" aria-label="Open">${ICONS.open}</button>
+          <button data-action="edit" data-id="${j.id}" title="Edit" aria-label="Edit">${ICONS.edit}</button>
+          <button class="btn-danger" data-action="delete" data-id="${j.id}" title="Delete" aria-label="Delete">${ICONS.trash}</button>
+        </div></td>
       </tr>`;
     });
     tbody.innerHTML = rows.join('');
@@ -406,6 +478,11 @@
     syncSelectAll(visible);
   }
   function truncate(s, n) { return s.length > n ? s.slice(0, n - 1) + '…' : s; }
+  const ICONS = {
+    open: '<svg class="i" viewBox="0 0 16 16" aria-hidden="true"><path d="M9 3h4v4M13 3L7.5 8.5M12 9.5V13H3V4h3.5" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" fill="none"/></svg>',
+    edit: '<svg class="i" viewBox="0 0 16 16" aria-hidden="true"><path d="M10.5 3.5l2 2L6 12H4v-2z" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round" fill="none"/></svg>',
+    trash: '<svg class="i" viewBox="0 0 16 16" aria-hidden="true"><path d="M3 4.5h10M6.5 4.5V3h3v1.5M4.5 4.5l.6 8.5h5.8l.6-8.5" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" fill="none"/></svg>',
+  };
 
   /* ───── Toast ───── */
   function toast(msg, kind) {
@@ -434,35 +511,57 @@
   }
 
   /* ───── CSV import ───── */
-  function importCsv(text) {
-    const rows = parseCsv(text);
+  /* Like the Jobright build's importer: any delimiter, BOM stripped, header
+     row detected, and the job link taken from the column that actually
+     holds job links (by header — url / link / href / apply — and by what is
+     in it), else from whichever cell in the row has one. Rows without a
+     usable link are counted and dropped, never turned into a fake URL. */
+  function importCsv(text, sourceName) {
+    text = String(text || '').replace(/^\uFEFF/, '');
+    const rows = parseCsv(text, sniffDelimiter(text));
     if (!rows.length) { toast('CSV is empty', 'error'); return; }
-    /* First row could be header. Detect by looking for common header words. */
-    const first = rows[0].map(c => c.trim().toLowerCase());
-    const hasHeader = first.some(c => /\b(url|link|job_url|application_url)\b/.test(c));
-    const headerMap = {};
-    if (hasHeader) {
-      first.forEach((c, i) => {
-        if (/\b(url|link|job_url|application_url)\b/.test(c)) headerMap.url = i;
-        else if (/\btitle|job_title|position\b/.test(c)) headerMap.title = i;
-        else if (/\bcompany|employer\b/.test(c)) headerMap.company = i;
-        else if (/\bnotes?|comment|note\b/.test(c)) headerMap.notes = i;
-      });
-    } else {
-      headerMap.url = 0; headerMap.title = 1; headerMap.company = 2; headerMap.notes = 3;
+    const first = rows[0].map(c => String(c).trim().toLowerCase());
+    const firstHasUrl = rows[0].some(c => jobUrlIn(c));
+    const hasHeader = !firstHasUrl && rows.length > 1;
+    const data = hasHeader ? rows.slice(1) : rows;
+    const width = Math.max(...rows.slice(0, 200).map(r => r.length));
+    const sample = data.slice(0, 200);
+    const share = (i, test) => sample.length ? sample.filter(r => test(r[i])).length / sample.length : 0;
+    const col = {};
+    /* Link column: the header's word helps, the contents decide. */
+    let bestUrl = -1, bestScore = 0;
+    for (let i = 0; i < width; i++) {
+      const h = hasHeader ? (first[i] || '') : '';
+      let score = share(i, c => !!jobUrlIn(c));
+      if (/\b(url|link|href|apply|application|posting|job.?url)\b/.test(h)) score += 0.25;
+      if (/\b(src|logo|image|img|avatar|icon)\b/.test(h)) score -= 1;
+      if (score > bestScore) { bestScore = score; bestUrl = i; }
     }
-    if (headerMap.url == null) headerMap.url = 0;
+    if (bestUrl >= 0 && bestScore >= 0.3) col.url = bestUrl;
+    if (hasHeader) {
+      first.forEach((h, i) => {
+        if (i === col.url) return;
+        if (col.title == null && /\b(title|position|role|job.?title|job.?name|vacancy|opening)\b/.test(h)) col.title = i;
+        else if (col.company == null && /\b(company|employer|organi[sz]ation|business|hiring)\b/.test(h)) col.company = i;
+        else if (col.notes == null && /\b(notes?|comments?)\b/.test(h)) col.notes = i;
+      });
+    }
+    /* No title column named: the first column of plain text (a scraped
+       listing puts the job title first). */
+    if (col.title == null) {
+      for (let i = 0; i < width; i++) {
+        if (i === col.url || i === col.company) continue;
+        if (share(i, c => { const v = String(c || '').trim(); return v.length >= 3 && v.length <= 150 && !/https?:\/\//i.test(v); }) >= 0.6) { col.title = i; break; }
+      }
+    }
     let added = 0, dupes = 0, invalid = 0;
-    const dataRows = hasHeader ? rows.slice(1) : rows;
-    for (const r of dataRows) {
-      const url = (r[headerMap.url] || '').trim();
+    for (const r of data) {
+      const url = (col.url != null && jobUrlIn(r[col.url])) || r.map(jobUrlIn).find(Boolean) || '';
       if (!url) { invalid++; continue; }
-      const result = addJob(
-        url,
-        headerMap.title   != null ? r[headerMap.title]   : '',
-        headerMap.company != null ? r[headerMap.company] : '',
-        headerMap.notes   != null ? r[headerMap.notes]   : '',
-      );
+      const result = addJob(url,
+        col.title != null ? r[col.title] : '',
+        col.company != null ? r[col.company] : '',
+        col.notes != null ? r[col.notes] : '');
       if (result === 'duplicate') dupes++;
       else if (result) added++;
       else invalid++;
@@ -472,8 +571,12 @@
       const parts = [];
       if (added) parts.push(`${added} added`);
       if (dupes) parts.push(`${dupes} duplicates skipped`);
-      if (invalid) parts.push(`${invalid} invalid`);
-      toast('Import: ' + (parts.join(', ') || 'no changes'), added ? 'success' : 'info');
+      if (invalid) parts.push(`${invalid} without a job link`);
+      const msg = (sourceName ? sourceName + ': ' : 'Import: ') + (parts.join(', ') || 'no changes');
+      if (!added && invalid && invalid === data.length) {
+        toast(`${msg} — this file has no application links (only titles / companies), so nothing can be applied to`, 'error');
+      } else toast(msg, added ? 'success' : 'info');
+      dbg('CSV import', { source: sourceName || '', rows: data.length, header: hasHeader, columns: col, added, dupes, invalid });
     });
   }
   function exportCsv() {
@@ -948,9 +1051,21 @@
       const f = e.target.files[0];
       if (!f) return;
       const r = new FileReader();
-      r.onload = () => importCsv(r.result);
+      r.onload = () => importCsv(r.result, f.name);
       r.readAsText(f);
       e.target.value = ''; // allow re-import same file
+    });
+    /* Drop a CSV file — or text with links — anywhere on the page. */
+    document.addEventListener('dragover', (e) => { e.preventDefault(); });
+    document.addEventListener('drop', (e) => {
+      e.preventDefault();
+      const files = [...((e.dataTransfer && e.dataTransfer.files) || [])];
+      if (files.length) {
+        for (const f of files) { const r = new FileReader(); r.onload = () => importCsv(r.result, f.name); r.readAsText(f); }
+        return;
+      }
+      const t = e.dataTransfer && e.dataTransfer.getData('text/plain');
+      if (t) importCsv(t, 'Dropped text');
     });
     on('btnStart', 'click', startQueue);
     on('btnStop',  'click', stopQueue);
@@ -976,12 +1091,23 @@
     on('btnClearAll', 'click', async () => {
       if (!queue.length) return;
       if (!confirm(`Delete ALL ${queue.length} jobs? This cannot be undone.`)) return;
+      const stored = await new Promise(r => ST.get([KEY_QUEUE], d => r(Array.isArray(d[KEY_QUEUE]) ? d[KEY_QUEUE] : [])));
+      forget(stored); forget(queue);
       queue = []; selectedIds.clear();
       await saveQueue(); render();
       toast('Queue cleared', 'info');
     });
 
     on('searchInput',  'input',  (e) => { view.search = e.target.value; render(); });
+    on('stats', 'click', (e) => {
+      const t = e.target.closest && e.target.closest('.stat[data-f]');
+      if (!t) return;
+      const f = t.getAttribute('data-f');
+      view.filter = (view.filter === f || f === 'all') ? 'all' : f;
+      const sf = document.getElementById('statusFilter');
+      if (sf) sf.value = view.filter;
+      render();
+    });
     on('statusFilter', 'change', (e) => { view.filter = e.target.value; render(); });
     on('atsFilter',    'change', (e) => { view.ats    = e.target.value; render(); });
 
@@ -1036,7 +1162,9 @@
 
     /* Row delegated clicks */
     document.getElementById('jobsTbody').addEventListener('click', async (e) => {
-      const a = e.target.dataset.action; const id = e.target.dataset.id;
+      /* The click lands on the icon inside the button. */
+      const btn = e.target.closest && e.target.closest('button[data-action]');
+      const a = btn && btn.dataset.action; const id = btn && btn.dataset.id;
       if (!a || !id) return;
       if (a === 'open') {
         const j = queue.find(x => x.id === id);
@@ -1118,6 +1246,10 @@
       setRunnerIndicator(!!d[KEY_ACTIVE]);
       init();
       render();
+      if (_junkRemoved) {
+        saveQueue().then(render);
+        toast(`Removed ${_junkRemoved} entries that were not job links (left by an earlier CSV import)`, 'info');
+      }
       /* If a run was active when this manager page (re)loaded, we lost
          our in-memory tab map. Re-queue any 'running' jobs and refill
          slots so the run continues cleanly. */

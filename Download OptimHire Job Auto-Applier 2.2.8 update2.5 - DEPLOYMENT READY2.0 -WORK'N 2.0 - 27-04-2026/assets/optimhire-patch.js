@@ -1844,6 +1844,430 @@
     rescueLocationNow = tick;
   })();
 
+  /* ── Answers that went in wrong (seen on Greenhouse) ─────────────────
+   * Three things OptimHire's own answers put into forms, fixed once the
+   * page has settled (so OptimHire's fill is finished):
+   *   • a required essay answered "N/A" → a real answer from your profile
+   *     (or a sound general one);
+   *   • an essay holding a CV / cover-letter contact header ("MAXMILLIAM
+   *     OKAFOR, MSC (+353) 87… | email | linkedin…") → the header taken
+   *     off, keeping the letter under it, or a real answer if nothing is
+   *     left;
+   *   • "Where are you located?" asked as a list of regions, answered
+   *     "United States/Canada" (or left empty and flagged) → the region
+   *     your country is in (Europe / EMEA / UK & Ireland … for Ireland). */
+  (function installAnswerRepair() {
+    if (window.top !== window.self && !/greenhouse|lever|ashby|workable|smartrecruiters/i.test(location.hostname)) return;
+    const SETTLE_MS = 3000;
+    const seen = new Map(), done = new WeakSet();
+    const settled = (el) => { const t = seen.get(el); if (!t) { seen.set(el, Date.now()); return false; } return Date.now() - t >= SETTLE_MS; };
+    const JUNK_RE = /^\s*(n\/?a|na|none|nil|null|-+|\.+|not applicable|no answer)\s*\.?\s*$/i;
+    const ESSAY_LABEL_RE = /\bwhy\b|describe|tell us|explain|about yourself|motivat|interest(ed)? in|what (excites|interests|attracts)|problem|challenge|project|accomplish|achievement|proud|experience with|how (have|would|do) you|cover letter|additional information/i;
+    const isRequired = (el, lbl) => el.required || el.getAttribute('aria-required') === 'true' || /\*\s*$/.test(lbl || '');
+    function contactHeader(v) {
+      const head = v.slice(0, 320);
+      return /[\w.+-]+@[\w-]+\.[\w.]+/.test(head) && (/(\+?\d[\d\s().-]{8,}\d)/.test(head) || /linkedin\.com|github\.com/i.test(head));
+    }
+    function withoutHeader(v) {
+      const lines = v.split(/\r?\n/);
+      let i = 0;
+      while (i < lines.length && i < 8) {
+        const l = lines[i].trim();
+        if (!l || /@|linkedin|github|https?:\/\/|www\.|\+?\d[\d\s().-]{7,}\d|^[A-Z][A-Z .,'’-]{3,}$|\|/.test(l) || l.split(/\s+/).length < 5) { i++; continue; }
+        break;
+      }
+      return lines.slice(i).join('\n').trim();
+    }
+    async function repairEssays(p) {
+      for (const el of $$('textarea, input[type="text"]:not([role="combobox"])').filter(isVisible)) {
+        if (done.has(el) || isPageChromeField(el)) continue;
+        const v = (el.value || '').trim();
+        if (!v) continue;
+        const lbl = (getLabel(el) || '').trim();
+        if (!lbl || !ESSAY_LABEL_RE.test(lbl)) continue;
+        const junk = JUNK_RE.test(v) && isRequired(el, lbl);
+        const header = el.tagName === 'TEXTAREA' && contactHeader(v);
+        if (!junk && !header) continue;
+        if (!settled(el)) continue;
+        done.add(el);
+        let next = '';
+        if (header) {
+          const body = withoutHeader(v);
+          if (body.length >= 80) next = body;
+        }
+        if (!next) {
+          const g = String(guessValue(lbl.replace(/\*/g, ''), p, el.tagName === 'TEXTAREA' ? 'textarea' : 'text') || '').trim();
+          if (g.length > 20 && !JUNK_RE.test(g)) next = g;
+        }
+        if (!next || next === v) continue;
+        el.focus();
+        nativeSet(el, next);
+        el.blur();
+        LOG(`Answer repair: "${lbl.slice(0, 60)}" — ${header ? 'CV contact header removed' : '"' + v + '" replaced'}`);
+      }
+    }
+
+    const REGION_Q_RE = /where (are you|do you) (currently )?(located|based|live|reside)|which (region|country|location|time ?zone)[^?]{0,40}(located|based|live|in)\b|(current|your) (region|country) of residence|(country|region) of residence|location \(region\)|what region/i;
+    const EUROPE_RE = /ireland|united kingdom|\buk\b|england|scotland|wales|britain|germany|france|spain|portugal|italy|netherlands|belgium|poland|sweden|norway|denmark|finland|austria|switzerland|czech|romania|greece|hungary|ukraine|luxembourg|estonia|latvia|lithuania|croatia|slovakia|slovenia|bulgaria/i;
+    const AMERICAS_RE = /united states|\busa?\b|america|canada/i;
+    function regionWants(country) {
+      const c = String(country || '').toLowerCase();
+      const out = [];
+      if (c) out.push(c);
+      if (/ireland/.test(c)) out.push('republic of ireland', 'uk & ireland', 'uk and ireland', 'uk/ireland', 'ireland');
+      if (/united kingdom|\buk\b|england|scotland|wales|britain/.test(c)) out.push('united kingdom', 'uk', 'uk & ireland', 'great britain');
+      if (EUROPE_RE.test(c)) out.push('europe', 'emea', 'eu');
+      if (/united states|\busa?\b/.test(c)) out.push('united states', 'usa', 'us', 'north america', 'americas');
+      if (/canada/.test(c)) out.push('canada', 'north america', 'americas');
+      if (/nigeria|ghana|kenya|south africa|egypt|morocco|uganda|tanzania|cameroon/.test(c)) out.push('africa', 'emea');
+      if (/india|pakistan|bangladesh|singapore|philippines|japan|china|korea|malaysia|indonesia|australia|new zealand/.test(c)) out.push('apac', 'asia');
+      if (!AMERICAS_RE.test(c)) out.push('outside the us', 'outside of the us', 'outside the united states', 'international', 'rest of world', 'rest of the world', 'other');
+      return out;
+    }
+    const norm = s => String(s || '').toLowerCase().replace(/\s+/g, ' ').trim();
+    function pickRegion(texts, wants) {
+      for (const w of wants) {
+        const re = new RegExp('(^|[^a-z])' + w.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '([^a-z]|$)');
+        const hit = texts.find(t => norm(t) === w) || texts.find(t => re.test(norm(t)));
+        if (hit) return hit;
+      }
+      return null;
+    }
+    function acceptable(current, wants, country) {
+      if (!current) return false;
+      if (AMERICAS_RE.test(current) && !AMERICAS_RE.test(country || '')) return false;
+      return !!pickRegion([current], wants);
+    }
+    async function repairRegions(p) {
+      const country = p.country || '';
+      if (!country) return;
+      const wants = regionWants(country);
+      for (const sel of $$('select').filter(isVisible)) {
+        const lbl = (getLabel(sel) || '').trim();
+        if (!REGION_Q_RE.test(lbl) || done.has(sel)) continue;
+        const cur = sel.selectedIndex >= 0 && sel.options[sel.selectedIndex] && sel.options[sel.selectedIndex].value ? sel.options[sel.selectedIndex].text : '';
+        if (acceptable(cur, wants, country) || !settled(sel)) continue;
+        const opts = [...sel.options].filter(o => o.value);
+        const hit = pickRegion(opts.map(o => o.text), wants);
+        done.add(sel);
+        if (!hit) continue;
+        const opt = opts.find(o => o.text === hit);
+        sel.value = opt.value;
+        sel.dispatchEvent(new Event('input', { bubbles: true }));
+        sel.dispatchEvent(new Event('change', { bubbles: true }));
+        LOG(`Answer repair: "${lbl.slice(0, 50)}" ${cur ? `"${cur}" → ` : '→ '}"${hit}" (you are in ${country})`);
+      }
+      for (const input of $$('input').filter(i => isComboInput(i))) {
+        const ctl = comboControl(input);
+        if (!isVisible(ctl || input) || done.has(input)) continue;
+        const lbl = (getLabel(input) || getLabel(ctl) || '').trim();
+        if (!REGION_Q_RE.test(lbl)) continue;
+        const cur = comboSelectedText(input);
+        const flagged = fieldFlagged(input) || fieldFlagged(ctl || input);
+        if ((acceptable(cur, wants, country) && !flagged) || !settled(input)) continue;
+        done.add(input);
+        try { realClick(ctl || input); } catch (_) {}
+        try { input.focus(); } catch (_) {}
+        nativeSet(input, '');
+        try { input.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', code: 'ArrowDown', bubbles: true, cancelable: true })); } catch (_) {}
+        await sleep(450);
+        const opts = comboOptions();
+        const hitText = pickRegion(opts.map(o => (o.textContent || '').trim()), wants);
+        const hit = hitText && opts.find(o => (o.textContent || '').trim() === hitText);
+        if (!hit) { try { input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', code: 'Escape', bubbles: true })); input.blur(); } catch (_) {} continue; }
+        try { realClick(hit); } catch (_) { try { hit.click(); } catch (__) {} }
+        await sleep(250);
+        LOG(`Answer repair: "${lbl.slice(0, 50)}" ${cur ? `"${cur}" → ` : '→ '}"${hitText}" (you are in ${country})`);
+      }
+    }
+
+    let busy = false;
+    async function tick() {
+      if (busy || _IS_OH_PAGE || wdEngineOwns()) return;
+      if (!(Date.now() - _manualTriggerTs < 90_000 || ((await isAutomationActive()) && (window.top !== window.self || await isActiveJobTab())))) return;
+      busy = true;
+      try {
+        const p = await getProfile();
+        await repairEssays(p);
+        await repairRegions(p);
+      } catch (e) { LOG('Answer repair error', e); }
+      finally { busy = false; }
+    }
+    setInterval(tick, 2000);
+  })();
+
+  /* ── Oracle Recruiting Cloud (…/hcmUI/CandidateExperience) ───────────
+   * Oracle's application (JPMorgan, Goldman Sachs, Dell, EY…) has pieces
+   * the generic filler doesn't handle — ideas from the Jobright build:
+   *   • "Confirm Your Identity": a code is emailed, then typed one digit
+   *     per box. With "Read verification codes from my signed-in Gmail" on
+   *     (Queue Manager → Workday sign-in) the code is read from your Gmail
+   *     (oh-bg.js 10), typed and VERIFY pressed; "Keep me signed in" is
+   *     ticked. Off, a run skips the job at once instead of waiting.
+   *   • Pill buttons ("Female | Male | Prefer not to say", "I consent"):
+   *     a required group left unanswered is answered — equality questions
+   *     with "prefer not to say", consent with "I consent", the rest from
+   *     your profile's answers.
+   *   • Typeaheads that show "No results were found." (a value typed but
+   *     never picked): searched again by its first word and the closest
+   *     suggestion picked. The postal code is SW1W 0RH, as asked.
+   *   • Address Line 1 holding a country name while Line 2 holds the
+   *     street: put right. */
+  (function installOracleCx() {
+    if (window.top !== window.self) return;
+    const isOracle = () => /(^|\.)oraclecloud\.com$/i.test(location.hostname) || /\/hcmUI\/CandidateExperience/i.test(location.pathname);
+    if (!isOracle()) return;
+    const ORACLE_POSTCODE = 'SW1W 0RH';
+    const SETTLE_MS = 3500;                 // leave OptimHire's own fill time to finish first
+    const txt = el => ((el && (el.innerText || el.textContent)) || '').replace(/\s+/g, ' ').trim();
+    const firstSeen = new Map();
+    const settled = key => { const t = firstSeen.get(key); if (!t) { firstSeen.set(key, Date.now()); return false; } return Date.now() - t >= SETTLE_MS; };
+    let busy = false, pin = { since: 0, typed: '', resent: false, gaveUp: false };
+
+    async function active() {
+      if (Date.now() - _manualTriggerTs < 90_000) return true;
+      return (await isAutomationActive()) && (await isActiveJobTab());
+    }
+
+    /* ── identity code ── */
+    const PIN_RE = /confirm your identity|verification code (was|has been) sent|we (sent|emailed) (you )?a (verification |security |one-time )?code|enter the (verification |security )?code/i;
+    function codeBoxes() {
+      const ins = $$('input').filter(i => isVisible(i) && !/^(hidden|checkbox|radio|submit|button|email|password|file)$/i.test(i.type || ''));
+      const singles = ins.filter(i => i.getAttribute('maxlength') === '1');
+      if (singles.length >= 4) return singles;
+      const one = ins.find(i => /one-time-code/i.test(i.getAttribute('autocomplete') || '') ||
+        /\b(code|pin|otp|passcode)\b/i.test([i.name, i.id, i.getAttribute('aria-label'), i.placeholder].join(' ')));
+      return one ? [one] : [];
+    }
+    const onPinScreen = () => PIN_RE.test(txt(document.body).slice(0, 4000)) && codeBoxes().length > 0;
+    async function typeCode(code) {
+      const keep = $$('input[type="checkbox"]').find(c => !c.checked && /keep me signed in/i.test(txt(c.closest('label,div,span')) || ''));
+      if (keep) realClick(keep);
+      const boxes = codeBoxes();
+      if (boxes.length === 1) { boxes[0].focus(); nativeSet(boxes[0], code); }
+      else {
+        for (let i = 0; i < boxes.length && i < code.length; i++) {
+          boxes[i].focus();
+          nativeSet(boxes[i], code[i]);
+          boxes[i].dispatchEvent(new KeyboardEvent('keyup', { key: code[i], bubbles: true }));
+          await sleep(90);
+        }
+      }
+      await sleep(400);
+      const verify = $$('button,[role="button"],input[type="submit"]').find(b => isVisible(b) && !b.disabled &&
+        /^(verify|confirm|submit|continue|next)$/i.test(txt(b) || b.value || ''));
+      if (verify) realClick(verify);
+    }
+    async function skipForCode(why) {
+      if (pin.gaveUp) return;
+      pin.gaveUp = true;
+      LOG(`Oracle: ${why}`);
+      if (Date.now() - _manualTriggerTs < 90_000) return;        // you are here: it's yours to type
+      requestSkipCurrent(`Oracle: ${why}`);
+    }
+    async function handlePin() {
+      if (!pin.since) { pin = { since: Date.now(), typed: '', resent: false, gaveUp: false }; LOG('Oracle: "Confirm Your Identity" — a code was emailed'); }
+      if (pin.gaveUp) return;
+      const { ohGmailCodes } = await ST.get('ohGmailCodes');
+      if (ohGmailCodes !== true) return skipForCode('it wants the code it emailed — turn on "Read verification codes from my signed-in Gmail" in the Queue Manager to have it typed for you');
+      let r = null;
+      try {
+        r = await chrome.runtime.sendMessage({ type: 'OH_MAIL_FIND_CODE', hosts: [location.hostname],
+          companies: [txt($('h1,[class*="job-title" i]')).slice(0, 60)], since: pin.since });
+      } catch (_) {}
+      if (r && r.ok && r.code && r.code !== pin.typed) {
+        pin.typed = r.code;
+        LOG('Oracle: code found in your Gmail — typing it');
+        await typeCode(r.code);
+        return;
+      }
+      if (r && r.reason === 'gmail-not-signed-in') return skipForCode('Gmail is not signed in in this browser, so the emailed code can\'t be read');
+      if (!pin.resent && Date.now() - pin.since > 50_000) {
+        pin.resent = true;
+        const again = $$('a,button,[role="button"]').find(b => isVisible(b) && /send (a )?new code|resend( code)?/i.test(txt(b)));
+        if (again) { realClick(again); LOG('Oracle: no code yet — pressed "Send New Code"'); }
+      }
+      if (Date.now() - pin.since > 120_000) return skipForCode('no verification code arrived within 2 minutes');
+    }
+
+    /* ── pill buttons ── */
+    const PILL_SKIP_RE = /^(next|back|submit|continue|apply|cancel|close|save|verify|sign in|send new code|edit|add|remove|delete|upload|browse|attach|review|done|ok)\b/i;
+    const isPicked = b => b.getAttribute('aria-pressed') === 'true' || b.getAttribute('aria-checked') === 'true' ||
+      b.getAttribute('aria-selected') === 'true' || /(^|[\s_-])(selected|active|checked|is-selected)([\s_-]|$)/i.test(b.className || '');
+    function pillGroups() {
+      const byBox = new Map();
+      for (const b of $$('button,[role="radio"]')) {
+        if (!isVisible(b) || b.closest('header,nav,footer,[role="dialog"]')) continue;
+        const t = txt(b);
+        if (!t || t.length > 60 || PILL_SKIP_RE.test(t) || b.type === 'submit') continue;
+        let box = b.parentElement;
+        if (box && box.querySelectorAll('button,[role="radio"]').length < 2) box = box.parentElement;
+        if (!box) continue;
+        if (!byBox.has(box)) byBox.set(box, []);
+        byBox.get(box).push(b);
+      }
+      return [...byBox.entries()].filter(([, bs]) => bs.length >= 2 && bs.length <= 12);
+    }
+    function questionOf(box) {
+      const by = box.getAttribute('aria-labelledby');
+      const named = by && document.getElementById(by.split(/\s+/)[0]);
+      if (named && txt(named)) return txt(named);
+      for (let n = box, i = 0; n && i < 4; n = n.parentElement, i++) {
+        for (let sib = n.previousElementSibling; sib; sib = sib.previousElementSibling) {
+          const t = txt(sib);
+          if (t && t.length >= 3 && t.length <= 600 && !sib.querySelector('button,input,select,textarea')) return t;
+        }
+      }
+      return '';
+    }
+    const PREFER_NOT_RE = /prefer not|decline|do not wish|don[’']?t wish|not to (say|answer|disclose)|rather not|choose not|i do not want/i;
+    const EQUALITY_RE = /gender|transgender|sexual orientation|pronoun|disabilit|veteran|ethnic|\brace\b|religio|marital|\bsex\b|lgbt/i;
+    function choosePill(q, pills, p) {
+      const names = pills.map(b => txt(b).toLowerCase());
+      if (EQUALITY_RE.test(q)) { const i = names.findIndex(n => PREFER_NOT_RE.test(n)); if (i >= 0) return pills[i]; }
+      if (/consent|agree|acknowledge|accept/i.test(q)) {
+        const i = names.findIndex(n => /^(i\s+)?(consent|agree|accept|acknowledge|yes)\b/.test(n) && !/\b(not|don[’']?t)\b/.test(n));
+        if (i >= 0) return pills[i];
+      }
+      const a = String(guessValue(q, p, 'radio') || '').trim().toLowerCase();
+      if (!a) return null;
+      let i = names.findIndex(n => n === a);
+      if (i < 0) i = names.findIndex(n => n.startsWith(a) || a.startsWith(n));
+      if (i < 0 && /^(yes|no)\b/.test(a)) i = names.findIndex(n => n.split(/\W/)[0] === a.split(/\W/)[0]);
+      return i >= 0 ? pills[i] : null;
+    }
+    async function answerPills(p) {
+      let n = 0;
+      for (const [box, pills] of pillGroups()) {
+        if (pills.some(isPicked)) continue;
+        const q = questionOf(box);
+        if (!q || !(/\*/.test(q) || EQUALITY_RE.test(q))) continue;
+        if (!settled('pill|' + q)) continue;
+        const pick = choosePill(q.replace(/\*/g, ''), pills, p);
+        if (!pick) continue;
+        realClick(pick);
+        n++;
+        LOG(`Oracle: "${q.slice(0, 70)}" → ${txt(pick)}`);
+        await sleep(250);
+      }
+      return n;
+    }
+
+    /* ── typeaheads ── */
+    const NO_RESULTS_RE = /no results (were )?found|no matches/i;
+    function listFor(inp) {
+      const id = inp.getAttribute('aria-controls') || inp.getAttribute('aria-owns') || inp.getAttribute('list');
+      return id ? document.getElementById(id) : null;
+    }
+    function optionsFor(inp) {
+      const list = listFor(inp);
+      const scope = list || inp.closest('[class*="select" i],[class*="combobox" i],[class*="typeahead" i],.input-row,.apply-flow-input') || document;
+      return $$('[role="option"],li[class*="list-item" i],li[class*="option" i]', scope)
+        .filter(o => isVisible(o) && !NO_RESULTS_RE.test(txt(o)));
+    }
+    function showsNoResults(inp) {
+      const list = listFor(inp);
+      if (list && isVisible(list) && NO_RESULTS_RE.test(txt(list))) return true;
+      const box = inp.closest('[class*="select" i],[class*="combobox" i],[class*="typeahead" i],.input-row,.apply-flow-input');
+      return !!(box && $$('*', box).some(e => e.children.length === 0 && isVisible(e) && NO_RESULTS_RE.test(txt(e))));
+    }
+    const words = s => String(s || '').toLowerCase().split(/[^a-z0-9]+/).filter(w => w.length > 1);
+    function closest(opts, wanted) {
+      const w = new Set(words(wanted));
+      let best = null, score = -1;
+      for (const o of opts) {
+        const ow = words(txt(o));
+        const sc = ow.filter(x => w.has(x)).length / Math.max(1, Math.max(ow.length, w.size));
+        if (sc > score) { score = sc; best = o; }
+      }
+      return best;
+    }
+    async function search(inp, queries, wanted) {
+      for (const qy of queries) {
+        if (!qy) continue;
+        inp.focus();
+        nativeSet(inp, '');
+        await sleep(80);
+        nativeSet(inp, qy);
+        inp.dispatchEvent(new KeyboardEvent('keydown', { key: qy.slice(-1), bubbles: true }));
+        inp.dispatchEvent(new KeyboardEvent('keyup', { key: qy.slice(-1), bubbles: true }));
+        let opts = [];
+        for (let i = 0; i < 15 && !opts.length; i++) { await sleep(200); opts = optionsFor(inp); }
+        if (!opts.length) continue;
+        const pick = closest(opts, wanted) || opts[0];
+        realClick(pick);
+        await sleep(350);
+        return txt(pick);
+      }
+      return '';
+    }
+    const isPostal = inp => /postal|zip|post ?code|eircode/i.test(getLabel(inp) || inp.name || inp.id || '');
+    async function fixTypeaheads() {
+      let n = 0;
+      for (const inp of $$('input[role="combobox"],input[aria-autocomplete="list"],input[aria-autocomplete="both"]').filter(isVisible)) {
+        const label = getLabel(inp) || '';
+        if (isPostal(inp)) {
+          if ((inp.value || '').trim().toUpperCase() === ORACLE_POSTCODE && !showsNoResults(inp)) continue;
+          if (!settled('postal')) continue;
+          const got = await search(inp, [ORACLE_POSTCODE, ORACLE_POSTCODE.split(' ')[0]], ORACLE_POSTCODE);
+          if (!got) { nativeSet(inp, ORACLE_POSTCODE); inp.blur(); }
+          LOG(`Oracle: postal code → ${got || ORACLE_POSTCODE}`);
+          n++;
+          continue;
+        }
+        const v = (inp.value || '').trim();
+        if (!v) continue;
+        /* Suggestions left open under a box nobody is typing in: the value
+           was typed but never picked. Pick the closest. */
+        const open = optionsFor(inp);
+        if (!showsNoResults(inp) && open.length && document.activeElement !== inp && settled('open|' + label)) {
+          const pick = closest(open, v);
+          if (pick) { realClick(pick); LOG(`Oracle: "${label.slice(0, 40)}" — picked the suggestion "${txt(pick)}" for "${v}"`); n++; await sleep(300); }
+          continue;
+        }
+        if (!showsNoResults(inp) || !settled('ta|' + label)) continue;
+        const ws = words(v);
+        const queries = [ws[0], v.slice(0, 4)];
+        if (EQUALITY_RE.test(label)) queries.push('decline', 'prefer not', 'not to');
+        const got = await search(inp, queries, v);
+        LOG(`Oracle: "${label.slice(0, 40)}" had no match for "${v}" → ${got || 'still no suggestion'}`);
+        if (got) n++;
+      }
+      return n;
+    }
+
+    /* ── address lines ── */
+    const COUNTRY_ONLY_RE = /^(united kingdom|great britain|england|ireland|republic of ireland|united states( of america)?|usa|us|uk|canada|germany|france|india|nigeria|australia|netherlands|spain|italy|portugal|poland)$/i;
+    function fixAddress(p) {
+      const fields = $$('input').filter(isVisible);
+      const line1 = fields.find(i => /address (line )?1|street address|^address$/i.test(getLabel(i) || ''));
+      const line2 = fields.find(i => /address (line )?2/i.test(getLabel(i) || ''));
+      if (!line1 || !COUNTRY_ONLY_RE.test((line1.value || '').trim())) return;
+      const street = (p.street || '').trim() || (line2 && /\d/.test(line2.value || '') ? line2.value.trim() : '');
+      if (!street) return;
+      nativeSet(line1, street);
+      if (line2 && line2.value.trim() === street) nativeSet(line2, '');
+      LOG(`Oracle: Address Line 1 had the country ("${line1.value}") — street put there instead`);
+    }
+
+    async function tick() {
+      if (busy || wdEngineOwns()) return;
+      if (!(await active())) return;
+      busy = true;
+      try {
+        if (onPinScreen()) { await handlePin(); return; }
+        pin.since = 0;
+        const p = await getProfile();
+        fixAddress(p);
+        await answerPills(p);
+        await fixTypeaheads();
+      } catch (e) {
+        LOG('Oracle helper error', e);
+      } finally { busy = false; }
+    }
+    setInterval(tick, 1500);
+  })();
+
   /* ── Auto-submit when OptimHire says "Review and submit the form" ────
    * OptimHire fills the form with its own engine and then stops, showing
    * "Review and submit the form" / "Form filled", waiting for a human to
@@ -2421,10 +2845,15 @@
     check();
   })();
 
+  /* Boxes that take a fact about you, never filler text. */
+  const CONTACT_LABEL_RE = /\b(first|last|middle|full|given|family|preferred|legal|sur)?\s?name\b|e-?mail|phone|mobile|telephone|address|street|city|town|post ?code|postal|zip|county|state|province|country|linkedin|github|website|portfolio|url\b/i;
+
   /* ── Profile helper ─────────────────────────────────────── */
   async function getProfile() {
     const keys = ['candidateDetails', 'cachedSeekerInfo', 'seekerDetails', 'userDetails'];
-    const data = await ST.get(keys.concat(['autoApplyState', 'complexFormData', 'manualApplicationDetail']));
+    const data = await ST.get(keys.concat(['autoApplyState', 'complexFormData', 'manualApplicationDetail', 'ohWdSeeker']));
+    /* Outside a run OptimHire keeps little more than your name: your details
+       from the last OptimHire job (kept by the Workday engine) are the base. */
     let merged = {};
 
     /* OptimHire 2.9.0 keeps the applicant's real details (e-mail, phone
@@ -2441,6 +2870,7 @@
         if (ad && ad.seeker && typeof ad.seeker === 'object') { merged = Object.assign({}, ad.seeker, merged); }
       } catch (_) {}
     }
+    if (data.ohWdSeeker && typeof data.ohWdSeeker === 'object') merged = Object.assign({}, data.ohWdSeeker, merged);   // lowest of all
 
     // Parse and merge all available profile sources
     for (const key of keys) {
@@ -2618,6 +3048,7 @@
     strengths: 'My key strengths are technical proficiency, strong problem-solving ability, effective communication, and a collaborative team-first mindset.',
     weakness: 'I have been working on delegating more effectively. I naturally want to ensure quality by handling things myself, and I\'ve been consciously building trust with colleagues to share responsibility.',
     goals: 'Over the next 3-5 years, I want to deepen my expertise, take on greater leadership responsibility, and contribute to impactful projects that drive real business outcomes.',
+    hardProblem: 'I enjoy hard technical problems, especially ones where reliability, scale and clear trade-offs matter. I approach them by measuring first, breaking the problem into parts I can test quickly, validating each step with data, and leaving the system simpler and better documented than I found it.',
     tellAbout: 'I\'m a dedicated professional with a track record of delivering strong results. I combine technical depth with a collaborative approach, and I thrive in roles where I can solve meaningful problems and help teams succeed.',
     motivation: 'I\'m motivated by meaningful impact, continuous learning, and the opportunity to work alongside talented people on problems that matter.',
     valueAdd: 'I bring the right combination of experience, technical skill, and work ethic to make an immediate positive impact. I move fast, communicate clearly, and consistently deliver quality work.',
@@ -3344,7 +3775,60 @@
    * ────────────────────────────────────────────────────────────────── */
   const RESUME_INPUT_RE = /resume|r[ée]sum[ée]|cv\b|curriculum|upload.*resume|attach.*resume/i;
   /* Upload boxes that must never receive the CV. */
-  const NOT_RESUME_RE = /cover\s*letter|motivation|portfolio|transcript|certificat|photo|headshot|writing\s*sample|other\s*(documents?|attachments?)|additional\s*(documents?|files?)/i;
+  const NOT_RESUME_RE = /cover[\s_-]*letter|motivation|portfolio|transcript|certificat|photo|headshot|writing[\s_-]*sample|other[\s_-]*(documents?|attachments?)|additional[\s_-]*(documents?|files?)/i;
+
+  /* ── No CV in a cover-letter box ─────────────────────────────────────
+   * OptimHire's own filler collects upload boxes as questions; its answer
+   * service hands back the CV link for "Cover Letter", and the CV went
+   * into both boxes (Greenhouse showed Maxmilliam_Okafor.pdf twice). Every
+   * filler in this world attaches files by assigning input.files, so the
+   * guard sits there: a file that isn't a cover letter is not attached to
+   * a cover-letter box. A REQUIRED cover-letter box still gets it rather
+   * than blocking the application. */
+  (function guardCoverLetterBoxes() {
+    const COVER_BOX_RE = /cover[\s_-]*letter|motivation(al)?[\s_-]*letter|lettre[\s_-]*de[\s_-]*motivation|anschreiben|carta[\s_-]*de[\s_-]*presentaci/i;
+    const COVER_FILE_RE = /cover|letter|motivation|anschreiben/i;
+    const desc = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'files');
+    if (!desc || !desc.set) return;
+    /* The box's own heading: the nearest ancestor (a few levels up) that
+       holds a label-like element, or the group naming it. */
+    function head(inp) {
+      for (let n = inp.parentElement, i = 0; n && i < 5; n = n.parentElement, i++) {
+        const by = n.getAttribute && n.getAttribute('aria-labelledby');
+        const named = by && document.getElementById(by.split(/\s+/)[0]);
+        if (named) return named.textContent || '';
+        const h = n.querySelector('label, legend, .label, [class*="label" i], h3, h4');
+        if (h && !h.contains(inp)) return h.textContent || '';
+      }
+      return '';
+    }
+    function boxText(inp) {
+      const ids = (inp.getAttribute('aria-labelledby') || '').split(/\s+/).filter(Boolean)
+        .map(id => { const n = document.getElementById(id); return n ? n.textContent : ''; });
+      const lab = inp.id && document.querySelector(`label[for="${CSS.escape(inp.id)}"]`);
+      return [inp.id, inp.name, inp.getAttribute('aria-label'), inp.getAttribute('aria-describedby'), ...ids,
+              lab && lab.textContent, head(inp)].filter(Boolean).join(' ').slice(0, 400);
+    }
+    function required(inp) {
+      if (inp.required || inp.getAttribute('aria-required') === 'true') return true;
+      return /\*/.test(head(inp));
+    }
+    Object.defineProperty(HTMLInputElement.prototype, 'files', {
+      configurable: true,
+      enumerable: desc.enumerable,
+      get() { return desc.get.call(this); },
+      set(list) {
+        try {
+          if (this.type === 'file' && list && list.length && COVER_BOX_RE.test(boxText(this)) &&
+              !Array.prototype.some.call(list, f => COVER_FILE_RE.test(f.name || '')) && !required(this)) {
+            LOG(`Cover letter box: not attaching "${list[0].name}" — that's the CV, not a cover letter`);
+            return;
+          }
+        } catch (_) {}
+        desc.set.call(this, list);
+      },
+    });
+  })();
 
   async function fetchResumeFile(url, filename = 'resume.pdf') {
     if (!url) return null;
@@ -3434,7 +3918,9 @@
     if (/first.?name/.test(l))                            return p.first_name    || '';
     if (/last.?name/.test(l))                             return p.last_name     || '';
     if (/full.?name|your.?name/.test(l))                  return fullName;
-    if (/preferred.?name|display.?name|nickname/.test(l)) return fullName;
+    /* "Preferred Name" is what you are called — your first name, not both. */
+    if (/preferred.?name|nickname/.test(l))               return p.first_name || fullName;
+    if (/display.?name/.test(l))                          return fullName;
     /* Email: handle "Email", "Email Address", "E-mail", "E mail", "EMail".
        Note: label is pre-processed so non-alphanumerics become spaces, so
        "E-mail" becomes "e mail" — \se?mail covers both forms. */
@@ -3633,6 +4119,8 @@
                                                           return DEFAULTS.whyCompany;
     if (/why.*role|why.*position|interest.*role|interest.*position|excite.*role|why.*apply/.test(l))
                                                           return DEFAULTS.whyRole;
+    if (/hard(est)?.?(technical.?)?problem|technical.?challenge|toughest|most.?challenging|complex.?problem/.test(l))
+                                                          return p.summary || DEFAULTS.hardProblem;
     if (/describe.?(a\s+)?challeng|tell.?(me|us).?about.?a.?time|example.?of|situation.?where/.test(l))
                                                           return p.summary || DEFAULTS.tellAbout;
 
@@ -4387,6 +4875,9 @@
           /* A URL field cannot take free text — leave it for OptimHire / the
              user rather than inject an invalid value. */
           else if (inputType === 'url') val = '';
+          /* Never "N/A" in a name / contact / address / link box — that is
+             a wrong answer, not a neutral one; such a box is left for you. */
+          else if (CONTACT_LABEL_RE.test(lbl)) val = '';
           /* Neutral filler. This used to be p.first_name, which answered an
              arbitrary required question ("Describe a project you're proud
              of") with the applicant's first name. */
@@ -6886,6 +7377,99 @@
     }
     await tryResumeUpload(p);
     await autoFillPage();
+    await successFactorsSelects(p);
+    await successFactorsResume(p);
+    await successFactorsTerms();
+  }
+
+  /* SuccessFactors' career site labels its boxes "City:*", "Citizenship 1:*"
+     and asks in plain <select>s starting at "No Selection" — which the
+     id-based map above and the generic pass mostly missed (an Ericsson form
+     came back with Citizenship 1, "How did you hear", Gender and the Terms
+     of Use all undone, while the optional Citizenship 2 got filled). Each
+     select is answered by what its label asks. */
+  const SF_EMPTY_RE = /^(no selection|select( one)?|please select|choose|--+|\s*)$/i;
+  function sfLabel(el) { return String(getLabel(el) || '').replace(/[*:]/g, ' ').replace(/\s+/g, ' ').trim(); }
+  function sfSelectEmpty(sel) {
+    const o = sel.options[sel.selectedIndex];
+    return !o || !o.value || SF_EMPTY_RE.test((o.text || '').trim());
+  }
+  function sfSet(sel, opt) {
+    sel.value = opt.value;
+    sel.dispatchEvent(new Event('input', { bubbles: true }));
+    sel.dispatchEvent(new Event('change', { bubbles: true }));
+  }
+  function sfAnswer(label, p, sel) {
+    const l = label.toLowerCase();
+    const opts = $$('option', sel).filter(o => o.value);
+    const find = re => opts.find(o => re.test(o.text));
+    if (/citizenship\s*2|second citizenship|additional (citizenship|nationality)|other nationality/.test(l)) return null;
+    if (/citizenship|nationality/.test(l)) return bestSelectOption(sel, p.citizenship || p.nationality || p.country, label);
+    if (/gender|\bsex\b|ethnic|race|disabilit|veteran|sexual orientation/.test(l)) return find(/prefer not|decline|not to (say|disclose|answer)|do not wish|don[’']?t wish|rather not/i) || null;
+    if (/conflict of interest|related to (an )?employee|relative|family member/.test(l)) return find(/^no\b/i) || null;
+    if (/how did you (hear|find|learn)|where did you (hear|see|find)|\bsource\b|referral source/.test(l)) {
+      return find(/linkedin/i) || find(/job ?board|internet|online|website|career(s)? site/i) || find(/^other/i) || null;
+    }
+    if (/state|province|county|region/.test(l) && !/country/.test(l)) return p.state ? bestSelectOption(sel, p.state, label) : null;
+    if (/country/.test(l)) return p.country ? bestSelectOption(sel, p.country, label) : null;
+    const g = guessValue(label, p, 'select');
+    return g ? bestSelectOption(sel, g, label) : null;
+  }
+  async function successFactorsSelects(p) {
+    const sels = $$('select').filter(isVisible);
+    let cit1 = '';
+    for (const sel of sels) {
+      const label = sfLabel(sel);
+      if (!label) continue;
+      if (/citizenship\s*1|^citizenship$|^nationality$/i.test(label) && !sfSelectEmpty(sel)) cit1 = sel.value;
+      if (!sfSelectEmpty(sel)) continue;
+      const opt = sfAnswer(label, p, sel);
+      if (!opt) continue;
+      sfSet(sel, opt);
+      if (/citizenship\s*1|^citizenship$|^nationality$/i.test(label)) cit1 = opt.value;
+      LOG(`SuccessFactors: "${label.slice(0, 60)}" → ${opt.text}`);
+      await sleep(120);
+    }
+    /* The optional second citizenship repeating the first: cleared. */
+    for (const sel of sels) {
+      if (!/citizenship\s*2|second citizenship/i.test(sfLabel(sel)) || !cit1 || sel.value !== cit1) continue;
+      const none = $$('option', sel).find(o => !o.value);
+      if (none) { sfSet(sel, none); LOG('SuccessFactors: Citizenship 2 only repeated Citizenship 1 — cleared'); }
+    }
+  }
+  /* "Upload a Resume" is a tile that opens an attach dialog; the file box
+     only exists once it is open. */
+  async function successFactorsResume(p) {
+    const done = $$('[id*="resume" i],[class*="attachment" i]').some(e => /\.(pdf|docx?|rtf|txt)\b/i.test(e.textContent || ''));
+    if (done) return;
+    const tile = $$('a,button,[role="button"],div,span').find(e => isVisible(e) && e.children.length <= 2 &&
+      /^upload (a |your )?(resume|cv)$/i.test((e.textContent || '').trim()));
+    if (!tile) return;
+    realClick(tile);
+    await sleep(700);
+    if (await tryResumeUpload(p)) LOG('SuccessFactors: CV attached through "Upload a Resume"');
+  }
+  /* "Terms of Use: Read the data privacy statement." — the statement opens in
+     a dialog whose Accept is the consent. Accepted once per page. */
+  let _sfTermsDone = '';
+  async function successFactorsTerms() {
+    if (_sfTermsDone === location.href) return;
+    const link = $$('a,button,[role="button"]').find(e => isVisible(e) &&
+      /data privacy statement|privacy (statement|policy|notice)|terms of use/i.test((e.textContent || '').trim()) &&
+      /terms of use|privacy|consent/i.test(((e.closest('div,tr,p,li') || e).textContent || '')));
+    if (!link) return;
+    realClick(link);
+    for (let i = 0; i < 15; i++) {
+      await sleep(200);
+      const accept = $$('button,[role="button"],input[type="button"],input[type="submit"],a').find(b => isVisible(b) &&
+        /^(i\s+)?(accept|agree)(\s+(and|&)\s+continue)?$/i.test((b.textContent || b.value || '').trim()));
+      if (accept) {
+        realClick(accept);
+        _sfTermsDone = location.href;
+        LOG('SuccessFactors: data privacy statement accepted');
+        return;
+      }
+    }
   }
 
   /* ── T30d: UKG / UltiPro autofill ───────────────────────── */
@@ -8188,6 +8772,7 @@
   (function installQueueRunner() {
     const POLL_MS         = 2_000;
     const JOB_TIMEOUT_MS  = 180_000;  // 3 min hard cap per job
+    const WD_JOB_TIMEOUT_MS = 480_000; // Workday: many steps plus the account
     const NO_FORM_GRACE_MS = 18_000;  // if no fillable form by now → unsupported, skip
     const SUBMIT_GRACE_MS = 8_000;    // wait this long after submit before declaring success
     const CONFIRM_WAIT_MS = 30_000;   // keep looking for a REAL confirmation this long after submit
@@ -8432,6 +9017,25 @@
           _submitSeenAt = 0;
           _validErrSince = 0;
           LOG(`[Queue Runner] on job: ${job.title || job.url}`);
+        }
+
+        /* Workday: the Workday engine applies (sign-in, CV, every step,
+           Submit) and says how it went; this only reads its result. */
+        const wde = window.__ohWdEngine;
+        if (wde && wde.isWorkday && wde.isWorkday()) {
+          const r = wde.queueResult(job.id);
+          if (r) {
+            if (r.outcome === 'submitted') {
+              await qaCommit('queue job confirmed');
+              return advance(job, 'applied', '', { confirmed: true, confirmedBy: 'Workday confirmation' });
+            }
+            return advance(job, 'failed', `Workday: ${r.reason || r.outcome || 'could not finish'}`.slice(0, 200));
+          }
+          wde.startQueueJob(job);
+          if (job.lastActionTs && Date.now() - job.lastActionTs > WD_JOB_TIMEOUT_MS) {
+            return advance(job, 'failed', 'Workday: timed out');
+          }
+          return;
         }
 
         /* Proactively drive the autofill on this queue tab. The normal

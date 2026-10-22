@@ -82,6 +82,7 @@ async function fill(ctx: Ctx, key: AidKey, value: string | undefined, root: Pare
   const c = containerOf(el);
   handled.add(c);
   if (!value) return false;
+  if (hooks.keepExisting?.() && readValue(kindOf(c) === "none" ? el : c)) return true; // [oh] yours stays
   await pace(ctx);
   let ok = await writeValue(kindOf(c) === "none" ? el : c, value).catch((e) => {
     if (e instanceof NeedsHuman) return false;
@@ -174,6 +175,29 @@ async function pruneIncomplete(ctx: Ctx, sectionEl: HTMLElement, anchor: AidKey)
     await humanClick(del);
     await sleep(300);
     await waitStable(300, 5000);
+  }
+}
+
+/**
+ * [oh] The most recent role with a start date and no end date is the one you are in now: tick
+ * "I currently work here" (Workday then drops the end date it was asking for). Whoever filled
+ * the role — this engine, Workday's CV parse or another filler.
+ */
+async function markCurrentRole(ctx: Ctx, sectionEl: HTMLElement): Promise<void> {
+  const first = blocks(sectionEl, "jobTitleF")[0];
+  if (!first) return;
+  const box = field("currentlyF", first);
+  if (!box) return;
+  const c = containerOf(box);
+  if (readValue(c) === "true") return;
+  const start = dateContainer(first, "start");
+  const end = dateContainer(first, "end");
+  if (!start || !readValue(start) || (end && readValue(end))) return;
+  handled.add(c);
+  if (await setCheckbox(c, true)) {
+    ctx.log('Ticked "I currently work here" on your most recent role (it has no end date)');
+    if (end) handled.add(end);
+    await waitStable(300, 4000);
   }
 }
 
@@ -317,7 +341,9 @@ async function uploadDocuments(ctx: Ctx) {
   if (cv && cvInput) {
     const root = cvInput.closest("section, fieldset, [data-automation-id^='formField-']") ?? document;
     const names = uploadedFileNames(root);
-    if (!names.some((n) => n.includes(cv.name.slice(0, 12)))) {
+    if ((hooks.keepExisting?.() || (hooks.advance && !hooks.advance())) && names.length) {
+      handled.add(containerOf(cvInput)); // [oh] assist: a CV already attached (yours) is left as it is
+    } else if (!names.some((n) => n.includes(cv.name.slice(0, 12)))) {
       // Remove whatever the resume step / last application left behind.
       for (const del of qa(sel("fileDelete"), root).filter(isVisible)) {
         await humanClick(del);
@@ -343,6 +369,7 @@ async function uploadDocuments(ctx: Ctx) {
 }
 
 export async function myExperience(ctx: Ctx): Promise<void> {
+  await hooks.beforeExperience?.(); // [oh]
   const p = ctx.profile;
 
   const work = section("workSection", /work experience|employment history|berufserfahrung|expérience professionnelle|experiencia (laboral|profesional)|experiência profissional|esperienza (lavorativa|professionale)|werkervaring|doświadczenie zawodowe|職歴|工作经历/iu);
@@ -350,8 +377,10 @@ export async function myExperience(ctx: Ctx): Promise<void> {
     const bs = await ensureBlockCount(ctx, work, "jobTitleF", p.work.length);
     for (let i = 0; i < Math.min(bs.length, p.work.length); i++) await fillWork(ctx, bs[i], p.work[i]);
     ctx.log(`Work experience: ${p.work.length} role(s) filled`);
-  } else if (work && hooks.autoSubmit?.()) {
-    await pruneIncomplete(ctx, work, "jobTitleF"); // [oh]
+    await markCurrentRole(ctx, work); // [oh]
+  } else if (work) {
+    await markCurrentRole(ctx, work); // [oh] before anything is judged incomplete
+    if (hooks.autoSubmit?.()) await pruneIncomplete(ctx, work, "jobTitleF"); // [oh]
   }
 
   const edu = section("eduSection", /^(education|ausbildung|bildung|formation|educación|formación|educação|formação|istruzione|formazione|opleiding|wykształcenie|学歴|教育)/iu);

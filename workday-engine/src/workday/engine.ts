@@ -172,11 +172,21 @@ function requiredFlagsHere(ctx: Ctx) {
   return ctx.run.flags.filter((f) => f.page === ctx.page);
 }
 
+/** [oh] Assist mode: the page on screen is filled; Next is yours. */
+function pageFilled(ctx: Ctx): StepResult {
+  ctx.run.status = "filled";
+  ctx.run.pauseReason = undefined;
+  ctx.log("Page filled — check it, then continue");
+  void ctx.save();
+  return "stop";
+}
+
 async function fillAndNext(ctx: Ctx, handler?: (c: Ctx) => Promise<void>): Promise<StepResult> {
   if (handler) await handler(ctx);
   await genericFill(ctx);
   await ctx.save();
   const flags = requiredFlagsHere(ctx);
+  if (hooks.advance && !hooks.advance() && !flags.length) return pageFilled(ctx); // [oh]
   if (flags.length) {
     throw new NeedsHuman(`Answer ${flags.length} field(s) on this page, then click Resume: ${flags.map((f) => f.label).join(", ").slice(0, 300)}`);
   }
@@ -199,7 +209,11 @@ async function waitForExternalDocs(ctx: Ctx) {
   ctx.log("Tailoring tool didn't respond in 90 s — continuing with the fallback CV", "warn");
 }
 
+/** [oh] Pages assist mode fills; on the rest (posting, sign-in, Review…) it does nothing. */
+const ASSIST_PAGES: PageKind[] = ["resumeUpload", "myInformation", "myExperience", "questions", "voluntaryDisclosures", "selfIdentify"];
+
 async function handlePage(ctx: Ctx, page: PageKind): Promise<StepResult> {
+  if (hooks.advance && !hooks.advance() && !ASSIST_PAGES.includes(page)) return "stop"; // [oh]
   switch (page) {
     case "jobPosting": {
       if (ctx.job) chrome.runtime.sendMessage({ type: "wd:jobCaptured", job: ctx.job }).catch(() => {});
@@ -231,6 +245,7 @@ async function handlePage(ctx: Ctx, page: PageKind): Promise<StepResult> {
       throw new NeedsHuman("Verify your email using the link Workday sent, sign in if asked, then click Resume.");
     case "resumeUpload":
       await resumeUpload(ctx);
+      if (hooks.advance && !hooks.advance()) return pageFilled(ctx); // [oh]
       return clickNext(ctx);
     case "myInformation":
       return fillAndNext(ctx, myInformation);

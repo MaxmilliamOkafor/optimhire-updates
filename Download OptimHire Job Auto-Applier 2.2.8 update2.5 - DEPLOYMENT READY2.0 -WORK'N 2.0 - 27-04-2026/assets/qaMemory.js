@@ -43,7 +43,7 @@
 
   function paintCount() {
     var el = $('qaMemCount');
-    if (el) el.textContent = '(' + count() + ')';
+    if (el) el.textContent = String(count());
   }
 
   function isOpen() { var m = $('qaModal'); return !!(m && !m.classList.contains('hidden')); }

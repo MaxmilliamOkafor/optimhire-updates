@@ -7,6 +7,7 @@ import type { RunState } from "./types.js";
 let host: HTMLElement | null = null;
 let root: ShadowRoot | null = null;
 let handlers: { resume: () => void; stop: () => void } = { resume: () => {}, stop: () => {} };
+let hideTimer: number | undefined; // [oh] one pending auto-hide at a time
 
 export function setOverlayHandlers(h: typeof handlers) {
   handlers = h;
@@ -25,10 +26,12 @@ const LABELS: Record<string, string> = {
   done: "Submitted",
   error: "Error",
   idle: "Stopped",
+  filled: "Page filled — check it, then continue", // [oh]
 };
 
 export function renderOverlay(run: RunState) {
   if (!document.body) return;
+  if (hideTimer) { clearTimeout(hideTimer); hideTimer = undefined; } // [oh] a newer state replaces the old one's hide
   if (!host) {
     host = document.createElement("div");
     host.id = "wd-autopilot-overlay";
@@ -37,7 +40,7 @@ export function renderOverlay(run: RunState) {
     document.body.appendChild(host);
   }
   if (!root) return;
-  const color = { running: "#5bc08b", paused: "#e0a86a", review: "#c79a6a", done: "#5bc08b", error: "#e06a6a", idle: "#8892a8" }[run.status];
+  const color = { running: "#5bc08b", paused: "#e0a86a", review: "#c79a6a", done: "#5bc08b", error: "#e06a6a", idle: "#8892a8", filled: "#5bc08b" }[run.status];
   const last = run.log[run.log.length - 1]?.msg ?? "";
   root.innerHTML = `
     <style>
@@ -68,5 +71,5 @@ export function renderOverlay(run: RunState) {
       if (a === "stop") handlers.stop();
     })
   );
-  if (run.status === "idle") setTimeout(removeOverlay, 4000);
+  if (run.status === "idle" || run.status === "filled") hideTimer = window.setTimeout(removeOverlay, 4000);
 }

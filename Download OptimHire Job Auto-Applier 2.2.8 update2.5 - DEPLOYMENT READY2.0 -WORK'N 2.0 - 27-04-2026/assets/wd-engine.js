@@ -1731,6 +1731,7 @@ OPTIONS: ${JSON.stringify(options.slice(0, 150))}`
     const c = containerOf(el);
     handled.add(c);
     if (!value) return false;
+    if (hooks.keepExisting?.() && readValue(kindOf(c) === "none" ? el : c)) return true;
     await pace(ctx);
     let ok = await writeValue(kindOf(c) === "none" ? el : c, value).catch((e) => {
       if (e instanceof NeedsHuman) return false;
@@ -1804,6 +1805,23 @@ OPTIONS: ${JSON.stringify(options.slice(0, 150))}`
       await humanClick(del);
       await sleep(300);
       await waitStable(300, 5e3);
+    }
+  }
+  async function markCurrentRole(ctx, sectionEl) {
+    const first = blocks(sectionEl, "jobTitleF")[0];
+    if (!first) return;
+    const box = field("currentlyF", first);
+    if (!box) return;
+    const c = containerOf(box);
+    if (readValue(c) === "true") return;
+    const start = dateContainer(first, "start");
+    const end = dateContainer(first, "end");
+    if (!start || !readValue(start) || end && readValue(end)) return;
+    handled.add(c);
+    if (await setCheckbox(c, true)) {
+      ctx.log('Ticked "I currently work here" on your most recent role (it has no end date)');
+      if (end) handled.add(end);
+      await waitStable(300, 4e3);
     }
   }
   function dateContainer(block, which) {
@@ -1930,7 +1948,9 @@ OPTIONS: ${JSON.stringify(options.slice(0, 150))}`
     if (cv && cvInput) {
       const root2 = cvInput.closest("section, fieldset, [data-automation-id^='formField-']") ?? document;
       const names = uploadedFileNames(root2);
-      if (!names.some((n) => n.includes(cv.name.slice(0, 12)))) {
+      if ((hooks.keepExisting?.() || hooks.advance && !hooks.advance()) && names.length) {
+        handled.add(containerOf(cvInput));
+      } else if (!names.some((n) => n.includes(cv.name.slice(0, 12)))) {
         for (const del of qa(sel("fileDelete"), root2).filter(isVisible)) {
           await humanClick(del);
           await sleep(300);
@@ -1953,14 +1973,17 @@ OPTIONS: ${JSON.stringify(options.slice(0, 150))}`
     }
   }
   async function myExperience(ctx) {
+    await hooks.beforeExperience?.();
     const p = ctx.profile;
     const work = section("workSection", /work experience|employment history|berufserfahrung|expérience professionnelle|experiencia (laboral|profesional)|experiência profissional|esperienza (lavorativa|professionale)|werkervaring|doświadczenie zawodowe|職歴|工作经历/iu);
     if (work && p.work.length) {
       const bs = await ensureBlockCount(ctx, work, "jobTitleF", p.work.length);
       for (let i = 0; i < Math.min(bs.length, p.work.length); i++) await fillWork(ctx, bs[i], p.work[i]);
       ctx.log(`Work experience: ${p.work.length} role(s) filled`);
-    } else if (work && hooks.autoSubmit?.()) {
-      await pruneIncomplete(ctx, work, "jobTitleF");
+      await markCurrentRole(ctx, work);
+    } else if (work) {
+      await markCurrentRole(ctx, work);
+      if (hooks.autoSubmit?.()) await pruneIncomplete(ctx, work, "jobTitleF");
     }
     const edu = section("eduSection", /^(education|ausbildung|bildung|formation|educación|formación|educação|formação|istruzione|formazione|opleiding|wykształcenie|学歴|教育)/iu);
     if (edu && p.education.length) {
@@ -2170,6 +2193,7 @@ OPTIONS: ${JSON.stringify(options.slice(0, 150))}`
   var handlers = { resume: () => {
   }, stop: () => {
   } };
+  var hideTimer;
   function setOverlayHandlers(h) {
     handlers = h;
   }
@@ -2184,10 +2208,16 @@ OPTIONS: ${JSON.stringify(options.slice(0, 150))}`
     review: "Ready to submit",
     done: "Submitted",
     error: "Error",
-    idle: "Stopped"
+    idle: "Stopped",
+    filled: "Page filled — check it, then continue"
+    // [oh]
   };
   function renderOverlay(run) {
     if (!document.body) return;
+    if (hideTimer) {
+      clearTimeout(hideTimer);
+      hideTimer = void 0;
+    }
     if (!host) {
       host = document.createElement("div");
       host.id = "wd-autopilot-overlay";
@@ -2196,7 +2226,7 @@ OPTIONS: ${JSON.stringify(options.slice(0, 150))}`
       document.body.appendChild(host);
     }
     if (!root) return;
-    const color = { running: "#5bc08b", paused: "#e0a86a", review: "#c79a6a", done: "#5bc08b", error: "#e06a6a", idle: "#8892a8" }[run.status];
+    const color = { running: "#5bc08b", paused: "#e0a86a", review: "#c79a6a", done: "#5bc08b", error: "#e06a6a", idle: "#8892a8", filled: "#5bc08b" }[run.status];
     const last = run.log[run.log.length - 1]?.msg ?? "";
     root.innerHTML = `
     <style>
@@ -2227,7 +2257,7 @@ OPTIONS: ${JSON.stringify(options.slice(0, 150))}`
         if (a === "stop") handlers.stop();
       })
     );
-    if (run.status === "idle") setTimeout(removeOverlay, 4e3);
+    if (run.status === "idle" || run.status === "filled") hideTimer = window.setTimeout(removeOverlay, 4e3);
   }
 
   // src/workday/engine.ts
@@ -2349,11 +2379,19 @@ OPTIONS: ${JSON.stringify(options.slice(0, 150))}`
   function requiredFlagsHere(ctx) {
     return ctx.run.flags.filter((f) => f.page === ctx.page);
   }
+  function pageFilled(ctx) {
+    ctx.run.status = "filled";
+    ctx.run.pauseReason = void 0;
+    ctx.log("Page filled — check it, then continue");
+    void ctx.save();
+    return "stop";
+  }
   async function fillAndNext(ctx, handler) {
     if (handler) await handler(ctx);
     await genericFill(ctx);
     await ctx.save();
     const flags = requiredFlagsHere(ctx);
+    if (hooks.advance && !hooks.advance() && !flags.length) return pageFilled(ctx);
     if (flags.length) {
       throw new NeedsHuman(`Answer ${flags.length} field(s) on this page, then click Resume: ${flags.map((f) => f.label).join(", ").slice(0, 300)}`);
     }
@@ -2374,7 +2412,9 @@ OPTIONS: ${JSON.stringify(options.slice(0, 150))}`
     }
     ctx.log("Tailoring tool didn't respond in 90 s — continuing with the fallback CV", "warn");
   }
+  var ASSIST_PAGES = ["resumeUpload", "myInformation", "myExperience", "questions", "voluntaryDisclosures", "selfIdentify"];
   async function handlePage(ctx, page) {
+    if (hooks.advance && !hooks.advance() && !ASSIST_PAGES.includes(page)) return "stop";
     switch (page) {
       case "jobPosting": {
         if (ctx.job) chrome.runtime.sendMessage({ type: "wd:jobCaptured", job: ctx.job }).catch(() => {
@@ -2407,6 +2447,7 @@ OPTIONS: ${JSON.stringify(options.slice(0, 150))}`
         throw new NeedsHuman("Verify your email using the link Workday sent, sign in if asked, then click Resume.");
       case "resumeUpload":
         await resumeUpload(ctx);
+        if (hooks.advance && !hooks.advance()) return pageFilled(ctx);
         return clickNext(ctx);
       case "myInformation":
         return fillAndNext(ctx, myInformation);
@@ -2604,6 +2645,7 @@ OPTIONS: ${JSON.stringify(options.slice(0, 150))}`
   var LOGIN_KEY = "ohWorkdayLogin";
   var RESUME_IFRAME = "optimhire-resume-score-record";
   var SEEKER_KEY = "ohWdSeeker";
+  var CV_KEY = "ohCvProfile";
   function readMode() {
     try {
       const m = JSON.parse(sessionStorage.getItem(MODE_KEY) || "null");
@@ -2624,9 +2666,34 @@ OPTIONS: ${JSON.stringify(options.slice(0, 150))}`
     } catch {
     }
   }
+  var ASSIST_KEYS = ["ohAutoTrigger", "ohWdEngineOff", "ohAutomationDisabled", "isAutoProcessStartJob", "isManuallyStartJob", "ohJobQueueActive"];
+  var assistOn = false;
+  function readAssist() {
+    ST.get(ASSIST_KEYS).then((d) => {
+      const running = !!(d.isAutoProcessStartJob || d.isManuallyStartJob || d.ohJobQueueActive);
+      assistOn = d.ohAutoTrigger !== false && d.ohWdEngineOff !== true && d.ohAutomationDisabled !== true && !running;
+    }, () => {
+    });
+  }
+  readAssist();
+  chrome.storage.onChanged.addListener((c, area) => {
+    if (area === "local" && ASSIST_KEYS.some((k) => k in c)) readAssist();
+  });
+  var QUEUE_RESULT_KEY = "ohWdQueueResult";
+  function queueResult(jobId) {
+    try {
+      const r = JSON.parse(sessionStorage.getItem(QUEUE_RESULT_KEY) || "null");
+      return r && r.jobId === jobId ? r : null;
+    } catch {
+      return null;
+    }
+  }
   window.__ohWdEngine = {
-    owns: () => TOP && (!!readMode() || isActive()),
-    takesManual: () => TOP && hasWorkdayApp()
+    owns: () => TOP && (!!readMode() || isActive() || assistOn && hasWorkdayApp()),
+    takesManual: () => TOP && hasWorkdayApp(),
+    isWorkday: () => TOP && isWorkdayHost(),
+    startQueueJob: (job) => void startQueueJob(job),
+    queueResult
   };
   var say = (msg) => console.info(`[WD-Engine] ${msg}`);
   var send = (msg) => chrome.runtime.sendMessage(msg).catch(() => void 0);
@@ -2885,7 +2952,32 @@ OPTIONS: ${JSON.stringify(options.slice(0, 150))}`
     }
     return "";
   }
-  async function buildProfile(ad) {
+  var cvReading = /* @__PURE__ */ new Map();
+  function cvProfileFor(url, p) {
+    if (!url) return Promise.resolve(null);
+    if (!cvReading.has(url)) cvReading.set(url, readCvProfile(url, p).finally(() => setTimeout(() => cvReading.delete(url), 5e3)));
+    return cvReading.get(url);
+  }
+  async function readCvProfile(url, p) {
+    const { [CV_KEY]: cached } = await ST.get(CV_KEY);
+    if (cached && cached.url === url && cached.profile) return cached.profile;
+    const doc = await fetchCv(url, p).catch(() => void 0);
+    if (!doc) return null;
+    const w = window;
+    if (!w.__ohCv) {
+      await within(chrome.runtime.sendMessage({ type: "OH_CV_LOAD" }), 15e3).catch(() => null);
+      for (let i = 0; i < 40 && !w.__ohCv; i++) await new Promise((r2) => setTimeout(r2, 100));
+    }
+    if (!w.__ohCv) return null;
+    const r = await within(w.__ohCv.read(doc.base64, doc.mime), 3e4).catch(() => null);
+    if (!r || !r.profile) return null;
+    const prof = r.profile;
+    await ST.set({ [CV_KEY]: { url, at: Date.now(), roles: prof.work.length, profile: prof } });
+    say(`read your CV: ${prof.work.length} role(s), ${prof.education.length} education, ${prof.skills.length} skill(s)`);
+    return prof;
+  }
+  var cvReady = Promise.resolve();
+  async function buildProfile(ad, cvUrl = "") {
     const s = await profileSources(ad);
     const { ohWorkdayProfile: imported } = await ST.get("ohWorkdayProfile");
     const code = pick(s, "mobile_code", "phone_country_code", "dial_code").replace(/\D/g, "");
@@ -2929,7 +3021,22 @@ OPTIONS: ${JSON.stringify(options.slice(0, 150))}`
         previouslyWorkedHere: false
       }
     });
-    if (!imported || typeof imported !== "object") return base;
+    const withCv = async (prof) => {
+      if (prof.work.length || !cvUrl) {
+        cvReady = Promise.resolve();
+        return prof;
+      }
+      cvReady = cvProfileFor(cvUrl, prof).then((cv) => {
+        if (!cv || !cv.work.length || prof.work.length) return;
+        prof.work = cv.work;
+        if (!prof.education.length) prof.education = cv.education;
+        if (!prof.skills.length) prof.skills = cv.skills;
+        if (!prof.languages.length) prof.languages = cv.languages;
+        if (!prof.summary) prof.summary = cv.summary;
+      }, () => void 0);
+      return prof;
+    };
+    if (!imported || typeof imported !== "object") return withCv(base);
     const p = normalizeProfile(imported);
     const fillIn = (a, b) => {
       for (const k of Object.keys(b)) {
@@ -2938,8 +3045,9 @@ OPTIONS: ${JSON.stringify(options.slice(0, 150))}`
       }
     };
     fillIn(p, base);
-    return p;
+    return withCv(p);
   }
+  var ASSIST_SETTINGS = () => ({ ...SETTINGS, fieldDelayMs: 10 });
   var SETTINGS = {
     ...DEFAULT_WD_SETTINGS,
     consentCreateAccountTerms: true,
@@ -2955,6 +3063,14 @@ OPTIONS: ${JSON.stringify(options.slice(0, 150))}`
     fallbackToMasterCv: true,
     externalAutoRequest: false
   };
+  async function primaryCvUrl() {
+    const { candidateDetails } = await ST.get("candidateDetails");
+    const list = parse(candidateDetails).developer_resume_object;
+    const all = Array.isArray(list) ? list : typeof list === "string" ? parse(list) : [];
+    if (!Array.isArray(all) || !all.length) return "";
+    const main = all.find((r) => String(r.is_primary) === "1") || all[0];
+    return String(main?.resume_url || "");
+  }
   function toBase64(buf) {
     const bytes = new Uint8Array(buf);
     let bin = "";
@@ -3050,20 +3166,22 @@ OPTIONS: ${JSON.stringify(options.slice(0, 150))}`
   async function installHooks(mode) {
     const { complexFormData, updatedResume } = await ST.get(["complexFormData", "updatedResume"]);
     const ad = mode.auto ? parse(complexFormData).applicationDetails : void 0;
-    const profile = await buildProfile(ad);
     const src = await profileSources(ad);
-    const own = pick(ad?.seeker || {}, "resume") || pick(src, "resume", "resume_url", "resumeUrl", "cv_url", "cv");
+    const own = pick(ad?.seeker || {}, "resume") || pick(src, "resume", "resume_url", "resumeUrl", "cv_url", "cv") || await primaryCvUrl();
     const cvUrl = mode.auto ? updatedResume || own : own || updatedResume;
+    const profile = await buildProfile(ad, own || cvUrl);
     let cv = null;
     accountNoted = false;
     setHooks({
       profile: async () => profile,
-      settings: async () => SETTINGS,
+      settings: async () => mode.assist ? ASSIST_SETTINGS() : SETTINGS,
       masterCv: () => cv ??= fetchCv(cvUrl, profile).catch(() => void 0),
       autoSubmit: () => mode.submit,
+      ...mode.assist ? { advance: () => false } : {},
       prefetch: (qs) => askOptimHire(qs),
       answer: hostAnswer,
       onPage: (run) => onPage(mode, run),
+      beforeExperience: () => within(cvReady, 3e4).then(() => void 0),
       onFinish: (run, outcome) => void finish(mode, run, outcome)
     });
   }
@@ -3095,13 +3213,29 @@ OPTIONS: ${JSON.stringify(options.slice(0, 150))}`
     } catch {
     }
   }
+  function plainReason(run, outcome) {
+    if (run.flags.length) {
+      const labels = run.flags.map((f) => f.label).join("; ");
+      return `${run.flags.length} question${run.flags.length === 1 ? "" : "s"} only you can answer: ${labels}`.slice(0, 240);
+    }
+    if (outcome === "review") return "filled, but no Submit button on Review";
+    return (run.pauseReason || "").replace(/,?\s*then click Resume\.?/gi, "").replace(/\s+:/, ":").trim();
+  }
   async function finish(mode, run, outcome) {
+    if (mode.assist) return;
     clearMode();
+    if (mode.queue) {
+      try {
+        sessionStorage.setItem(QUEUE_RESULT_KEY, JSON.stringify({ jobId: mode.jobId, outcome, at: Date.now(), reason: plainReason(run, outcome) }));
+      } catch {
+      }
+    }
     say(`${outcome}${run.pauseReason ? ": " + run.pauseReason : ""}`);
     await remember(run, outcome, mode);
     const reason = run.pauseReason || "";
     if (run.page === "verifyEmail") await noteSite("verify");
     else if (outcome !== "submitted" && /sign-in was rejected|already have an account|failed twice/i.test(reason)) await noteSite("other-password");
+    if (mode.queue) return;
     if (!mode.auto) {
       send({ type: "OH_MANUAL_FILL_STATUS", state: outcome === "error" ? "error" : "done" });
       return;
@@ -3125,7 +3259,7 @@ OPTIONS: ${JSON.stringify(options.slice(0, 150))}`
       url: location.href,
       fromWdEngine: true,
       missingQuestions,
-      message: `Workday: ${reason || (outcome === "review" ? "filled, but no Submit button on Review" : "couldn't finish")}`.slice(0, 300)
+      message: `Workday: ${plainReason(run, outcome) || "couldn't finish"}`.slice(0, 300)
     });
   }
   async function startFromOptimHire(msg) {
@@ -3160,10 +3294,28 @@ OPTIONS: ${JSON.stringify(options.slice(0, 150))}`
     await installHooks(mode);
     await startRun(null);
   }
-  async function startManual(submit2) {
-    if (isActive()) return;
-    const mode = { auto: false, submit: submit2, startedAt: Date.now(), jobId: "" };
+  async function startQueueJob(job) {
+    const id = String(job?.id || "");
+    if (!id || isActive() || readMode()?.jobId === id || queueResult(id)) return;
+    const mode = { auto: false, queue: true, submit: true, startedAt: Date.now(), jobId: id };
     writeMode(mode);
+    answerCache.clear();
+    say(`applying (CSV queue: ${String(job.title || job.url || id).slice(0, 60)})`);
+    try {
+      await installHooks(mode);
+      await startRun(null);
+    } catch (e) {
+      clearMode();
+      try {
+        sessionStorage.setItem(QUEUE_RESULT_KEY, JSON.stringify({ jobId: id, outcome: "error", reason: e?.message || String(e), at: Date.now() }));
+      } catch {
+      }
+    }
+  }
+  async function startManual(submit2, pageOnly = false) {
+    if (isActive()) return;
+    const mode = { auto: false, submit: submit2, assist: pageOnly, startedAt: Date.now(), jobId: "" };
+    if (!pageOnly) writeMode(mode);
     send({ type: "OH_MANUAL_FILL_STATUS", state: "start" });
     await installHooks(mode);
     await startRun(null);
@@ -3181,7 +3333,7 @@ OPTIONS: ${JSON.stringify(options.slice(0, 150))}`
         return false;
       }
       if (msg.type === "OH_AUTOFILL_THIS_PAGE" && hasWorkdayApp()) {
-        void startManual(!!msg.submit);
+        void startManual(!!msg.submit, !!msg.pageOnly);
         return false;
       }
       if (msg.type === "STOP_ALL_PROCESSES" && readMode()?.auto) {
@@ -3191,6 +3343,76 @@ OPTIONS: ${JSON.stringify(options.slice(0, 150))}`
       }
       return false;
     });
+    const submitCountdown = (seconds = 5) => {
+      if (!document.body) return;
+      const host2 = document.createElement("div");
+      host2.id = "oh-wd-submit-countdown";
+      host2.style.cssText = "position:fixed;right:16px;bottom:16px;z-index:2147483647";
+      const root2 = host2.attachShadow({ mode: "open" });
+      root2.innerHTML = `<style>
+      .b{font:13px/1.4 Inter,system-ui,sans-serif;display:flex;align-items:center;gap:12px;padding:12px 14px;background:#12141c;color:#e6e8ef;
+         border:1px solid #262a36;border-radius:12px;box-shadow:0 10px 30px rgba(0,0,0,.45)}
+      b{font-weight:600} button{font:600 12.5px/1 inherit;font-family:inherit;height:30px;padding:0 12px;border-radius:8px;cursor:pointer;
+         background:#1a1d27;color:#e6e8ef;border:1px solid #333849} button:hover{background:#20242f}
+      .now{background:#6d5efc;border-color:#6d5efc;color:#fff}</style>
+      <div class="b" role="status"><span>Submitting your application in <b id="n">${seconds}</b>…</span>
+      <button class="now" id="go">Submit now</button><button id="x">Cancel</button></div>`;
+      document.body.appendChild(host2);
+      let left = seconds;
+      let done = false;
+      const finish2 = (submit2) => {
+        if (done) return;
+        done = true;
+        clearInterval(t);
+        host2.remove();
+        if (submit2) {
+          say("assist: submitting from Review");
+          void startManual(true);
+        } else say("assist: submit cancelled — Review is yours");
+      };
+      const t = window.setInterval(() => {
+        left--;
+        const n = root2.getElementById("n");
+        if (n) n.textContent = String(left);
+        if (left <= 0) finish2(true);
+      }, 1e3);
+      root2.getElementById("go")?.addEventListener("click", () => finish2(true));
+      root2.getElementById("x")?.addEventListener("click", () => finish2(false));
+    };
+    const ASSIST_PAGES2 = ["resumeUpload", "myInformation", "myExperience", "questions", "voluntaryDisclosures", "selfIdentify"];
+    const assisted = /* @__PURE__ */ new Set();
+    setInterval(() => {
+      if (!assistOn || readMode() || isActive() || !hasWorkdayApp()) return;
+      const page = detectPage();
+      if (page === "review") {
+        const rk = `review|${location.pathname}`;
+        if (!assisted.has(rk) && !document.getElementById("oh-wd-submit-countdown")) {
+          assisted.add(rk);
+          submitCountdown();
+        }
+        return;
+      }
+      if (!ASSIST_PAGES2.includes(page)) return;
+      const key = `${page}|${activeStepName()}|${location.pathname}`;
+      if (assisted.has(key)) return;
+      assisted.add(key);
+      const mode = { auto: false, submit: false, assist: true, startedAt: Date.now(), jobId: "" };
+      void installHooks(mode).then(() => startRun(null));
+    }, 900);
+    const warmCv = (tries = 0) => {
+      if (!hasWorkdayApp()) {
+        if (tries < 40) setTimeout(() => warmCv(tries + 1), 500);
+        return;
+      }
+      if (!assistOn && !readMode()) return;
+      void (async () => {
+        const src = await profileSources();
+        const url = pick(src, "resume", "resume_url", "resumeUrl", "cv_url", "cv") || await primaryCvUrl();
+        const { ohWorkdayProfile } = await ST.get("ohWorkdayProfile");
+        if (url && !(ohWorkdayProfile && Array.isArray(ohWorkdayProfile.work) && ohWorkdayProfile.work.length)) await cvProfileFor(url, normalizeProfile({}));
+      })().catch(() => void 0);
+    };
+    setTimeout(() => warmCv(), 1500);
     const boot = (tries = 0) => {
       const mode = readMode();
       if (!mode) return;
