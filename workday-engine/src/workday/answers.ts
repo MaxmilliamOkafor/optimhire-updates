@@ -167,6 +167,14 @@ export async function resolveAnswer(
     return { answer: saved.answer, source: "bank" };
   }
 
+  // [oh] Knockout questions: the user's true answer, before anything that could guess.
+  if (hooks.knockout && !CONTACT_RX.test(label)) {
+    let k: string | null = null;
+    try { k = hooks.knockout(label, options); } catch { k = null; }
+    const pick = k ? (options.length ? (options.includes(k) ? k : optionFor(k, options)) : k) : null;
+    if (pick) return { answer: pick, source: "host" };
+  }
+
   // [oh] Unattended runs: the host's answer (the user's own saved answers / answer service) comes
   // before the profile's defaults, which only know what the profile was told.
   if (hooks.answer && !CONTACT_RX.test(label)) {

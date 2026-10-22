@@ -81,7 +81,7 @@
            background: var(--bg3); color: var(--text); font-size: 11px; font-weight: 600; }
   .count:empty { display: none; }
 
-  input[type="text"], input[type="url"], input[type="email"], input[type="password"], select, textarea {
+  input[type="text"], input[type="url"], input[type="email"], input[type="password"], input[type="number"], select, textarea {
     height: 34px; background: var(--bg2); color: var(--text); border: 1px solid var(--border);
     padding: 0 11px; border-radius: 8px; font-size: 12.5px; font-family: inherit;
   }
@@ -182,6 +182,19 @@
   .qa-list td { font-size: 12.5px; vertical-align: top; word-break: break-word; }
   .qa-list td.qa-ans { color: var(--success); }
   .qa-list td.qa-meta { color: var(--muted); font-size: 11px; white-space: nowrap; }
+  .ko-grid { display: grid; grid-template-columns: 1fr auto; gap: 10px 18px; align-items: center; }
+  .ko-q { font-size: 13px; color: var(--text); line-height: 1.4; }
+  .ko-q small { display: block; color: var(--muted); font-size: 11.5px; margin-top: 1px; }
+  .seg { justify-self: end; display: inline-flex; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; background: var(--bg3); }
+  .seg input { position: absolute; opacity: 0; pointer-events: none; width: auto !important; }
+  .modal .seg label { margin: 0; padding: 5px 13px; font-size: 12px; font-weight: 550; color: var(--muted); cursor: pointer; user-select: none; }
+  .modal .seg label + input + label { border-left: 1px solid var(--border); }
+  .modal .seg input:checked + label { background: var(--accent); color: #fff; }
+  .modal .seg input:focus-visible + label { outline: 2px solid var(--accent); outline-offset: -2px; }
+  .ko-3 { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
+  .ko-3 label { margin-top: 0 !important; }
+  .count.warn { background: rgba(245, 180, 74, .16); color: var(--warning); }
+  @media (max-width: 640px) { .ko-3 { grid-template-columns: 1fr; } }
   .qa-empty { padding: 28px 10px; text-align: center; color: var(--muted); font-size: 13px; line-height: 1.6; }
   @media (max-width: 1000px) { .stats { grid-template-columns: repeat(4, minmax(0, 1fr)); } }
   @media (max-width: 640px) { .page { padding: 16px; } .stats { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
@@ -221,6 +234,7 @@
       </div>
       <div class="group">
         <button id="btnQaMemory" class="btn-ghost" title="Answers learned from applications that were confirmed as submitted — review or forget them"><svg class="i" viewBox="0 0 16 16" aria-hidden="true"><path d="M3 4.5h10M3 8h10M3 11.5h6" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" fill="none"/></svg>Remembered answers <span id="qaMemCount" class="count"></span></button>
+        <button id="btnKnockout" class="btn-ghost" title="Your true answers to screening questions — work rights per country, sponsorship, relocation, years, degree"><svg class="i" viewBox="0 0 16 16" aria-hidden="true"><path d="M8 1.8l5 2v4c0 3.1-2.1 5.4-5 6.4-2.9-1-5-3.3-5-6.4v-4z" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round" fill="none"/><path d="M5.8 8.2l1.6 1.6 2.9-3.1" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" fill="none"/></svg>Knockout answers <span id="koBadge" class="count warn"></span></button>
         <button id="btnWdLogin" class="btn-ghost" title="Workday sign-in, the Workday engine, your imported profile and emailed verification codes"><svg class="i" viewBox="0 0 16 16" aria-hidden="true"><circle cx="5.5" cy="8" r="2.75" stroke="currentColor" stroke-width="1.4" fill="none"/><path d="M8.2 8H14M12 8v2.2" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" fill="none"/></svg>Workday &amp; sign-in</button>
         <button id="btnDebug" class="btn-ghost btn-icon" title="Debug log" aria-label="Debug log"><svg class="i" viewBox="0 0 16 16" aria-hidden="true"><path d="M5 4h8M5 8h8M5 12h5M2.5 4h.01M2.5 8h.01M2.5 12h.01" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" fill="none"/></svg></button>
       </div>
@@ -308,7 +322,7 @@
         When an application is <b>confirmed</b> as submitted, the answers you (or OptimHire) gave to questions
         the built-in rules could not answer — or answered differently — are remembered and reused next time the
         same question appears. Contact details, links, salary, dates and sponsorship / work-authorisation
-        questions are never remembered (sponsorship always answers “No”). Forget anything you don't want reused.
+        questions are never remembered (those come from your Knockout answers). Forget anything you don't want reused.
       </div>
       <div class="qa-tools">
         <input type="text" id="qaSearch" placeholder="Search questions or answers…">
@@ -317,6 +331,47 @@
       <div id="qaList" class="qa-list"></div>
       <div class="modal-actions">
         <button id="qaClose">Close</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Knockout answers -->
+  <div id="koModal" class="modal-bg hidden">
+    <div class="modal qa-modal" style="max-width:640px">
+      <h2>Knockout answers</h2>
+      <div class="help-text">
+        These questions screen applications out automatically: a wrong answer gets you rejected or ranked last,
+        whoever filled it in. Every application answers them with what you set here — work authorisation and
+        sponsorship <b>for the country the job is in</b>, years of experience 7 unless you set another number, the
+        certifications you hold, your degree from your CV. A wrong answer already on a
+        page (from OptimHire or any other filler) is corrected, and Submit waits until they are right. Anything you
+        change by hand on a page is left as you set it.
+      </div>
+      <div class="section">
+        <label for="koCountries">Countries where you can work without sponsorship</label>
+        <input type="text" id="koCountries" placeholder="e.g. United Kingdom, Ireland" autocomplete="off">
+        <div class="help-text">Separate with commas. For a job anywhere else, "Are you authorised to work…?" is answered
+        No and "Will you need sponsorship?" Yes.</div>
+        <label class="switch-row" style="margin-top:14px !important">
+          <span><b>Anywhere in the EU / EEA</b><small>You have EU-wide work rights (e.g. an EU passport).</small></span>
+          <input type="checkbox" id="koEu"><span class="sw"></span>
+        </label>
+      </div>
+      <div class="section"><div id="koGrid" class="ko-grid"></div></div>
+      <div class="section">
+        <div class="ko-3">
+          <div><label for="koYears">Years of experience</label><input type="number" id="koYears" min="0" max="60"></div>
+          <div><label for="koDegree">Highest degree</label><input type="text" id="koDegree" autocomplete="off"></div>
+          <div><label for="koSalary">Expected salary</label><input type="text" id="koSalary" inputmode="numeric" autocomplete="off"></div>
+        </div>
+        <div id="koCvNote" class="help-text"></div>
+        <label for="koCerts">Certifications you hold</label>
+        <input type="text" id="koCerts" placeholder="e.g. AWS, PMP, CISSP" autocomplete="off">
+        <div class="help-text">"Do you hold an AWS Certified … certification?" is answered Yes for each one listed (separate with commas).</div>
+      </div>
+      <div class="modal-actions">
+        <button id="koClose">Close</button>
+        <button id="koSave" class="btn-primary">Save answers</button>
       </div>
     </div>
   </div>
@@ -379,5 +434,6 @@
   <script src="../assets/jobQueue.js"></script>
   <script src="../assets/qaMemory.js"></script>
   <script src="../assets/workdayLogin.js"></script>
+  <script src="../assets/knockout.js"></script>
 </body>
 </html>

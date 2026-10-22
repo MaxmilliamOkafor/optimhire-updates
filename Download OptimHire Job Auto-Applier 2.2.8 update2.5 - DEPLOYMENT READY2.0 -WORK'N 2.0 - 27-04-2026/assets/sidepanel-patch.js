@@ -2578,6 +2578,13 @@
     '#oh-queue-card .qc-primary:hover{background:var(--qc-accent-2);border-color:var(--qc-accent-2)}',
     '#oh-queue-card .qc-square{flex:0 0 34px;padding:0} #oh-queue-card .qc-narrow{flex:0 0 auto}',
     '#oh-queue-card .qc-sep{height:1px;background:var(--qc-line);margin:4px 0 6px}',
+    '#oh-queue-card .qc-ko{display:flex;width:100%;align-items:center;gap:10px;margin:0 0 6px;padding:8px 10px;border:1px solid var(--qc-line);border-radius:10px;background:transparent;color:var(--qc-text);text-align:left;cursor:pointer;font:inherit}',
+    '#oh-queue-card .qc-ko:hover{background:var(--qc-raise)}',
+    '#oh-queue-card .qc-ko.qc-ko-warn{border-color:rgba(245,180,74,.5);background:rgba(245,180,74,.08)}',
+    '#oh-queue-card .qc-ko span{flex:1;display:flex;flex-direction:column;gap:1px;min-width:0}',
+    '#oh-queue-card .qc-ko b{font-size:12px;font-weight:600}',
+    '#oh-queue-card .qc-ko small{font-size:10.5px;color:var(--qc-muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}',
+    '#oh-queue-card .qc-ko svg{width:12px;height:12px;color:var(--qc-muted);flex:none}',
     '#oh-queue-card .qc-switch{display:flex;width:100%;align-items:center;gap:10px;padding:7px 2px;border:0;background:transparent;text-align:left;cursor:pointer}',
     '#oh-queue-card .qc-switch-text{flex:1;display:flex;flex-direction:column}',
     '#oh-queue-card .qc-switch-text b{font-weight:550;font-size:12px}',
@@ -2652,6 +2659,8 @@
           '<button id="oh-qc-fillsubmit" class="qc-btn qc-narrow" title="Autofill this page and press its submit button">' + ICON.send + 'Fill &amp; submit</button>' +
         '</div>' +
         '<div class="qc-sep"></div>' +
+        '<button id="oh-qc-ko" class="qc-ko" title="Work rights, sponsorship, relocation, years of experience… are always answered with your true answers, per job country. Wrong answers get applications rejected or ranked last.">' +
+          '<span><b id="oh-qc-ko-title">Knockout answers</b><small id="oh-qc-ko-sub">—</small></span>' + ICON.arrow + '</button>' +
         '<button id="oh-qc-master" class="qc-switch" role="switch" aria-checked="true" ' +
           'title="Hard stop: makes the extension completely inert — no auto-clicking, no auto-submitting, no background loops — until you turn it back on">' +
           '<span class="qc-switch-text"><b>Automation</b><small id="oh-qc-master-sub">Applies and submits for you</small></span><span class="qc-toggle"></span></button>' +
@@ -2702,6 +2711,11 @@
             refresh();
           });
         });
+      });
+      var koLine = document.getElementById('oh-qc-ko');
+      if (koLine) koLine.addEventListener('click', function () {
+        try { chrome.tabs.create({ url: chrome.runtime.getURL('tabs/jobQueue.html#knockout'), active: true }); }
+        catch (_) {}
       });
       var qaLine = document.getElementById('oh-qc-qamem');
       if (qaLine) qaLine.addEventListener('click', function () {
@@ -2932,6 +2946,21 @@
       paintQaCount();
     }
 
+    /* Knockout answers: a prompt until you have checked them, then where you can work. */
+    function paintKo() {
+      var row = document.getElementById('oh-qc-ko'), t = document.getElementById('oh-qc-ko-title'), sub = document.getElementById('oh-qc-ko-sub');
+      if (!row || !t || !sub) return;
+      chrome.storage.local.get(['ohKnockout', 'ohKnockoutFixes'], function (d) {
+        var ko = (d && d.ohKnockout) || null, fixes = Number(d && d.ohKnockoutFixes) || 0;
+        var ok = !!(ko && ko.confirmed);
+        row.classList.toggle('qc-ko-warn', !ok);
+        t.textContent = ok ? 'Knockout answers' : 'Check your knockout answers';
+        var where = ko && ko.workCountries && ko.workCountries.length ? 'Work rights: ' + [].concat(ko.workCountries).join(', ') + (ko.euWide ? ' + EU' : '') : '';
+        sub.textContent = ok ? (where || 'Set') + (fixes ? ' · ' + fixes + ' wrong answer' + (fixes === 1 ? '' : 's') + ' fixed' : '')
+                             : 'Work rights, relocation, years — wrong ones get you rejected';
+      });
+    }
+
     /* Which other autofill extensions are installed / paused right now. */
     var OTHER_FILLER_RE = /ats ?tailor|job ?genie|simplify|jobright|speedy ?apply|lazy ?apply|auto ?fill|auto[- ]?appl|job ?assist|careerflow|huntr|job ?copilot|\bteal\b|apply ?ai|ai ?apply|jobscan|massapply|loopcv|sonara/i;
     function paintOthers() {
@@ -2979,6 +3008,7 @@
             var pl = document.getElementById('oh-qc-prio');
             if (pl) pl.setAttribute('aria-checked', d && d.ohPreferAts === false ? 'false' : 'true');
             paintOthers();
+            paintKo();
           } catch (_) {}
           _queueTier = (d && d.ohPreferAts !== false && d.ohQueueTier) || null;
           var map = (d && d.ohHarvestedJobs) || {};
@@ -3037,6 +3067,7 @@
         chrome.storage.onChanged.addListener(function (changes, area) {
           if (area !== 'local') return;
           if (changes.ohQaMemory) setQaCount(changes.ohQaMemory.newValue);
+          if (changes.ohKnockout || changes.ohKnockoutFixes) paintKo();
           if (changes[KEY_QUEUE] || changes[KEY_ACTIVE] || changes.ohHarvestedJobs ||
               changes.isAutoProcessStartJob || changes.isManuallyStartJob || changes.matchingJobCount ||
               changes.ohPreferAts || changes.ohQueueTier) refresh();

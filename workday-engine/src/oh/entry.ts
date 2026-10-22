@@ -587,6 +587,11 @@ async function installHooks(mode: Mode): Promise<void> {
     autoSubmit: () => mode.submit,
     ...(mode.assist ? { advance: () => false } : {}),
     prefetch: (qs) => askOptimHire(qs),
+    knockout: (label, options) => {
+      // Your true answers to knockout questions (assets/optimhire-patch.js, same isolated world).
+      const ko = (window as unknown as { __ohKnockout?: (l: string, o: string[]) => string | null }).__ohKnockout;
+      return typeof ko === "function" ? ko(label, options) : null;
+    },
     answer: hostAnswer,
     onPage: (run) => onPage(mode, run),
     beforeExperience: () => within(cvReady, 30_000).then(() => undefined),

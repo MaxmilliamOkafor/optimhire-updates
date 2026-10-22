@@ -29,6 +29,9 @@ export interface EngineHooks {
   keepExisting?: () => boolean;
   /** Fetch answers for a page's open questions in one request, before they are resolved one by one. */
   prefetch?: (questions: OpenQuestion[]) => Promise<void>;
+  /** Knockout questions (work authorisation for this job's country, sponsorship, relocation, years,
+   *  degree…): the user's true answer — the option to pick, or the text — or null when it is not one. */
+  knockout?: (label: string, options: string[]) => string | null;
   /** The host's answer to one question (the user's own saved answers / answer service), or null. */
   answer?: (label: string, kind: ControlKind, options: string[]) => Promise<string | null>;
   /** The run ended: submitted, stopped on Review, paused for the user, failed, or stopped. */

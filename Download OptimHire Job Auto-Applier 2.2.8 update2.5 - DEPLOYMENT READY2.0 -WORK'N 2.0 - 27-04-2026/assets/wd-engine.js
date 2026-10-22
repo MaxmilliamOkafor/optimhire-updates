@@ -1647,6 +1647,16 @@
     if (saved && (!options.length || options.some((o) => similarity(o, saved.answer) >= 0.85))) {
       return { answer: saved.answer, source: "bank" };
     }
+    if (hooks.knockout && !CONTACT_RX.test(label)) {
+      let k = null;
+      try {
+        k = hooks.knockout(label, options);
+      } catch {
+        k = null;
+      }
+      const pick2 = k ? options.length ? options.includes(k) ? k : optionFor(k, options) : k : null;
+      if (pick2) return { answer: pick2, source: "host" };
+    }
     if (hooks.answer && !CONTACT_RX.test(label)) {
       const a = await hooks.answer(label, kind, options).catch(() => null);
       const pick2 = a ? optionFor(a, options) : null;
@@ -3179,6 +3189,10 @@ OPTIONS: ${JSON.stringify(options.slice(0, 150))}`
       autoSubmit: () => mode.submit,
       ...mode.assist ? { advance: () => false } : {},
       prefetch: (qs) => askOptimHire(qs),
+      knockout: (label, options) => {
+        const ko = window.__ohKnockout;
+        return typeof ko === "function" ? ko(label, options) : null;
+      },
       answer: hostAnswer,
       onPage: (run) => onPage(mode, run),
       beforeExperience: () => within(cvReady, 3e4).then(() => void 0),

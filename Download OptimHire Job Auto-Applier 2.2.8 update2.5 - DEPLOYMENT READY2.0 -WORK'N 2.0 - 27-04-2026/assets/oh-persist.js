@@ -48,7 +48,8 @@
     'ohWdEngineLog',          // the Workday engine's last runs, for diagnostics
     'ohWdSeeker',             // your details from the last OptimHire job (Workday "Autofill this page")
     'ohGmailCodes',           // read verification codes from the signed-in Gmail (opt-in)
-    'ohCvProfile'             // roles / education / skills read from your CV
+    'ohCvProfile',            // roles / education / skills read from your CV
+    'ohKnockout'              // your true answers to knockout questions (work rights, relocation…)
   ];
   var KEYSET = {};
   KEYS.forEach(function (k) { KEYSET[k] = 1; });
