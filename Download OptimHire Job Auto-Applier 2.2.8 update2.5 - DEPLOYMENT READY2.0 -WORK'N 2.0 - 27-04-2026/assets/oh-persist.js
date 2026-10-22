@@ -49,7 +49,8 @@
     'ohWdSeeker',             // your details from the last OptimHire job (Workday "Autofill this page")
     'ohGmailCodes',           // read verification codes from the signed-in Gmail (opt-in)
     'ohCvProfile',            // roles / education / skills read from your CV
-    'ohKnockout'              // your true answers to knockout questions (work rights, relocation…)
+    'ohKnockout',             // your true answers to knockout questions (work rights, relocation…)
+    'ohTailorCv'              // CSV jobs: your CV ordered to each job's description (off by default)
   ];
   var KEYSET = {};
   KEYS.forEach(function (k) { KEYSET[k] = 1; });

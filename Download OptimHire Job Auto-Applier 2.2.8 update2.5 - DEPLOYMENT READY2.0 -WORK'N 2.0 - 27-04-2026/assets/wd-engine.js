@@ -415,10 +415,10 @@
     let best = "en";
     let bestScore = 0;
     for (const [lang, hints] of Object.entries(LANG_HINTS)) {
-      const score = hints.reduce((s, h) => s + (freq.get(h) ?? 0), 0);
-      if (score > bestScore) {
+      const score2 = hints.reduce((s, h) => s + (freq.get(h) ?? 0), 0);
+      if (score2 > bestScore) {
         best = lang;
-        bestScore = score;
+        bestScore = score2;
       }
     }
     return best;
@@ -738,15 +738,15 @@
   }
   function bestMatch(els, wanted, min = 0.6) {
     let best = null;
-    let score = 0;
+    let score2 = 0;
     for (const el of els) {
       const s = similarity(wanted, text(el));
-      if (s > score) {
-        score = s;
+      if (s > score2) {
+        score2 = s;
         best = el;
       }
     }
-    return score >= min ? best : null;
+    return score2 >= min ? best : null;
   }
   var DECLINE_RX2 = DECLINE_RX;
 
@@ -926,16 +926,16 @@
   async function selectRadio(target, wanted) {
     const rs = radios(target);
     let best = null;
-    let score = 0;
+    let score2 = 0;
     for (const r of rs) {
       const l = optionLabel(r);
       const s = wanted === "decline" ? DECLINE_RX2.test(l) ? 1 : 0 : similarity(wanted, l);
-      if (s > score) {
-        score = s;
+      if (s > score2) {
+        score2 = s;
         best = r;
       }
     }
-    if (!best || score < 0.6) return false;
+    if (!best || score2 < 0.6) return false;
     if (best.checked) return true;
     await humanClick(best);
     await sleep(80);
@@ -1361,6 +1361,14 @@
     list.unshift(app);
     await set(K.apps, list.slice(0, 1e3));
   }
+  function bytesToBase64(bytes) {
+    let bin = "";
+    const chunk = 32768;
+    for (let i = 0; i < bytes.length; i += chunk) {
+      bin += String.fromCharCode(...bytes.subarray(i, i + chunk));
+    }
+    return btoa(bin);
+  }
   function base64ToBytes(b64) {
     const bin = atob(b64);
     const out = new Uint8Array(bin.length);
@@ -1647,15 +1655,15 @@
     const bucket = num ? bucketFor(Math.floor(+num[1]), options) : null;
     if (bucket) return bucket;
     let best = null;
-    let score = 0;
+    let score2 = 0;
     for (const o of options) {
       const s = similarity(o, answer);
-      if (s > score) {
-        score = s;
+      if (s > score2) {
+        score2 = s;
         best = o;
       }
     }
-    return score >= 0.6 ? best : null;
+    return score2 >= 0.6 ? best : null;
   }
   var RULES = [
     [Q.sponsorship, (_l, c) => yesNo(c.profile.answers.needsSponsorship)],
@@ -1817,10 +1825,10 @@ OPTIONS: ${JSON.stringify(options.slice(0, 150))}`
   function bulletsText(bullets) {
     return bullets.map((b) => `• ${b.replace(/^[•\-*]\s*/, "")}`).join("\n");
   }
-  function section(key, heading2) {
+  function section(key, heading3) {
     const byId = byAid(key);
     if (byId) return byId;
-    const h = qa("h2, h3, h4, legend, [role='heading']").find((e) => isVisible(e) && heading2.test(text(e)));
+    const h = qa("h2, h3, h4, legend, [role='heading']").find((e) => isVisible(e) && heading3.test(text(e)));
     return h ? h.closest("section, fieldset, [role='group'], div[data-automation-id]") ?? h.parentElement : null;
   }
   function blocks(sectionEl, anchor) {
@@ -2713,6 +2721,430 @@ OPTIONS: ${JSON.stringify(options.slice(0, 150))}`
     return active;
   }
 
+  // src/workday/tailor.ts
+  function tokens(s) {
+    return s.replace(/[^\p{L}\p{N}_+#./ -]+/gu, " ").split(/\s+/).map((t) => t.replace(/^[./-]+|[./-]+$/g, "")).filter((t) => t.length > 1);
+  }
+  function extractKeywords(jd, limit = 40) {
+    const toks = tokens(jd);
+    const counts = /* @__PURE__ */ new Map();
+    const bump = (k, w) => counts.set(k, (counts.get(k) ?? 0) + w);
+    for (let i = 0; i < toks.length; i++) {
+      const t = toks[i];
+      const lower = t.toLowerCase();
+      if (STOPWORDS.has(lower)) continue;
+      const technical = new RegExp("\\p{Lu}.*\\p{Lu}|[+#.]|\\d", "u").test(t) || new RegExp("^\\p{Lu}\\p{Ll}+\\p{Lu}", "u").test(t);
+      bump(lower, technical ? 2 : 1);
+      const t2 = toks[i + 1];
+      if (t2 && !STOPWORDS.has(t2.toLowerCase())) bump(`${lower} ${t2.toLowerCase()}`, 1.5);
+    }
+    return [...counts.entries()].filter(([k, v]) => v >= 2 && k.length > 2).sort((a, b) => b[1] - a[1]).slice(0, limit).map(([k]) => k);
+  }
+  function score(text2, kws) {
+    const t = text2.toLowerCase();
+    return kws.reduce((s, k, i) => t.includes(k) ? s + (kws.length - i) : s, 0);
+  }
+  function keywordTailor(p, job, baseLetter = "", _lang = "en") {
+    const kws = extractKeywords(`${job.title}
+${job.description}`);
+    const roles = {};
+    for (const w of p.work) roles[w.id] = [...w.bullets].sort((a, b) => score(b, kws) - score(a, kws));
+    const skills = [...p.skills].sort((a, b) => score(b, kws) - score(a, kws));
+    const name = `${p.personal.firstName} ${p.personal.lastName}`.trim();
+    const coverLetter = baseLetter.trim() || `Dear Hiring Team,
+
+I am applying for the ${job.title} role (${job.reqId}). ${p.summary}
+
+In my recent work as ${p.work[0]?.title ?? "a professional"} at ${p.work[0]?.company ?? "my current company"}, ${(roles[p.work[0]?.id ?? ""] ?? [])[0] ?? ""}
+
+I would welcome the chance to discuss how I can contribute.
+
+Sincerely,
+${name}`;
+    return { summary: p.summary, skills, roles, coverLetter, keywords: kws, warnings: [], method: "keyword" };
+  }
+
+  // src/workday/pdf.ts
+  var HELV = [
+    278,
+    278,
+    355,
+    556,
+    556,
+    889,
+    667,
+    191,
+    333,
+    333,
+    389,
+    584,
+    278,
+    333,
+    278,
+    278,
+    556,
+    556,
+    556,
+    556,
+    556,
+    556,
+    556,
+    556,
+    556,
+    556,
+    278,
+    278,
+    584,
+    584,
+    584,
+    556,
+    1015,
+    667,
+    667,
+    722,
+    722,
+    667,
+    611,
+    778,
+    722,
+    278,
+    500,
+    667,
+    556,
+    833,
+    722,
+    778,
+    667,
+    778,
+    722,
+    667,
+    611,
+    722,
+    667,
+    944,
+    667,
+    667,
+    611,
+    278,
+    278,
+    278,
+    469,
+    556,
+    333,
+    556,
+    556,
+    500,
+    556,
+    556,
+    278,
+    556,
+    556,
+    222,
+    222,
+    500,
+    222,
+    833,
+    556,
+    556,
+    556,
+    556,
+    333,
+    500,
+    278,
+    556,
+    500,
+    722,
+    500,
+    500,
+    500,
+    334,
+    260,
+    334,
+    584
+  ];
+  var WIN_ANSI = {
+    "€": 128,
+    "‚": 130,
+    "„": 132,
+    "…": 133,
+    "•": 149,
+    "–": 150,
+    "—": 151,
+    "‘": 145,
+    "’": 146,
+    "“": 147,
+    "”": 148,
+    "™": 153,
+    "·": 183,
+    "Š": 138,
+    "š": 154,
+    "Ž": 142,
+    "ž": 158,
+    "Œ": 140,
+    "œ": 156,
+    "Ÿ": 159,
+    "‹": 139,
+    "›": 155
+  };
+  var TRANSLIT = { "ł": "l", "Ł": "L", "đ": "d", "Đ": "D", "ı": "i" };
+  function encodeChar(ch) {
+    const c = ch.charCodeAt(0);
+    if (c >= 32 && c <= 126) return c;
+    if (WIN_ANSI[ch] !== void 0) return WIN_ANSI[ch];
+    if (c >= 160 && c <= 255) return c;
+    const base = TRANSLIT[ch] ?? ch.normalize("NFD")[0];
+    if (base && base !== ch) return encodeChar(base);
+    return 63;
+  }
+  function charWidth(code, bold) {
+    let w;
+    if (code >= 32 && code <= 126) w = HELV[code - 32];
+    else if (code === 149) w = 350;
+    else if (code === 150) w = 556;
+    else if (code === 151) w = 1e3;
+    else w = 556;
+    return bold ? w * 1.06 : w;
+  }
+  function textWidth(s, size, bold = false) {
+    let w = 0;
+    for (const ch of s) w += charWidth(encodeChar(ch), bold);
+    return w * size / 1e3;
+  }
+  function wrap(s, size, maxWidth, bold = false) {
+    const out = [];
+    for (const para of s.split("\n")) {
+      const words = para.split(/\s+/).filter(Boolean);
+      if (!words.length) {
+        out.push("");
+        continue;
+      }
+      let line = "";
+      for (const w of words) {
+        const cand = line ? `${line} ${w}` : w;
+        if (textWidth(cand, size, bold) <= maxWidth || !line) line = cand;
+        else {
+          out.push(line);
+          line = w;
+        }
+      }
+      if (line) out.push(line);
+    }
+    return out;
+  }
+  function pdfString(s) {
+    let out = "(";
+    for (const ch of s) {
+      const b = encodeChar(ch);
+      if (b === 40 || b === 41 || b === 92) out += "\\" + String.fromCharCode(b);
+      else if (b > 126) out += "\\" + b.toString(8).padStart(3, "0");
+      else out += String.fromCharCode(b);
+    }
+    return out + ")";
+  }
+  function newPdf() {
+    const doc = { pageWidth: 595.28, pageHeight: 841.89, margin: 50, pages: [[]], y: 0 };
+    doc.y = doc.pageHeight - doc.margin;
+    return doc;
+  }
+  function ensure(doc, h) {
+    if (doc.y - h < doc.margin) {
+      doc.pages.push([]);
+      doc.y = doc.pageHeight - doc.margin;
+    }
+  }
+  function drawText(doc, s, x, size, bold = false) {
+    doc.pages[doc.pages.length - 1].push(
+      `BT /${bold ? "F2" : "F1"} ${size} Tf ${x.toFixed(2)} ${doc.y.toFixed(2)} Td ${pdfString(s)} Tj ET`
+    );
+  }
+  function rule(doc) {
+    const y = doc.y.toFixed(2);
+    doc.pages[doc.pages.length - 1].push(
+      `0.6 w 0.3 g ${doc.margin} ${y} m ${(doc.pageWidth - doc.margin).toFixed(2)} ${y} l S 0 g`
+    );
+  }
+  function paragraph(doc, s, opts = {}) {
+    const size = opts.size ?? 10;
+    const lead = size * 1.32;
+    const left = doc.margin + (opts.indent ?? 0);
+    const bulletGap = opts.bullet ? 11 : 0;
+    const width = doc.pageWidth - doc.margin - left - bulletGap;
+    const lines = wrap(s, size, width, opts.bold);
+    lines.forEach((line, i) => {
+      ensure(doc, lead);
+      doc.y -= lead;
+      if (opts.bullet && i === 0) drawText(doc, "•", left, size);
+      const x = opts.center ? (doc.pageWidth - textWidth(line, size, opts.bold)) / 2 : left + bulletGap;
+      drawText(doc, line, x, size, opts.bold);
+    });
+    doc.y -= opts.after ?? 0;
+  }
+  function space(doc, h) {
+    doc.y -= h;
+  }
+  function heading2(doc, s) {
+    ensure(doc, 34);
+    doc.y -= 8;
+    paragraph(doc, s.toUpperCase(), { size: 11, bold: true });
+    doc.y -= 3;
+    rule(doc);
+    doc.y -= 2;
+  }
+  function renderPdf(doc, meta) {
+    const objs = [];
+    const add = (s) => {
+      objs.push(s);
+      return objs.length;
+    };
+    const catalog = add("");
+    const pagesId = add("");
+    const f1 = add("<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>");
+    const f2 = add("<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold /Encoding /WinAnsiEncoding >>");
+    const kids = [];
+    for (const ops of doc.pages) {
+      const stream = ops.join("\n");
+      const content = add(`<< /Length ${stream.length} >>
+stream
+${stream}
+endstream`);
+      kids.push(
+        add(
+          `<< /Type /Page /Parent ${pagesId} 0 R /MediaBox [0 0 ${doc.pageWidth} ${doc.pageHeight}] /Resources << /Font << /F1 ${f1} 0 R /F2 ${f2} 0 R >> >> /Contents ${content} 0 R >>`
+        )
+      );
+    }
+    objs[catalog - 1] = `<< /Type /Catalog /Pages ${pagesId} 0 R >>`;
+    objs[pagesId - 1] = `<< /Type /Pages /Kids [${kids.map((k) => `${k} 0 R`).join(" ")}] /Count ${kids.length} >>`;
+    const info = add(`<< /Title ${pdfString(meta.title)} /Author ${pdfString(meta.author)} /Producer (Claude Workday Autopilot) >>`);
+    let out = "%PDF-1.4\n%âãÏÓ\n";
+    const offsets = [];
+    objs.forEach((o, i) => {
+      offsets.push(out.length);
+      out += `${i + 1} 0 obj
+${o}
+endobj
+`;
+    });
+    const xref = out.length;
+    out += `xref
+0 ${objs.length + 1}
+0000000000 65535 f 
+`;
+    for (const off of offsets) out += `${String(off).padStart(10, "0")} 00000 n 
+`;
+    out += `trailer
+<< /Size ${objs.length + 1} /Root ${catalog} 0 R /Info ${info} 0 R >>
+startxref
+${xref}
+%%EOF
+`;
+    const bytes = new Uint8Array(out.length);
+    for (let i = 0; i < out.length; i++) bytes[i] = out.charCodeAt(i) & 255;
+    return bytes;
+  }
+
+  // src/workday/render.ts
+  var HEADINGS = {
+    en: { summary: "Summary", skills: "Skills", experience: "Experience", education: "Education", certifications: "Certifications", languages: "Languages", present: "Present", native: "Native" },
+    de: { summary: "Profil", skills: "Kenntnisse", experience: "Berufserfahrung", education: "Ausbildung", certifications: "Zertifizierungen", languages: "Sprachen", present: "heute", native: "Muttersprache" },
+    fr: { summary: "Profil", skills: "Compétences", experience: "Expérience professionnelle", education: "Formation", certifications: "Certifications", languages: "Langues", present: "aujourd'hui", native: "Langue maternelle" },
+    es: { summary: "Perfil", skills: "Habilidades", experience: "Experiencia profesional", education: "Formación", certifications: "Certificaciones", languages: "Idiomas", present: "actualidad", native: "Nativo" },
+    pt: { summary: "Perfil", skills: "Competências", experience: "Experiência profissional", education: "Formação", certifications: "Certificações", languages: "Idiomas", present: "atual", native: "Nativo" },
+    it: { summary: "Profilo", skills: "Competenze", experience: "Esperienza professionale", education: "Istruzione", certifications: "Certificazioni", languages: "Lingue", present: "oggi", native: "Madrelingua" },
+    nl: { summary: "Profiel", skills: "Vaardigheden", experience: "Werkervaring", education: "Opleiding", certifications: "Certificeringen", languages: "Talen", present: "heden", native: "Moedertaal" },
+    pl: { summary: "Podsumowanie", skills: "Umiejętności", experience: "Doświadczenie zawodowe", education: "Wykształcenie", certifications: "Certyfikaty", languages: "Języki", present: "obecnie", native: "Ojczysty" }
+  };
+  function headingsFor(lang) {
+    return HEADINGS[lang] ?? HEADINGS.en;
+  }
+  function fmtYm(ym2, current = false, lang = "en") {
+    if (current) return headingsFor(lang).present;
+    if (!ym2) return "";
+    const [y, m] = ym2.split("-");
+    return m ? `${m}/${y}` : y;
+  }
+  function safeName(s) {
+    return s.replace(/[^A-Za-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 40);
+  }
+  function docFileNames(p, job) {
+    const who = safeName(`${p.personal.firstName}-${p.personal.lastName}`) || "Candidate";
+    const role = safeName(job.title) || "Role";
+    return { cv: `${who}-${role}-CV.pdf`, cl: `${who}-${role}-Cover-Letter.pdf` };
+  }
+  function contactLine(p) {
+    const { personal: me } = p;
+    const phone = [me.phone.countryCode, me.phone.number].filter(Boolean).join(" ");
+    const place = [me.address.city, me.address.country].filter(Boolean).join(", ");
+    return [me.email, phone, place, me.linkedin, me.github, me.website].filter(Boolean).join(" | ");
+  }
+  function renderCv(p, t, job, lang = "en") {
+    const H = headingsFor(lang);
+    const doc = newPdf();
+    const name = `${p.personal.firstName} ${p.personal.lastName}`.trim();
+    paragraph(doc, name, { size: 18, bold: true });
+    paragraph(doc, contactLine(p), { size: 9.5, after: 2 });
+    if (t.summary) {
+      heading2(doc, H.summary);
+      paragraph(doc, t.summary, { size: 10 });
+    }
+    if (t.skills.length) {
+      heading2(doc, H.skills);
+      paragraph(doc, t.skills.join(", "), { size: 10 });
+    }
+    if (p.work.length) {
+      heading2(doc, H.experience);
+      for (const w of p.work) {
+        space(doc, 4);
+        paragraph(doc, `${w.title}, ${w.company}`, { size: 10.5, bold: true });
+        const meta = [w.location, `${fmtYm(w.start)} – ${fmtYm(w.end, w.current, lang)}`].filter(Boolean).join(" | ");
+        paragraph(doc, meta, { size: 9.5 });
+        for (const b of t.roles[w.id] ?? w.bullets) paragraph(doc, b, { size: 10, bullet: true, indent: 4 });
+      }
+    }
+    if (p.education.length) {
+      heading2(doc, H.education);
+      for (const e of p.education) {
+        space(doc, 3);
+        paragraph(doc, `${e.degree}${e.field ? `, ${e.field}` : ""}`, { size: 10.5, bold: true });
+        const meta = [e.school, `${fmtYm(e.start)} – ${fmtYm(e.end)}`, e.gpa ? `GPA: ${e.gpa}` : ""].filter(Boolean).join(" | ");
+        paragraph(doc, meta, { size: 9.5 });
+      }
+    }
+    if (p.certifications.length) {
+      heading2(doc, H.certifications);
+      for (const c of p.certifications)
+        paragraph(doc, [c.name, c.issuer, fmtYm(c.issued)].filter(Boolean).join(" | "), { size: 10, bullet: true });
+    }
+    if (p.languages.length) {
+      heading2(doc, H.languages);
+      paragraph(doc, p.languages.map((l) => `${l.language} (${l.native ? H.native : l.proficiency})`).join(", "), { size: 10 });
+    }
+    const bytes = renderPdf(doc, { title: `${name} – CV – ${job.title}`, author: name });
+    return { fileName: docFileNames(p, job).cv, mime: "application/pdf", base64: bytesToBase64(bytes) };
+  }
+
+  // src/cv/tailorcv.ts
+  function tailoredCv(p, job) {
+    const description = String(job.description || "").trim();
+    if (!p.work?.length || description.length < 200) return null;
+    const posting = {
+      key: "",
+      tenantHost: "",
+      site: "",
+      reqId: "",
+      title: String(job.title || "").trim() || "Role",
+      location: job.location || "",
+      description: description.slice(0, 2e4),
+      language: "en",
+      url: job.url || "",
+      capturedAt: Date.now()
+    };
+    const full = { ...p, certifications: p.certifications || [], languages: p.languages || [], skills: p.skills || [], education: p.education || [] };
+    const t = keywordTailor(full, posting);
+    const doc = renderCv(full, t, posting, "en");
+    return { ...doc, keywords: t.keywords.slice(0, 10) };
+  }
+
   // src/oh/entry.ts
   var TOP = window.top === window.self;
   var ST = chrome.storage.local;
@@ -3255,6 +3687,27 @@ OPTIONS: ${JSON.stringify(options.slice(0, 150))}`
     const MIME = { pdf: "application/pdf", doc: "application/msword", docx: "application/vnd.openxmlformats-officedocument.wordprocessingml.document", rtf: "application/rtf", txt: "text/plain" };
     return { fileName: `${who}-Resume.${ext}`, mime: MIME[ext] || mime || "application/pdf", base64 };
   }
+  var tailored = null;
+  async function tailoredForJob(profile) {
+    if ((await ST.get("ohTailorCv")).ohTailorCv !== true) return void 0;
+    const run = await getRun(tenantHost());
+    const last = await getLastJobKey(tenantHost());
+    const here = location.href.replace(/[?#].*$/, "").replace(/\/apply.*$/, "");
+    const saved = (run?.jobKey ? await getJob(run.jobKey) : void 0) ?? (last ? await getJob(last) : void 0);
+    const job = scrapeJob() ?? (saved && saved.url.replace(/[?#].*$/, "") === here ? saved : void 0);
+    if (!job) return void 0;
+    if (tailored?.key !== job.key) {
+      tailored = {
+        key: job.key,
+        doc: within(cvReady, 3e4).then(() => {
+          const doc = tailoredCv(profile, { title: job.title, description: job.description, location: job.location, url: job.url });
+          say(doc ? `CV tailored to this job (${doc.keywords.slice(0, 6).join(", ")})` : "CV not tailored (no roles read from your CV or no job description) — your own CV");
+          return doc ?? void 0;
+        }, () => void 0)
+      };
+    }
+    return tailored.doc;
+  }
   async function tailorResume() {
     const d = await ST.get(["resumeHide24Hr", "candidateDetails", "active_copilot_job_id", "complexFormData", "ohWdSkipTailor"]);
     if (d.ohWdSkipTailor === true) return;
@@ -3332,7 +3785,10 @@ OPTIONS: ${JSON.stringify(options.slice(0, 150))}`
     setHooks({
       profile: async () => profile,
       settings: async () => mode.assist ? ASSIST_SETTINGS() : SETTINGS,
-      masterCv: () => cv ??= fetchCv(cvUrl, profile).catch(() => void 0),
+      masterCv: async () => {
+        const own2 = await (cv ??= fetchCv(cvUrl, profile).catch(() => void 0));
+        return mode.queue && await tailoredForJob(profile) || own2;
+      },
       autoSubmit: () => mode.submit,
       ...mode.assist ? { advance: () => false } : {},
       prefetch: (qs) => askOptimHire(qs),

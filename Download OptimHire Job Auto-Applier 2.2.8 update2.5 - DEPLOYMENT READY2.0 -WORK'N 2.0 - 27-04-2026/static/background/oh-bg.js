@@ -516,6 +516,14 @@
     });
   } catch (_) {}
 
+  /* A frame's own tab address (a form in an iframe asks which CSV job it belongs to). */
+  try {
+    chrome.runtime.onMessage.addListener(function (msg, sender, reply) {
+      if (!msg || msg.type !== 'OH_TAB_URL' || sender.id !== chrome.runtime.id) return;
+      reply({ url: (sender.tab && sender.tab.url) || '' });
+    });
+  } catch (_) {}
+
   /* 9. The Workday engine fetches the CV here when the page may not (CORS). */
   try {
     chrome.runtime.onMessage.addListener(function (msg, sender, reply) {

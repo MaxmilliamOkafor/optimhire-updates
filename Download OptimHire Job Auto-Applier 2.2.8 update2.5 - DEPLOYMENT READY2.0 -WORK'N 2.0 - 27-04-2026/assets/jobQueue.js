@@ -168,7 +168,7 @@
     return new Promise(res => {
       /* KEY_CONCURRENCY was missing here, so the saved "Parallel tabs"
          choice was never restored and silently reset to 1. */
-      ST.get([KEY_QUEUE, KEY_ACTIVE, KEY_CURRENT, KEY_STARTTS, KEY_CONCURRENCY, 'ohPreferAts'], (d) => {
+      ST.get([KEY_QUEUE, KEY_ACTIVE, KEY_CURRENT, KEY_STARTTS, KEY_CONCURRENCY, 'ohPreferAts', 'ohTailorCv'], (d) => {
         queue = Array.isArray(d[KEY_QUEUE]) ? d[KEY_QUEUE] : [];
         /* Entries an earlier import made from cells that were not links
            (https://font-semibold/, a job title as a host name…) can never be
@@ -827,12 +827,22 @@
       ST.set({ ohPreferAts: _preferAts });
       toast(_preferAts ? 'ATS jobs first, Reed last' : 'Queue order as listed', 'info');
     });
+    /* Off: every job gets your own CV, unchanged. On: a copy ordered to the job (oh: optimhire-patch.js, wd-engine.js). */
+    on('tailorCv', 'change', (e) => {
+      ST.set({ ohTailorCv: !!e.target.checked });
+      toast(e.target.checked ? 'Each job gets your CV with its skills and bullets ordered to the job description'
+                             : 'Each job gets your own CV, unchanged', 'info');
+    });
 
     /* Watch storage so the running indicator + statuses stay live AND
        the orchestrator advances when a content script reports done. */
     chrome.storage.onChanged.addListener((changes, area) => {
       if (area !== 'local') return;
       if (changes[KEY_QUEUE]) { queue = changes[KEY_QUEUE].newValue || []; render(); }
+      if (changes.ohTailorCv) {
+        const tc = document.getElementById('tailorCv');
+        if (tc) tc.checked = changes.ohTailorCv.newValue === true;
+      }
       if (changes.ohPreferAts) {
         _preferAts = changes.ohPreferAts.newValue !== false;
         const pa = document.getElementById('preferAts');
@@ -854,6 +864,8 @@
       _preferAts = d.ohPreferAts !== false;
       const pa = document.getElementById('preferAts');
       if (pa) pa.checked = _preferAts;
+      const tc = document.getElementById('tailorCv');
+      if (tc) tc.checked = d.ohTailorCv === true;
       setRunnerIndicator(!!d[KEY_ACTIVE]);
       init();
       render();

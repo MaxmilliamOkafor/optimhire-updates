@@ -4386,7 +4386,7 @@
     });
   })();
 
-  async function fetchResumeFile(url, filename = 'resume.pdf') {
+  async function rawResumeFile(url, filename = 'resume.pdf') {
     if (!url) return null;
     try {
       const res = await fetch(url, { credentials: 'omit' });
@@ -4395,6 +4395,87 @@
       const type = blob.type || 'application/pdf';
       return new File([blob], filename, { type });
     } catch (_) { return null; }
+  }
+
+  /* Queue Manager → "Tailor CV to each job" (ohTailorCv — off unless you turn
+     it on): on a CSV job the CV uploaded is your CV with its skills and each
+     role's bullets ordered by this page's job description — nothing reworded
+     or added (the Workday engine's keyword tailoring + PDF, assets/wd-cvtext.js,
+     loaded only then). Your own CV whenever that can't be done: no job
+     description on the page, or no roles read from your CV. Made once per page. */
+  const _tailoredFiles = new Map();
+  function tabUrl() {
+    if (window.top === window.self) return Promise.resolve(location.href);
+    return new Promise(res => {
+      try { chrome.runtime.sendMessage({ type: 'OH_TAB_URL' }, r => { void chrome.runtime.lastError; res((r && r.url) || ''); }); }
+      catch (_) { res(''); }
+    });
+  }
+  function pageJobText() {
+    const pick = $$('[class*="job-description" i],[class*="jobDescription" i],[class*="job__description" i],[data-qa*="job-description" i],' +
+                    '.posting-page .section-wrapper,[class*="posting-description" i],#content .content,[class*="description" i]')
+      .filter(el => !el.closest('form') && (el.innerText || '').length > 400)
+      .sort((x, y) => (y.innerText || '').length - (x.innerText || '').length)[0];
+    let text = pick ? pick.innerText : '';
+    if (!text) {
+      const c = document.body.cloneNode(true);
+      c.querySelectorAll('form,script,style,noscript,nav,header,footer,input,select,textarea,button,[role="dialog"],[id^="oh-"]').forEach(n => n.remove());
+      text = c.textContent || '';
+    }
+    return text.replace(/[ \t]+/g, ' ').replace(/\n\s*\n\s*\n+/g, '\n\n').trim().slice(0, 20000);
+  }
+  async function cvLib() {
+    if (window.__ohCv && window.__ohCv.tailor) return window.__ohCv;
+    await new Promise(res => {
+      try { chrome.runtime.sendMessage({ type: 'OH_CV_LOAD' }, () => { void chrome.runtime.lastError; res(); }); }
+      catch (_) { res(); }
+    });
+    return window.__ohCv && window.__ohCv.tailor ? window.__ohCv : null;
+  }
+  function fileBase64(file) {
+    return new Promise(res => {
+      const r = new FileReader();
+      r.onload = () => res(String(r.result || '').replace(/^data:[^,]*,/, ''));
+      r.onerror = () => res('');
+      r.readAsDataURL(file);
+    });
+  }
+  function tailoredResumeFile(url, filename) {
+    const key = location.href.split('#')[0];
+    if (!_tailoredFiles.has(key)) _tailoredFiles.set(key, (async () => {
+      const d = await ST.get(['ohTailorCv', 'ohJobQueueActive', 'ohJobQueue', 'ohCvProfile', 'ohWorkdayProfile']);
+      if (d.ohTailorCv !== true || !d.ohJobQueueActive) return null;
+      const here = await tabUrl();
+      const job = (d.ohJobQueue || []).find(j => j && j.status === 'running' && j.url && here && _urlsMatchLoose(here, j.url));
+      if (!job) return null;
+      const description = pageJobText();
+      if (description.length < 200) { LOG('Tailored CV: no job description on this page — uploading your own CV'); return null; }
+      const lib = await cvLib();
+      if (!lib) return null;
+      const wp = d.ohWorkdayProfile;
+      const imported = wp && Array.isArray(wp.work) && wp.work.length && wp.personal ? wp : null;
+      let cv = d.ohCvProfile && d.ohCvProfile.profile;
+      if (!imported && !(cv && Array.isArray(cv.work) && cv.work.length)) {
+        const own = await rawResumeFile(url, filename);           // read your CV once; kept for next time
+        if (!own) return null;
+        const r = await lib.read(await fileBase64(own), own.type).catch(() => null);
+        cv = r && r.profile;
+        if (cv && Array.isArray(cv.work) && cv.work.length) await ST.set({ ohCvProfile: { url, at: Date.now(), roles: cv.work.length, profile: cv } });
+      }
+      const title = String(job.title || ($('h1') || {}).textContent || document.title || '').trim();
+      const doc = lib.tailor({ profile: imported || undefined, cv, person: await getProfile(), job: { title, description, url: here } });
+      if (!doc) { LOG('Tailored CV: no roles read from your CV — uploading your own CV'); return null; }
+      LOG(`Tailored CV for this job (${doc.keywords.slice(0, 6).join(', ')})`);
+      const bin = atob(doc.base64), bytes = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+      return new File([bytes], doc.fileName, { type: doc.mime });
+    })().catch(() => null));
+    return _tailoredFiles.get(key);
+  }
+
+  async function fetchResumeFile(url, filename = 'resume.pdf') {
+    if (!url) return null;
+    return (await tailoredResumeFile(url, filename)) || rawResumeFile(url, filename);
   }
 
   async function tryResumeUpload(p = {}) {

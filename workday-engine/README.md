@@ -23,6 +23,12 @@ adapter (`src/oh/entry.ts`) then:
    counts, auto-skip and next job work as before. Each run is kept in
    `ohWdEngineLog` (it shows up in your diagnostics).
 
+CSV-queue jobs upload your own CV unchanged. With Queue Manager → "Tailor CV to
+each job" on (`ohTailorCv`), they upload a copy instead: your skills and each role's
+bullets ordered by the job description's keywords (`tailor.ts` keyword mode — nothing
+reworded or added), rendered by `render.ts` / `pdf.ts`. Other job sites get the same
+copy through `assets/wd-cvtext.js` (`window.__ohCv.tailor`, `src/cv/tailorcv.ts`).
+
 "Autofill this page" on a Workday page runs the engine too and stops on Review (or
 asks you for what it can't answer). `ohWdEngineOff: true` (the switch in Queue
 Manager → Workday sign-in) gives Workday back to OptimHire's own filler.
@@ -34,6 +40,8 @@ Manager → Workday sign-in) gives Workday back to OptimHire's own filler.
   `[oh]` — `ohHooks.ts` plus a few lines in `engine.ts`, `answers.ts` and `steps.ts` —
   so a newer copy of the engine can be dropped in and the `[oh]` lines re-applied.
 - `src/oh/entry.ts` — the OptimHire adapter (content script entry).
+- `src/cv/` — reading your CV (pdf.js / docx → roles, education, skills) and the
+  per-job copy of it; built into `assets/wd-cvtext.js`, put into a tab only when needed.
 
 ## Build
 

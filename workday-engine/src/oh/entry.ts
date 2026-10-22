@@ -27,9 +27,10 @@
  * the page, from chrome.storage.local — the service worker never sees them.
  */
 import { autoResume, isActive, startRun, stopRun } from "../workday/engine.js";
-import { activeStepName, detectPage, hasWorkdayApp, isWorkdayHost, tenantHost } from "../workday/detect.js";
+import { activeStepName, detectPage, hasWorkdayApp, isWorkdayHost, scrapeJob, tenantHost } from "../workday/detect.js";
 import { similarity } from "../workday/dom.js";
-import { normalizeLabel, normalizeProfile } from "../workday/store.js";
+import { getJob, getLastJobKey, getRun, normalizeLabel, normalizeProfile } from "../workday/store.js";
+import { tailoredCv } from "../cv/tailorcv.js";
 import { setHooks, type OpenQuestion, type Outcome } from "../workday/ohHooks.js";
 import type { ControlKind } from "../workday/controls.js";
 import { DEFAULT_WD_SETTINGS, type PageKind, type Profile, type RunState, type StoredDoc, type WorkdaySettings } from "../workday/types.js";
@@ -585,6 +586,34 @@ async function fetchCv(url: string, p: Profile): Promise<StoredDoc | undefined> 
   return { fileName: `${who}-Resume.${ext}`, mime: MIME[ext] || mime || "application/pdf", base64 };
 }
 
+/* ---------------- your CV tailored to this job (optional) ---------------- */
+
+/* Queue Manager → "Tailor CV to each job" (ohTailorCv, off unless you turn it on): a CSV job uploads
+   your CV with its skills and bullets ordered by this job's description — made once per job; your own
+   CV whenever that can't be done (no roles read from your CV, no job description). */
+let tailored: { key: string; doc: Promise<StoredDoc | undefined> } | null = null;
+async function tailoredForJob(profile: Profile): Promise<StoredDoc | undefined> {
+  if ((await ST.get("ohTailorCv")).ohTailorCv !== true) return undefined;
+  // The run's CV is settled when it starts — on the job posting itself, whose description is read here.
+  const run = await getRun(tenantHost());
+  const last = await getLastJobKey(tenantHost());
+  const here = location.href.replace(/[?#].*$/, "").replace(/\/apply.*$/, "");
+  const saved = (run?.jobKey ? await getJob(run.jobKey) : undefined) ?? (last ? await getJob(last) : undefined);
+  const job = scrapeJob() ?? (saved && saved.url.replace(/[?#].*$/, "") === here ? saved : undefined);   // never another job's description
+  if (!job) return undefined;
+  if (tailored?.key !== job.key) {
+    tailored = {
+      key: job.key,
+      doc: within(cvReady, 30_000).then(() => {
+        const doc = tailoredCv(profile, { title: job.title, description: job.description, location: job.location, url: job.url });
+        say(doc ? `CV tailored to this job (${doc.keywords.slice(0, 6).join(", ")})` : "CV not tailored (no roles read from your CV or no job description) — your own CV");
+        return doc ?? undefined;
+      }, () => undefined),
+    };
+  }
+  return tailored.doc;
+}
+
 /* ---------------- OptimHire's "Optimize My Resume" screen ---------------- */
 
 /** The same tailoring step OptimHire runs on every other site (resume-auto.js presses through it). */
@@ -676,7 +705,10 @@ async function installHooks(mode: Mode): Promise<void> {
   setHooks({
     profile: async () => profile,
     settings: async () => (mode.assist ? ASSIST_SETTINGS() : SETTINGS),
-    masterCv: () => (cv ??= fetchCv(cvUrl, profile).catch(() => undefined)),
+    masterCv: async () => {
+      const own = await (cv ??= fetchCv(cvUrl, profile).catch(() => undefined));
+      return (mode.queue && (await tailoredForJob(profile))) || own;
+    },
     autoSubmit: () => mode.submit,
     ...(mode.assist ? { advance: () => false } : {}),
     prefetch: (qs) => askOptimHire(qs),
