@@ -3088,7 +3088,7 @@
       englishFluent: true,
       yearsExperience: '7', highestDegree: koDegreeFromCv(_koCv),
       certifications: ['AWS'],
-      salary: String(p.expected_salary || '').replace(/[^\d.]/g, ''),
+      salary: String(p.expected_salary || '').trim(),          // as your profile writes it ("£85,000")
       confirmed: false,
     };
     const saved = Object.assign({}, _ko || {});
@@ -3261,7 +3261,9 @@
       return opts.find(o => o.toLowerCase() === want) || opts.find(o => optionMeans(o) === want) || null;
     }
     if (ko.kind === 'years' || ko.kind === 'salary') {
-      const n = Number(ko.answer);
+      const a0 = koNum(ko.answer)[0];
+      const n = ko.kind === 'salary' && /\dk\b/i.test(ko.answer) && a0 < 1000 ? a0 * 1000 : a0;
+      if (n == null || isNaN(n)) return null;
       let best = null;
       for (const o of opts) {
         const nums = koNum(o).map(x => (/\d\s*k\b/i.test(o) && x < 1000 ? x * 1000 : x));
