@@ -790,8 +790,26 @@ async function startFromOptimHire(msg: Any): Promise<void> {
   if (st?.isJobClose) { clearMode(); say("OptimHire says the job is closed"); return; }
   await tailorResume();
   if (!readMode()) { say("stopped before the form was started"); return; }
+  if (toApplyManually()) return;
   await installHooks(mode);
   await startRun(null);
+}
+
+/** A link straight into "Autofill with Resume" / "Use My Last Application" (a job board's or OptimHire's
+ *  apply link): open "Apply Manually" instead — once per tab; the run carries on after the reload. */
+function toApplyManually(): boolean {
+  const rx = /\/apply\/(autofillWithResume|useMyLastApplication)\b/i;
+  if (!rx.test(location.pathname)) return false;
+  try {
+    if (sessionStorage.getItem("ohWdManualRedirect") === location.pathname) return false;
+    sessionStorage.setItem("ohWdManualRedirect", location.pathname);
+    sessionStorage.setItem("ohWdStartAfterLoad", "1"); // nothing ran yet: the run starts fresh on the new page
+  } catch {
+    return false;
+  }
+  say("this link opens Autofill with Resume / Use My Last Application — opening Apply Manually instead");
+  location.replace(location.href.replace(rx, "/apply/applyManually"));
+  return true;
 }
 
 /** A CSV queue job on this Workday tab: applied unattended, the result kept for the queue runner. */
@@ -802,6 +820,7 @@ async function startQueueJob(job: Any): Promise<void> {
   writeMode(mode);
   answerCache.clear();
   say(`applying (CSV queue: ${String(job.title || job.url || id).slice(0, 60)})`);
+  if (toApplyManually()) return;
   try {
     await installHooks(mode);
     await startRun(null);
@@ -925,7 +944,12 @@ if (TOP && isWorkdayHost()) {
       if (tries < 60) setTimeout(() => boot(tries + 1), 500);
       return;
     }
-    void installHooks(mode).then(() => autoResume());
+    let fresh = false;
+    try {
+      fresh = sessionStorage.getItem("ohWdStartAfterLoad") === "1";
+      sessionStorage.removeItem("ohWdStartAfterLoad");
+    } catch { /* storage blocked */ }
+    void installHooks(mode).then(async () => { if (fresh) await startRun(null); else await autoResume(); });
   };
   boot();
 }

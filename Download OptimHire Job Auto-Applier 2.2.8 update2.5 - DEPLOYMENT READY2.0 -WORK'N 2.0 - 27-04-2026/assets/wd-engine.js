@@ -2498,10 +2498,10 @@ OPTIONS: ${JSON.stringify(options.slice(0, 150))}`
       }
       case "applyMethod": {
         await waitForExternalDocs(ctx);
-        const hasCv = !!pickCv(ctx);
-        const btn = hasCv && byAid("autofillWithResume") || byAid("applyManually") || byAid("autofillWithResume");
+        const manual = byAid("applyManually");
+        const btn = manual || byAid("autofillWithResume");
         if (!btn) throw new NeedsHuman("Choose how to apply, then click Resume.");
-        ctx.log(hasCv ? "Apply method: Autofill with Resume (tailored CV)" : "Apply method: Apply Manually");
+        ctx.log(manual ? "Apply method: Apply Manually" : "Apply method: Autofill with Resume (the only choice here)");
         await humanClick(btn);
         await waitStable(600);
         return "next";
@@ -3454,8 +3454,23 @@ OPTIONS: ${JSON.stringify(options.slice(0, 150))}`
       say("stopped before the form was started");
       return;
     }
+    if (toApplyManually()) return;
     await installHooks(mode);
     await startRun(null);
+  }
+  function toApplyManually() {
+    const rx2 = /\/apply\/(autofillWithResume|useMyLastApplication)\b/i;
+    if (!rx2.test(location.pathname)) return false;
+    try {
+      if (sessionStorage.getItem("ohWdManualRedirect") === location.pathname) return false;
+      sessionStorage.setItem("ohWdManualRedirect", location.pathname);
+      sessionStorage.setItem("ohWdStartAfterLoad", "1");
+    } catch {
+      return false;
+    }
+    say("this link opens Autofill with Resume / Use My Last Application — opening Apply Manually instead");
+    location.replace(location.href.replace(rx2, "/apply/applyManually"));
+    return true;
   }
   async function startQueueJob(job) {
     const id = String(job?.id || "");
@@ -3464,6 +3479,7 @@ OPTIONS: ${JSON.stringify(options.slice(0, 150))}`
     writeMode(mode);
     answerCache.clear();
     say(`applying (CSV queue: ${String(job.title || job.url || id).slice(0, 60)})`);
+    if (toApplyManually()) return;
     try {
       await installHooks(mode);
       await startRun(null);
@@ -3583,7 +3599,16 @@ OPTIONS: ${JSON.stringify(options.slice(0, 150))}`
         if (tries < 60) setTimeout(() => boot(tries + 1), 500);
         return;
       }
-      void installHooks(mode).then(() => autoResume());
+      let fresh = false;
+      try {
+        fresh = sessionStorage.getItem("ohWdStartAfterLoad") === "1";
+        sessionStorage.removeItem("ohWdStartAfterLoad");
+      } catch {
+      }
+      void installHooks(mode).then(async () => {
+        if (fresh) await startRun(null);
+        else await autoResume();
+      });
     };
     boot();
   }

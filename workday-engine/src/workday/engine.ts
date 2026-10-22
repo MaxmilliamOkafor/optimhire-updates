@@ -13,7 +13,7 @@ import { enableTrustedFallback, readValue } from "./controls.js";
 import { activeStepName, detectPage, errorMessages, isSubmitButton, jobKeyFor, nextButton, reqIdFromUrl, scrapeJob, tenantHost } from "./detect.js";
 import { APPLY_TEXT_RX } from "./i18n.js";
 import { handleCreateAccount, handleSignIn } from "./auth.js";
-import { addFlag, pickCv, type Ctx } from "./context.js";
+import { addFlag, type Ctx } from "./context.js";
 import {
   fixFieldFromError,
   genericFill,
@@ -227,10 +227,13 @@ async function handlePage(ctx: Ctx, page: PageKind): Promise<StepResult> {
     }
     case "applyMethod": {
       await waitForExternalDocs(ctx);
-      const hasCv = !!pickCv(ctx);
-      const btn = (hasCv && byAid("autofillWithResume")) || byAid("applyManually") || byAid("autofillWithResume");
+      // [oh] Always "Apply Manually": every field is filled from your details and the CV is uploaded on
+      // My Experience. Never "Use My Last Application" (stale answers); "Autofill with Resume" (Workday's
+      // own CV parse) only on a site that offers nothing else.
+      const manual = byAid("applyManually");
+      const btn = manual || byAid("autofillWithResume");
       if (!btn) throw new NeedsHuman("Choose how to apply, then click Resume.");
-      ctx.log(hasCv ? "Apply method: Autofill with Resume (tailored CV)" : "Apply method: Apply Manually");
+      ctx.log(manual ? "Apply method: Apply Manually" : "Apply method: Autofill with Resume (the only choice here)");
       await humanClick(btn);
       await waitStable(600);
       return "next";
