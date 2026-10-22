@@ -1844,6 +1844,158 @@
     rescueLocationNow = tick;
   })();
 
+  /* ── Answers that went in wrong (seen on Greenhouse) ─────────────────
+   * Three things OptimHire's own answers put into forms, fixed once the
+   * page has settled (so OptimHire's fill is finished):
+   *   • a required essay answered "N/A" → a real answer from your profile
+   *     (or a sound general one);
+   *   • an essay holding a CV / cover-letter contact header ("MAXMILLIAM
+   *     OKAFOR, MSC (+353) 87… | email | linkedin…") → the header taken
+   *     off, keeping the letter under it, or a real answer if nothing is
+   *     left;
+   *   • "Where are you located?" asked as a list of regions, answered
+   *     "United States/Canada" (or left empty and flagged) → the region
+   *     your country is in (Europe / EMEA / UK & Ireland … for Ireland). */
+  (function installAnswerRepair() {
+    if (window.top !== window.self && !/greenhouse|lever|ashby|workable|smartrecruiters/i.test(location.hostname)) return;
+    const SETTLE_MS = 3000;
+    const seen = new Map(), done = new WeakSet();
+    const settled = (el) => { const t = seen.get(el); if (!t) { seen.set(el, Date.now()); return false; } return Date.now() - t >= SETTLE_MS; };
+    const JUNK_RE = /^\s*(n\/?a|na|none|nil|null|-+|\.+|not applicable|no answer)\s*\.?\s*$/i;
+    const ESSAY_LABEL_RE = /\bwhy\b|describe|tell us|explain|about yourself|motivat|interest(ed)? in|what (excites|interests|attracts)|problem|challenge|project|accomplish|achievement|proud|experience with|how (have|would|do) you|cover letter|additional information/i;
+    const isRequired = (el, lbl) => el.required || el.getAttribute('aria-required') === 'true' || /\*\s*$/.test(lbl || '');
+    function contactHeader(v) {
+      const head = v.slice(0, 320);
+      return /[\w.+-]+@[\w-]+\.[\w.]+/.test(head) && (/(\+?\d[\d\s().-]{8,}\d)/.test(head) || /linkedin\.com|github\.com/i.test(head));
+    }
+    function withoutHeader(v) {
+      const lines = v.split(/\r?\n/);
+      let i = 0;
+      while (i < lines.length && i < 8) {
+        const l = lines[i].trim();
+        if (!l || /@|linkedin|github|https?:\/\/|www\.|\+?\d[\d\s().-]{7,}\d|^[A-Z][A-Z .,'’-]{3,}$|\|/.test(l) || l.split(/\s+/).length < 5) { i++; continue; }
+        break;
+      }
+      return lines.slice(i).join('\n').trim();
+    }
+    async function repairEssays(p) {
+      for (const el of $$('textarea, input[type="text"]:not([role="combobox"])').filter(isVisible)) {
+        if (done.has(el) || isPageChromeField(el)) continue;
+        const v = (el.value || '').trim();
+        if (!v) continue;
+        const lbl = (getLabel(el) || '').trim();
+        if (!lbl || !ESSAY_LABEL_RE.test(lbl)) continue;
+        const junk = JUNK_RE.test(v) && isRequired(el, lbl);
+        const header = el.tagName === 'TEXTAREA' && contactHeader(v);
+        if (!junk && !header) continue;
+        if (!settled(el)) continue;
+        done.add(el);
+        let next = '';
+        if (header) {
+          const body = withoutHeader(v);
+          if (body.length >= 80) next = body;
+        }
+        if (!next) {
+          const g = String(guessValue(lbl.replace(/\*/g, ''), p, el.tagName === 'TEXTAREA' ? 'textarea' : 'text') || '').trim();
+          if (g.length > 20 && !JUNK_RE.test(g)) next = g;
+        }
+        if (!next || next === v) continue;
+        el.focus();
+        nativeSet(el, next);
+        el.blur();
+        LOG(`Answer repair: "${lbl.slice(0, 60)}" — ${header ? 'CV contact header removed' : '"' + v + '" replaced'}`);
+      }
+    }
+
+    const REGION_Q_RE = /where (are you|do you) (currently )?(located|based|live|reside)|which (region|country|location|time ?zone)[^?]{0,40}(located|based|live|in)\b|(current|your) (region|country) of residence|(country|region) of residence|location \(region\)|what region/i;
+    const EUROPE_RE = /ireland|united kingdom|\buk\b|england|scotland|wales|britain|germany|france|spain|portugal|italy|netherlands|belgium|poland|sweden|norway|denmark|finland|austria|switzerland|czech|romania|greece|hungary|ukraine|luxembourg|estonia|latvia|lithuania|croatia|slovakia|slovenia|bulgaria/i;
+    const AMERICAS_RE = /united states|\busa?\b|america|canada/i;
+    function regionWants(country) {
+      const c = String(country || '').toLowerCase();
+      const out = [];
+      if (c) out.push(c);
+      if (/ireland/.test(c)) out.push('republic of ireland', 'uk & ireland', 'uk and ireland', 'uk/ireland', 'ireland');
+      if (/united kingdom|\buk\b|england|scotland|wales|britain/.test(c)) out.push('united kingdom', 'uk', 'uk & ireland', 'great britain');
+      if (EUROPE_RE.test(c)) out.push('europe', 'emea', 'eu');
+      if (/united states|\busa?\b/.test(c)) out.push('united states', 'usa', 'us', 'north america', 'americas');
+      if (/canada/.test(c)) out.push('canada', 'north america', 'americas');
+      if (/nigeria|ghana|kenya|south africa|egypt|morocco|uganda|tanzania|cameroon/.test(c)) out.push('africa', 'emea');
+      if (/india|pakistan|bangladesh|singapore|philippines|japan|china|korea|malaysia|indonesia|australia|new zealand/.test(c)) out.push('apac', 'asia');
+      if (!AMERICAS_RE.test(c)) out.push('outside the us', 'outside of the us', 'outside the united states', 'international', 'rest of world', 'rest of the world', 'other');
+      return out;
+    }
+    const norm = s => String(s || '').toLowerCase().replace(/\s+/g, ' ').trim();
+    function pickRegion(texts, wants) {
+      for (const w of wants) {
+        const re = new RegExp('(^|[^a-z])' + w.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '([^a-z]|$)');
+        const hit = texts.find(t => norm(t) === w) || texts.find(t => re.test(norm(t)));
+        if (hit) return hit;
+      }
+      return null;
+    }
+    function acceptable(current, wants, country) {
+      if (!current) return false;
+      if (AMERICAS_RE.test(current) && !AMERICAS_RE.test(country || '')) return false;
+      return !!pickRegion([current], wants);
+    }
+    async function repairRegions(p) {
+      const country = p.country || '';
+      if (!country) return;
+      const wants = regionWants(country);
+      for (const sel of $$('select').filter(isVisible)) {
+        const lbl = (getLabel(sel) || '').trim();
+        if (!REGION_Q_RE.test(lbl) || done.has(sel)) continue;
+        const cur = sel.selectedIndex >= 0 && sel.options[sel.selectedIndex] && sel.options[sel.selectedIndex].value ? sel.options[sel.selectedIndex].text : '';
+        if (acceptable(cur, wants, country) || !settled(sel)) continue;
+        const opts = [...sel.options].filter(o => o.value);
+        const hit = pickRegion(opts.map(o => o.text), wants);
+        done.add(sel);
+        if (!hit) continue;
+        const opt = opts.find(o => o.text === hit);
+        sel.value = opt.value;
+        sel.dispatchEvent(new Event('input', { bubbles: true }));
+        sel.dispatchEvent(new Event('change', { bubbles: true }));
+        LOG(`Answer repair: "${lbl.slice(0, 50)}" ${cur ? `"${cur}" → ` : '→ '}"${hit}" (you are in ${country})`);
+      }
+      for (const input of $$('input').filter(i => isComboInput(i))) {
+        const ctl = comboControl(input);
+        if (!isVisible(ctl || input) || done.has(input)) continue;
+        const lbl = (getLabel(input) || getLabel(ctl) || '').trim();
+        if (!REGION_Q_RE.test(lbl)) continue;
+        const cur = comboSelectedText(input);
+        const flagged = fieldFlagged(input) || fieldFlagged(ctl || input);
+        if ((acceptable(cur, wants, country) && !flagged) || !settled(input)) continue;
+        done.add(input);
+        try { realClick(ctl || input); } catch (_) {}
+        try { input.focus(); } catch (_) {}
+        nativeSet(input, '');
+        try { input.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', code: 'ArrowDown', bubbles: true, cancelable: true })); } catch (_) {}
+        await sleep(450);
+        const opts = comboOptions();
+        const hitText = pickRegion(opts.map(o => (o.textContent || '').trim()), wants);
+        const hit = hitText && opts.find(o => (o.textContent || '').trim() === hitText);
+        if (!hit) { try { input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', code: 'Escape', bubbles: true })); input.blur(); } catch (_) {} continue; }
+        try { realClick(hit); } catch (_) { try { hit.click(); } catch (__) {} }
+        await sleep(250);
+        LOG(`Answer repair: "${lbl.slice(0, 50)}" ${cur ? `"${cur}" → ` : '→ '}"${hitText}" (you are in ${country})`);
+      }
+    }
+
+    let busy = false;
+    async function tick() {
+      if (busy || _IS_OH_PAGE || wdEngineOwns()) return;
+      if (!(Date.now() - _manualTriggerTs < 90_000 || ((await isAutomationActive()) && (window.top !== window.self || await isActiveJobTab())))) return;
+      busy = true;
+      try {
+        const p = await getProfile();
+        await repairEssays(p);
+        await repairRegions(p);
+      } catch (e) { LOG('Answer repair error', e); }
+      finally { busy = false; }
+    }
+    setInterval(tick, 2000);
+  })();
+
   /* ── Oracle Recruiting Cloud (…/hcmUI/CandidateExperience) ───────────
    * Oracle's application (JPMorgan, Goldman Sachs, Dell, EY…) has pieces
    * the generic filler doesn't handle — ideas from the Jobright build:
@@ -2890,6 +3042,7 @@
     strengths: 'My key strengths are technical proficiency, strong problem-solving ability, effective communication, and a collaborative team-first mindset.',
     weakness: 'I have been working on delegating more effectively. I naturally want to ensure quality by handling things myself, and I\'ve been consciously building trust with colleagues to share responsibility.',
     goals: 'Over the next 3-5 years, I want to deepen my expertise, take on greater leadership responsibility, and contribute to impactful projects that drive real business outcomes.',
+    hardProblem: 'I enjoy hard technical problems, especially ones where reliability, scale and clear trade-offs matter. I approach them by measuring first, breaking the problem into parts I can test quickly, validating each step with data, and leaving the system simpler and better documented than I found it.',
     tellAbout: 'I\'m a dedicated professional with a track record of delivering strong results. I combine technical depth with a collaborative approach, and I thrive in roles where I can solve meaningful problems and help teams succeed.',
     motivation: 'I\'m motivated by meaningful impact, continuous learning, and the opportunity to work alongside talented people on problems that matter.',
     valueAdd: 'I bring the right combination of experience, technical skill, and work ethic to make an immediate positive impact. I move fast, communicate clearly, and consistently deliver quality work.',
@@ -3960,6 +4113,8 @@
                                                           return DEFAULTS.whyCompany;
     if (/why.*role|why.*position|interest.*role|interest.*position|excite.*role|why.*apply/.test(l))
                                                           return DEFAULTS.whyRole;
+    if (/hard(est)?.?(technical.?)?problem|technical.?challenge|toughest|most.?challenging|complex.?problem/.test(l))
+                                                          return p.summary || DEFAULTS.hardProblem;
     if (/describe.?(a\s+)?challeng|tell.?(me|us).?about.?a.?time|example.?of|situation.?where/.test(l))
                                                           return p.summary || DEFAULTS.tellAbout;
 
