@@ -72,6 +72,11 @@
  *    verification email. Read-only; nothing is stored. Ported from the
  *    Jobright build (ua-mailbox.js).
  *
+ * 11. Other job-autofill extensions (ATS TAILOR, Job Genie, Simplify…) are
+ *    paused while a run is going — two fillers on one form undo each other —
+ *    and turned back on when it ends (also after a restart). ohPauseOthers:
+ *    false (the switch on the side panel's Job Queue card) leaves them alone.
+ *
  * Wiring: manifest.json background.service_worker points here. On an
  * OptimHire update, copy the new index.js in and keep this entry point.
  * Same directory as index.js on purpose, so nothing that resolves paths
@@ -82,7 +87,7 @@
   'use strict';
   var KEYS = ['copilotTabId', 'isAutoProcessStartJob', 'isManuallyStartJob', 'autoApplyState',
               'ohRunStats', 'ohJobQueueActive', 'ohJobQueue', 'ohAutomationDisabled', 'ohPreferAts',
-              'ohAutoApplyEngaged', 'ohAutoApplyEngagedTs', 'ohAutoPressTs', 'preferredJobsite', 'ohWdEngineOff'];
+              'ohAutoApplyEngaged', 'ohAutoApplyEngagedTs', 'ohAutoPressTs', 'preferredJobsite', 'ohWdEngineOff', 'ohPauseOthers'];
   var state = { tab: null, live: false, loaded: false };
   var ohSuccessWatch = null;      // OptimHire's handler, once it registers it
   var registered = null;          // { fn, tab } currently registered with Chrome
@@ -189,8 +194,41 @@
     } catch (_) {}
   }
 
+  /* 11. Other autofill extensions, paused during runs. */
+  var OTHER_FILLER_RE = /ats ?tailor|job ?genie|simplify|jobright|speedy ?apply|lazy ?apply|auto ?fill|auto[- ]?appl|job ?assist|careerflow|huntr|job ?copilot|\bteal\b|apply ?ai|ai ?apply|jobscan|massapply|loopcv|sonara/i;
+  var _othersBusy = false;
+  function syncOthers(d) {
+    var mg = chrome.management;
+    if (!mg || _othersBusy) return;
+    var live = !!(isLive(d) || d.ohJobQueueActive);
+    var want = live && d.ohPauseOthers !== false && d.ohAutomationDisabled !== true;
+    _othersBusy = true;
+    chrome.storage.local.get(['ohPausedExts'], function (st) {
+      var paused = (st && Array.isArray(st.ohPausedExts)) ? st.ohPausedExts : [];
+      var done = function () { _othersBusy = false; };
+      if (want && !paused.length) {
+        mg.getAll(function (list) {
+          void chrome.runtime.lastError;
+          var hit = (list || []).filter(function (e) {
+            return e.id !== chrome.runtime.id && e.enabled && e.type === 'extension' && e.mayDisable !== false &&
+                   OTHER_FILLER_RE.test((e.name || '') + ' ' + (e.shortName || ''));
+          });
+          if (!hit.length) { done(); return; }
+          hit.forEach(function (e) { mg.setEnabled(e.id, false, function () { void chrome.runtime.lastError; }); });
+          chrome.storage.local.set({ ohPausedExts: hit.map(function (e) { return { id: e.id, name: e.name }; }) }, done);
+          try { console.info('[OH-BG] paused during the run: ' + hit.map(function (e) { return e.name; }).join(', ')); } catch (_) {}
+        });
+      } else if (!want && paused.length) {
+        paused.forEach(function (e) { mg.setEnabled(e.id, true, function () { void chrome.runtime.lastError; }); });
+        chrome.storage.local.set({ ohPausedExts: [] }, done);
+        try { console.info('[OH-BG] turned back on: ' + paused.map(function (e) { return e.name; }).join(', ')); } catch (_) {}
+      } else done();
+    });
+  }
+
   function apply(d) {
     try { paintBadge(d); } catch (_) {}
+    try { syncOthers(d); } catch (_) {}
     var wasLive = state.live, wasTab = state.tab;
     state.tab = d.copilotTabId == null ? null : d.copilotTabId;
     state.live = isLive(d);
@@ -459,6 +497,17 @@
       return origSend.apply(null, args);
     };
   }
+
+  /* 9. Reading your CV (roles, education, skills): the reader — pdf.js, 1.4 MB —
+     is put into the asking tab only when a CV has to be read. */
+  try {
+    chrome.runtime.onMessage.addListener(function (msg, sender, reply) {
+      if (!msg || msg.type !== 'OH_CV_LOAD' || sender.id !== chrome.runtime.id || !sender.tab) return;
+      chrome.scripting.executeScript({ target: { tabId: sender.tab.id, frameIds: [sender.frameId || 0] }, files: ['assets/wd-cvtext.js'] })
+        .then(function () { reply({ ok: true }); }, function (e) { reply({ ok: false, error: String((e && e.message) || e) }); });
+      return true;
+    });
+  } catch (_) {}
 
   /* 9. The Workday engine fetches the CV here when the page may not (CORS). */
   try {

@@ -1947,6 +1947,46 @@
     setInterval(check, 3000);
   })();
 
+  /* ── OptimHire's own "Autofill this application" stops at missing fields ──
+   * Used on a page you are applying to yourself, it fills what its answers
+   * cover and then stops with "Please fill the missing fields and submit
+   * the form" / "5 out of 6 required fields filled". The moment that shows,
+   * our filler is run on the page you are looking at to finish the rest —
+   * on Workday the Workday engine, for that step only — once per page.
+   * Never during a run (the job tab has its own handling) and never with
+   * automation switched off. */
+  (function installFinishOptimHireFill() {
+    var RE = /please fill (in )?the missing|\b\d+\s+out of\s+\d+\s+required fields? filled/i;
+    var _doneFor = {};
+    function check() {
+      try {
+        var root = document.getElementById('__plasmo') || document.body;
+        var text = root ? (root.innerText || '') : '';
+        if (!RE.test(text)) return;
+        chrome.storage.local.get(OH_AUTOMATION_KEYS.concat(['ohAutomationDisabled']), function (d) {
+          try {
+            if (d && d.ohAutomationDisabled === true) return;
+            if (d && (d.isAutoProcessStartJob || d.ohJobQueueActive)) return;
+            realActiveTabs({ active: true, currentWindow: true }, function (tabs) {
+              var t = tabs && tabs[0];
+              if (!t || t.id == null || /^chrome(-extension)?:\/\//i.test(t.url || '')) return;
+              var key = t.id + '|' + (t.url || '');
+              if (_doneFor[key] && Date.now() - _doneFor[key] < 60000) return;
+              _doneFor[key] = Date.now();
+              addLog('OptimHire left required fields empty — finishing them', '');
+              Promise.resolve(chrome.tabs.sendMessage(t.id, { type: 'OH_AUTOFILL_THIS_PAGE', submit: false, pageOnly: true })).catch(function () {});
+            });
+          } catch (_) {}
+        });
+      } catch (_) {}
+    }
+    /* The native observer on purpose: the shadowed one is off while no run is
+       going — which is exactly when you use OptimHire's autofill yourself. */
+    var mo = new _SpNativeMO(function () { clearTimeout(check._t); check._t = setTimeout(check, 400); });
+    function start() { mo.observe(document.body, { childList: true, subtree: true, characterData: true }); }
+    if (document.body) start(); else document.addEventListener('DOMContentLoaded', start);
+  })();
+
   /* (A second, cooldown-less missing-details handler and its helpers used
    * to live here. It shadowed the countdown handler above via function
    * hoisting and caused back-to-back skips; it and its now-unused helpers
@@ -2618,6 +2658,9 @@
         '<button id="oh-qc-prio" class="qc-switch" role="switch" aria-checked="true" ' +
           'title="Apply to jobs on company ATS sites (Greenhouse, Lever, Workday…) first, then other job boards, and Reed last — for OptimHire\'s queue and the CSV Job Queue.">' +
           '<span class="qc-switch-text"><b>ATS jobs first</b><small>Then other boards, Reed last</small></span><span class="qc-toggle"></span></button>' +
+        '<button id="oh-qc-others" class="qc-switch" role="switch" aria-checked="true" ' +
+          'title="Other job-autofill extensions fill the same forms and undo each other. They are switched off while a run is going and back on when it ends.">' +
+          '<span class="qc-switch-text"><b>Pause other autofill extensions during runs</b><small id="oh-qc-others-sub">None found</small></span><span class="qc-toggle"></span></button>' +
         '<div class="qc-sep"></div>' +
         '<div id="oh-qc-truth" class="qc-foot" title="OptimHire’s ‘X applied’ counter also counts skips. This counts real submission confirmations.">Results: — submitted · — skipped</div>' +
         '<div class="qc-links">' +
@@ -2646,6 +2689,16 @@
           var on = !(d && d.ohPreferAts !== false);   // toggle
           chrome.storage.local.set({ ohPreferAts: on }, function () {
             addLog(on ? 'Queue order: ATS jobs first, Reed last' : 'Queue order: as OptimHire sends them', '');
+            refresh();
+          });
+        });
+      });
+      var othersLine = document.getElementById('oh-qc-others');
+      if (othersLine) othersLine.addEventListener('click', function () {
+        chrome.storage.local.get(['ohPauseOthers'], function (d) {
+          var on = !(d && d.ohPauseOthers !== false);   // toggle
+          chrome.storage.local.set({ ohPauseOthers: on }, function () {
+            addLog(on ? 'Other autofill extensions will be paused during runs' : 'Other autofill extensions are left alone', '');
             refresh();
           });
         });
@@ -2879,6 +2932,27 @@
       paintQaCount();
     }
 
+    /* Which other autofill extensions are installed / paused right now. */
+    var OTHER_FILLER_RE = /ats ?tailor|job ?genie|simplify|jobright|speedy ?apply|lazy ?apply|auto ?fill|auto[- ]?appl|job ?assist|careerflow|huntr|job ?copilot|\bteal\b|apply ?ai|ai ?apply|jobscan|massapply|loopcv|sonara/i;
+    function paintOthers() {
+      var row = document.getElementById('oh-qc-others'), sub = document.getElementById('oh-qc-others-sub');
+      if (!row || !sub) return;
+      chrome.storage.local.get(['ohPauseOthers', 'ohPausedExts'], function (d) {
+        var on = !(d && d.ohPauseOthers === false);
+        row.setAttribute('aria-checked', on ? 'true' : 'false');
+        var paused = (d && Array.isArray(d.ohPausedExts)) ? d.ohPausedExts : [];
+        if (paused.length) { sub.textContent = 'Paused now: ' + paused.map(function (e) { return e.name; }).join(', '); return; }
+        if (!chrome.management || !chrome.management.getAll) { sub.textContent = on ? 'On' : 'Off'; return; }
+        chrome.management.getAll(function (list) {
+          void chrome.runtime.lastError;
+          var names = (list || []).filter(function (e) {
+            return e.id !== chrome.runtime.id && e.enabled && e.type === 'extension' && OTHER_FILLER_RE.test((e.name || '') + ' ' + (e.shortName || ''));
+          }).map(function (e) { return e.name; });
+          sub.textContent = !names.length ? 'None installed' : (on ? 'Will pause: ' : 'Found: ') + names.join(', ');
+        });
+      });
+    }
+
     function refresh() {
       try {
         ensureCard();
@@ -2904,6 +2978,7 @@
           try {
             var pl = document.getElementById('oh-qc-prio');
             if (pl) pl.setAttribute('aria-checked', d && d.ohPreferAts === false ? 'false' : 'true');
+            paintOthers();
           } catch (_) {}
           _queueTier = (d && d.ohPreferAts !== false && d.ohQueueTier) || null;
           var map = (d && d.ohHarvestedJobs) || {};

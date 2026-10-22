@@ -178,6 +178,29 @@ async function pruneIncomplete(ctx: Ctx, sectionEl: HTMLElement, anchor: AidKey)
   }
 }
 
+/**
+ * [oh] The most recent role with a start date and no end date is the one you are in now: tick
+ * "I currently work here" (Workday then drops the end date it was asking for). Whoever filled
+ * the role — this engine, Workday's CV parse or another filler.
+ */
+async function markCurrentRole(ctx: Ctx, sectionEl: HTMLElement): Promise<void> {
+  const first = blocks(sectionEl, "jobTitleF")[0];
+  if (!first) return;
+  const box = field("currentlyF", first);
+  if (!box) return;
+  const c = containerOf(box);
+  if (readValue(c) === "true") return;
+  const start = dateContainer(first, "start");
+  const end = dateContainer(first, "end");
+  if (!start || !readValue(start) || (end && readValue(end))) return;
+  handled.add(c);
+  if (await setCheckbox(c, true)) {
+    ctx.log('Ticked "I currently work here" on your most recent role (it has no end date)');
+    if (end) handled.add(end);
+    await waitStable(300, 4000);
+  }
+}
+
 function dateContainer(block: HTMLElement, which: "start" | "end"): HTMLElement | null {
   const byId = which === "start" ? field("startDateF", block) : field("endDateF", block);
   if (byId) return containerOf(byId);
@@ -346,6 +369,7 @@ async function uploadDocuments(ctx: Ctx) {
 }
 
 export async function myExperience(ctx: Ctx): Promise<void> {
+  await hooks.beforeExperience?.(); // [oh]
   const p = ctx.profile;
 
   const work = section("workSection", /work experience|employment history|berufserfahrung|expérience professionnelle|experiencia (laboral|profesional)|experiência profissional|esperienza (lavorativa|professionale)|werkervaring|doświadczenie zawodowe|職歴|工作经历/iu);
@@ -353,8 +377,10 @@ export async function myExperience(ctx: Ctx): Promise<void> {
     const bs = await ensureBlockCount(ctx, work, "jobTitleF", p.work.length);
     for (let i = 0; i < Math.min(bs.length, p.work.length); i++) await fillWork(ctx, bs[i], p.work[i]);
     ctx.log(`Work experience: ${p.work.length} role(s) filled`);
-  } else if (work && hooks.autoSubmit?.()) {
-    await pruneIncomplete(ctx, work, "jobTitleF"); // [oh]
+    await markCurrentRole(ctx, work); // [oh]
+  } else if (work) {
+    await markCurrentRole(ctx, work); // [oh] before anything is judged incomplete
+    if (hooks.autoSubmit?.()) await pruneIncomplete(ctx, work, "jobTitleF"); // [oh]
   }
 
   const edu = section("eduSection", /^(education|ausbildung|bildung|formation|educación|formación|educação|formação|istruzione|formazione|opleiding|wykształcenie|学歴|教育)/iu);

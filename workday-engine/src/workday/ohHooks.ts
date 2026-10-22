@@ -35,6 +35,8 @@ export interface EngineHooks {
   onFinish?: (run: RunState, outcome: Outcome) => void;
   /** Every page the run reaches. */
   onPage?: (run: RunState) => void;
+  /** Awaited before My Experience is filled (e.g. your work history is still being read from your CV). */
+  beforeExperience?: () => Promise<void>;
 }
 
 export const hooks: EngineHooks = {};

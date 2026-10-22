@@ -20,7 +20,8 @@
  * appears — My Information, My Experience, questions, disclosures — and
  * nothing is pressed for you. Each step is filled once: going Back to one
  * never refills it over your edits. You check, edit and press Save and
- * Continue; the next step fills itself.
+ * Continue; the next step fills itself. On Review it submits for you after
+ * a 5-second countdown you can cancel.
  *
  * The engine's own messages (wd:cred:*, wd:progress …) are answered here, in
  * the page, from chrome.storage.local — the service worker never sees them.
@@ -44,6 +45,7 @@ const LOG_KEY = "ohWdEngineLog";          // chrome.storage.local: last runs, fo
 const LOGIN_KEY = "ohWorkdayLogin";       // shared with the Queue Manager's "Workday sign-in"
 const RESUME_IFRAME = "optimhire-resume-score-record";
 const SEEKER_KEY = "ohWdSeeker";          // your details from the last OptimHire job, for "Autofill this page"
+const CV_KEY = "ohCvProfile";             // roles / education / skills read from your CV (by its URL)
 
 interface Mode {
   auto: boolean;        // an OptimHire run: report the result to OptimHire
@@ -323,7 +325,41 @@ function pick(o: Any, ...keys: string[]): string {
   return "";
 }
 
-async function buildProfile(ad?: Any): Promise<Profile> {
+/**
+ * Your work history, education, skills and languages read from your own CV —
+ * every role, the current one, full descriptions — read once per CV and kept.
+ * The reader (assets/wd-cvtext.js, with pdf.js) is loaded into this tab only
+ * when a CV has to be read.
+ */
+interface CvProfile { work: Profile["work"]; education: Profile["education"]; skills: string[]; languages: Profile["languages"]; summary: string }
+const cvReading = new Map<string, Promise<CvProfile | null>>();
+function cvProfileFor(url: string, p: Profile): Promise<CvProfile | null> {
+  if (!url) return Promise.resolve(null);
+  if (!cvReading.has(url)) cvReading.set(url, readCvProfile(url, p).finally(() => setTimeout(() => cvReading.delete(url), 5000)));
+  return cvReading.get(url)!;
+}
+async function readCvProfile(url: string, p: Profile): Promise<CvProfile | null> {
+  const { [CV_KEY]: cached } = await ST.get(CV_KEY);
+  if (cached && cached.url === url && cached.profile) return cached.profile as CvProfile;
+  const doc = await fetchCv(url, p).catch(() => undefined);
+  if (!doc) return null;
+  const w = window as Any;
+  if (!w.__ohCv) {
+    await within(chrome.runtime.sendMessage({ type: "OH_CV_LOAD" }), 15_000).catch(() => null);
+    for (let i = 0; i < 40 && !w.__ohCv; i++) await new Promise((r) => setTimeout(r, 100));
+  }
+  if (!w.__ohCv) return null;
+  const r = (await within(w.__ohCv.read(doc.base64, doc.mime), 30_000).catch(() => null)) as Any;
+  if (!r || !r.profile) return null;
+  const prof = r.profile as CvProfile;
+  await ST.set({ [CV_KEY]: { url, at: Date.now(), roles: prof.work.length, profile: prof } });
+  say(`read your CV: ${prof.work.length} role(s), ${prof.education.length} education, ${prof.skills.length} skill(s)`);
+  return prof;
+}
+
+let cvReady: Promise<void> = Promise.resolve();
+
+async function buildProfile(ad?: Any, cvUrl = ""): Promise<Profile> {
   const s = await profileSources(ad);
   const { ohWorkdayProfile: imported } = await ST.get("ohWorkdayProfile");
   const code = pick(s, "mobile_code", "phone_country_code", "dial_code").replace(/\D/g, "");
@@ -370,7 +406,21 @@ async function buildProfile(ad?: Any): Promise<Profile> {
       previouslyWorkedHere: false,
     },
   } as any);
-  if (!imported || typeof imported !== "object") return base;
+  /* Returned at once; your CV is read alongside and its history put into this
+     same profile object when ready (My Experience waits for it: cvReady). */
+  const withCv = async (prof: Profile): Promise<Profile> => {
+    if (prof.work.length || !cvUrl) { cvReady = Promise.resolve(); return prof; }
+    cvReady = cvProfileFor(cvUrl, prof).then((cv) => {
+      if (!cv || !cv.work.length || prof.work.length) return;
+      prof.work = cv.work;
+      if (!prof.education.length) prof.education = cv.education;
+      if (!prof.skills.length) prof.skills = cv.skills;
+      if (!prof.languages.length) prof.languages = cv.languages;
+      if (!prof.summary) prof.summary = cv.summary;
+    }, () => undefined);
+    return prof;
+  };
+  if (!imported || typeof imported !== "object") return withCv(base);
   // A full profile imported from the standalone extension (work history, education…) wins
   // where it says something; OptimHire's details fill the rest.
   const p = normalizeProfile(imported as Profile);
@@ -381,7 +431,7 @@ async function buildProfile(ad?: Any): Promise<Profile> {
     }
   };
   fillIn(p, base);
-  return p;
+  return withCv(p);
 }
 
 /* Assist: as fast as Workday takes it. */
@@ -522,11 +572,12 @@ async function hostAnswer(label: string, kind: ControlKind, options: string[]): 
 async function installHooks(mode: Mode): Promise<void> {
   const { complexFormData, updatedResume } = await ST.get(["complexFormData", "updatedResume"]);
   const ad = mode.auto ? parse(complexFormData).applicationDetails : undefined;
-  const profile = await buildProfile(ad);
   const src = await profileSources(ad);
   // OptimHire's tailored CV for this job, else the CV on your OptimHire profile.
   const own = pick(ad?.seeker || {}, "resume") || pick(src, "resume", "resume_url", "resumeUrl", "cv_url", "cv") || (await primaryCvUrl());
   const cvUrl = mode.auto ? updatedResume || own : own || updatedResume;
+  // Your history is read from your own CV (the same every job), not a per-job tailored copy.
+  const profile = await buildProfile(ad, own || cvUrl);
   let cv: Promise<StoredDoc | undefined> | null = null;
   accountNoted = false;
   setHooks({
@@ -538,6 +589,7 @@ async function installHooks(mode: Mode): Promise<void> {
     prefetch: (qs) => askOptimHire(qs),
     answer: hostAnswer,
     onPage: (run) => onPage(mode, run),
+    beforeExperience: () => within(cvReady, 30_000).then(() => undefined),
     onFinish: (run, outcome) => void finish(mode, run, outcome),
   });
 }
@@ -659,10 +711,11 @@ async function startQueueJob(job: Any): Promise<void> {
   }
 }
 
-async function startManual(submit: boolean): Promise<void> {
+/** "Autofill this page": the whole application, stopping on Review — or, with pageOnly, just the step on screen. */
+async function startManual(submit: boolean, pageOnly = false): Promise<void> {
   if (isActive()) return;
-  const mode: Mode = { auto: false, submit, startedAt: Date.now(), jobId: "" };
-  writeMode(mode);
+  const mode: Mode = { auto: false, submit, assist: pageOnly, startedAt: Date.now(), jobId: "" };
+  if (!pageOnly) writeMode(mode);
   send({ type: "OH_MANUAL_FILL_STATUS", state: "start" });
   await installHooks(mode);
   await startRun(null);
@@ -683,7 +736,7 @@ if (TOP && isWorkdayHost()) {
       return false;
     }
     if (msg.type === "OH_AUTOFILL_THIS_PAGE" && hasWorkdayApp()) {
-      void startManual(!!msg.submit);
+      void startManual(!!msg.submit, !!msg.pageOnly);
       return false;
     }
     // OptimHire's run stopped: its job stops too (a manual "Autofill this page" carries on).
@@ -695,12 +748,53 @@ if (TOP && isWorkdayHost()) {
     return false;
   });
 
+  /* Assist, on Review: "Submitting your application in 5…" with Cancel, then Submit. */
+  const submitCountdown = (seconds = 5) => {
+    if (!document.body) return;
+    const host = document.createElement("div");
+    host.id = "oh-wd-submit-countdown";
+    host.style.cssText = "position:fixed;right:16px;bottom:16px;z-index:2147483647";
+    const root = host.attachShadow({ mode: "open" });
+    root.innerHTML = `<style>
+      .b{font:13px/1.4 Inter,system-ui,sans-serif;display:flex;align-items:center;gap:12px;padding:12px 14px;background:#12141c;color:#e6e8ef;
+         border:1px solid #262a36;border-radius:12px;box-shadow:0 10px 30px rgba(0,0,0,.45)}
+      b{font-weight:600} button{font:600 12.5px/1 inherit;font-family:inherit;height:30px;padding:0 12px;border-radius:8px;cursor:pointer;
+         background:#1a1d27;color:#e6e8ef;border:1px solid #333849} button:hover{background:#20242f}
+      .now{background:#6d5efc;border-color:#6d5efc;color:#fff}</style>
+      <div class="b" role="status"><span>Submitting your application in <b id="n">${seconds}</b>…</span>
+      <button class="now" id="go">Submit now</button><button id="x">Cancel</button></div>`;
+    document.body.appendChild(host);
+    let left = seconds;
+    let done = false;
+    const finish = (submit: boolean) => {
+      if (done) return;
+      done = true;
+      clearInterval(t);
+      host.remove();
+      if (submit) { say("assist: submitting from Review"); void startManual(true); }
+      else say("assist: submit cancelled — Review is yours");
+    };
+    const t = window.setInterval(() => {
+      left--;
+      const n = root.getElementById("n");
+      if (n) n.textContent = String(left);
+      if (left <= 0) finish(true);
+    }, 1000);
+    root.getElementById("go")?.addEventListener("click", () => finish(true));
+    root.getElementById("x")?.addEventListener("click", () => finish(false));
+  };
+
   /* Assist: a new step on screen (not in a run, nothing running) is filled once. */
   const ASSIST_PAGES: PageKind[] = ["resumeUpload", "myInformation", "myExperience", "questions", "voluntaryDisclosures", "selfIdentify"];
   const assisted = new Set<string>();
   setInterval(() => {
     if (!assistOn || readMode() || isActive() || !hasWorkdayApp()) return;
     const page = detectPage();
+    if (page === "review") {
+      const rk = `review|${location.pathname}`;
+      if (!assisted.has(rk) && !document.getElementById("oh-wd-submit-countdown")) { assisted.add(rk); submitCountdown(); }
+      return;
+    }
     if (!ASSIST_PAGES.includes(page)) return;
     const key = `${page}|${activeStepName()}|${location.pathname}`;
     if (assisted.has(key)) return;
@@ -708,6 +802,20 @@ if (TOP && isWorkdayHost()) {
     const mode: Mode = { auto: false, submit: false, assist: true, startedAt: Date.now(), jobId: "" };
     void installHooks(mode).then(() => startRun(null));
   }, 900);
+
+  /* Read your CV as soon as a Workday page with the app opens (assist on), so
+     your roles are ready by My Experience. Once per CV; kept after that. */
+  const warmCv = (tries = 0) => {
+    if (!hasWorkdayApp()) { if (tries < 40) setTimeout(() => warmCv(tries + 1), 500); return; }
+    if (!assistOn && !readMode()) return;
+    void (async () => {
+      const src = await profileSources();
+      const url = pick(src, "resume", "resume_url", "resumeUrl", "cv_url", "cv") || (await primaryCvUrl());
+      const { ohWorkdayProfile } = await ST.get("ohWorkdayProfile");
+      if (url && !(ohWorkdayProfile && Array.isArray(ohWorkdayProfile.work) && ohWorkdayProfile.work.length)) await cvProfileFor(url, normalizeProfile({} as Profile));
+    })().catch(() => undefined);
+  };
+  setTimeout(() => warmCv(), 1500);
 
   // A run interrupted by a reload (sign-in, session refresh) carries on; nothing else starts by itself.
   const boot = (tries = 0) => {

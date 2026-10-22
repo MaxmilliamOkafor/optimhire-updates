@@ -80,7 +80,7 @@
     return p && typeof p === 'object' && (p.personal || Array.isArray(p.work)) ? p : null;
   }
   function renderEngine() {
-    ST.get(['ohWdEngineOff', 'ohWorkdayProfile', 'ohGmailCodes'], function (d) {
+    ST.get(['ohWdEngineOff', 'ohWorkdayProfile', 'ohGmailCodes', 'ohCvProfile'], function (d) {
       $('wdEngineOn').checked = !(d && d.ohWdEngineOff === true);
       $('gmailCodesOn').checked = !!(d && d.ohGmailCodes === true);
       var p = d && d.ohWorkdayProfile;
@@ -88,7 +88,10 @@
       $('wdProfileState').textContent = p
         ? 'Imported' + (name ? ': ' + name : '') + ' — ' + ((p.work || []).length) + ' role(s), ' +
           ((p.education || []).length) + ' education, ' + ((p.skills || []).length) + ' skill(s)'
-        : 'Not imported — your OptimHire details are used.';
+        : (d && d.ohCvProfile && d.ohCvProfile.profile && d.ohCvProfile.profile.work && d.ohCvProfile.profile.work.length
+          ? 'Not imported — read from your CV: ' + d.ohCvProfile.profile.work.length + ' role(s), ' +
+            (d.ohCvProfile.profile.education || []).length + ' education, ' + (d.ohCvProfile.profile.skills || []).length + ' skill(s)'
+          : 'Not imported — read from your CV the first time a Workday form needs it.');
       $('wdProfileRemove').disabled = !p;
     });
   }

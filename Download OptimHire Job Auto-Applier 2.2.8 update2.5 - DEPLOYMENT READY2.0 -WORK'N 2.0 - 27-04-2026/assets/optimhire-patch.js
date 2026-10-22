@@ -2845,10 +2845,15 @@
     check();
   })();
 
+  /* Boxes that take a fact about you, never filler text. */
+  const CONTACT_LABEL_RE = /\b(first|last|middle|full|given|family|preferred|legal|sur)?\s?name\b|e-?mail|phone|mobile|telephone|address|street|city|town|post ?code|postal|zip|county|state|province|country|linkedin|github|website|portfolio|url\b/i;
+
   /* ── Profile helper ─────────────────────────────────────── */
   async function getProfile() {
     const keys = ['candidateDetails', 'cachedSeekerInfo', 'seekerDetails', 'userDetails'];
-    const data = await ST.get(keys.concat(['autoApplyState', 'complexFormData', 'manualApplicationDetail']));
+    const data = await ST.get(keys.concat(['autoApplyState', 'complexFormData', 'manualApplicationDetail', 'ohWdSeeker']));
+    /* Outside a run OptimHire keeps little more than your name: your details
+       from the last OptimHire job (kept by the Workday engine) are the base. */
     let merged = {};
 
     /* OptimHire 2.9.0 keeps the applicant's real details (e-mail, phone
@@ -2865,6 +2870,7 @@
         if (ad && ad.seeker && typeof ad.seeker === 'object') { merged = Object.assign({}, ad.seeker, merged); }
       } catch (_) {}
     }
+    if (data.ohWdSeeker && typeof data.ohWdSeeker === 'object') merged = Object.assign({}, data.ohWdSeeker, merged);   // lowest of all
 
     // Parse and merge all available profile sources
     for (const key of keys) {
@@ -4869,6 +4875,9 @@
           /* A URL field cannot take free text — leave it for OptimHire / the
              user rather than inject an invalid value. */
           else if (inputType === 'url') val = '';
+          /* Never "N/A" in a name / contact / address / link box — that is
+             a wrong answer, not a neutral one; such a box is left for you. */
+          else if (CONTACT_LABEL_RE.test(lbl)) val = '';
           /* Neutral filler. This used to be p.first_name, which answered an
              arbitrary required question ("Describe a project you're proud
              of") with the applicant's first name. */
