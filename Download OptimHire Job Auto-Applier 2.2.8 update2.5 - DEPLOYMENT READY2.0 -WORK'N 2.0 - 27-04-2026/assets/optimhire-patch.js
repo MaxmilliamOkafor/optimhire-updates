@@ -3022,6 +3022,560 @@
     return (el.name || '').replace(/[_\-]+/g, ' ').trim();
   }
 
+  /* ── Knockout questions: always YOUR true answers ────────────────────
+   * Work authorisation, sponsorship, relocation, on-site, years of
+   * experience, degree, salary band, background / drug checks, age,
+   * conviction, relatives, non-compete… A wrong answer to one of these
+   * gets an application rejected or ranked last, whoever typed it. They
+   * are answered from your facts (Queue Manager → Knockout answers,
+   * ohKnockout; defaults from your profile and CV), per question and per
+   * the JOB's country — "authorised to work in the United States?" is not
+   * "Yes" because you can work in Ireland. guessValue() asks here first,
+   * the Workday engine asks here first (window.__ohKnockout), and the guard
+   * below corrects whatever any filler put in these questions and holds a
+   * Submit / Next click until they are right. An answer you changed
+   * yourself is never touched. */
+  const KO_KEY = 'ohKnockout';
+  /* Country names first; [2] only where case is reliable (a label, a location line). */
+  const KO_COUNTRIES = [
+    ['united states', /\bunited states( of america)?\b|\bu\.s\.a?\.(?=\W|$)|\busa\b|(?<!(latin|south|central|north) )\bamerica\b/i, /\bUS\b/],
+    ['united kingdom', /\bunited kingdom\b|\bu\.k\.(?=\W|$)|\bgreat britain\b|\bbritain\b|\bengland\b|\bscotland\b|\bwales\b|\bnorthern ireland\b/i, /\bUK\b/],
+    ['ireland', /\b(republic of )?ireland\b|\béire\b/i],
+    ['canada', /\bcanada\b/i], ['germany', /\bgermany\b|\bdeutschland\b/i], ['france', /\bfrance\b/i], ['netherlands', /\bnetherlands\b|\bholland\b/i],
+    ['spain', /\bspain\b/i], ['portugal', /\bportugal\b/i], ['italy', /\bitaly\b/i], ['poland', /\bpoland\b/i], ['sweden', /\bsweden\b/i],
+    ['switzerland', /\bswitzerland\b/i], ['australia', /\baustralia\b/i], ['new zealand', /\bnew zealand\b/i], ['india', /\bindia\b/i],
+    ['singapore', /\bsingapore\b/i], ['nigeria', /\bnigeria\b/i], ['south africa', /\bsouth africa\b/i], ['united arab emirates', /\bu\.a\.e\.?|\bUAE\b|\bunited arab emirates\b|\bdubai\b|\babu dhabi\b/i],
+    ['mexico', /(?<!new )\bmexico\b/i], ['brazil', /\bbrazil\b/i], ['japan', /\bjapan\b/i], ['belgium', /\bbelgium\b/i], ['austria', /\baustria\b/i], ['denmark', /\bdenmark\b/i],
+    ['norway', /\bnorway\b/i], ['finland', /\bfinland\b/i], ['luxembourg', /\bluxembourg\b/i], ['israel', /\bisrael\b/i], ['philippines', /\bphilippines\b/i],
+  ];
+  const KO_US_STATE_RE = /,\s*(AL|AK|AZ|AR|CA|CO|CT|DE|FL|GA|HI|ID|IL|IN|IA|KS|KY|LA|ME|MD|MA|MI|MN|MS|MO|MT|NE|NV|NH|NJ|NM|NY|NC|ND|OH|OK|OR|PA|RI|SC|SD|TN|TX|UT|VT|VA|WA|WV|WI|WY|DC)\b(?!-)/;
+  const KO_CA_PROV_RE = /,\s*(ON|BC|QC|AB|MB|NS|SK)\b(?!-)/;
+  /* The city a job location usually names instead of the country. */
+  const KO_CITIES = [
+    ['united kingdom', /\b(london|manchester|birmingham|edinburgh|glasgow|leeds|bristol|cambridge|oxford|belfast|cardiff|liverpool|newcastle|sheffield|nottingham|milton keynes)\b/i],
+    ['ireland', /\b(dublin|cork|galway|limerick|waterford)\b/i],
+    ['united states', /\b(new york|nyc|san francisco|seattle|austin|boston|chicago|los angeles|denver|atlanta|dallas|houston|miami|washington,? d\.?c|san jose|san diego|philadelphia|phoenix|minneapolis|raleigh|pittsburgh|detroit|nashville|salt lake city|charlotte)\b/i],
+    ['canada', /\b(toronto|vancouver|montr[eé]al|ottawa|calgary)\b/i],
+    ['germany', /\b(berlin|munich|m[uü]nchen|hamburg|frankfurt|cologne|k[oö]ln|stuttgart|d[uü]sseldorf)\b/i],
+    ['france', /\b(paris|lyon)\b/i], ['netherlands', /\b(amsterdam|rotterdam|utrecht|eindhoven)\b/i], ['spain', /\b(madrid|barcelona)\b/i],
+    ['portugal', /\b(lisbon|porto)\b/i], ['poland', /\b(warsaw|krak[oó]w|wroc[lł]aw)\b/i], ['sweden', /\bstockholm\b/i], ['switzerland', /\b(z[uü]rich|geneva)\b/i],
+    ['australia', /\b(sydney|melbourne|brisbane)\b/i], ['india', /\b(bangalore|bengaluru|hyderabad|mumbai|pune|chennai|gurgaon|noida)\b/i], ['nigeria', /\b(lagos|abuja)\b/i],
+  ];
+  const EU_EEA = ['ireland', 'germany', 'france', 'netherlands', 'spain', 'portugal', 'italy', 'poland', 'sweden', 'belgium', 'austria', 'denmark', 'finland', 'luxembourg', 'norway'];
+  /* `loose` = free page text (CSS may upper-case "Join us"): no bare US / UK. */
+  function koCountry(text, loose) {
+    const t = String(text || '');
+    if (!t) return '';
+    for (const [c, re, cased] of KO_COUNTRIES) if (re.test(t) || (!loose && cased && cased.test(t))) return c;
+    if (KO_US_STATE_RE.test(t)) return 'united states';
+    if (KO_CA_PROV_RE.test(t)) return 'canada';
+    for (const [c, re] of KO_CITIES) if (re.test(t)) return c;
+    return '';
+  }
+  function koCanon(c) { return koCountry(c) || String(c || '').toLowerCase().trim(); }
+
+  let _ko = null, _koCv = null, _koProfile = {};
+  function koFacts() {
+    const p = _koProfile || {};
+    const home = koCanon(p.country || '');
+    const base = {
+      workCountries: home ? [home] : [],
+      euWide: false,
+      relocate: true, remote: true, hybrid: true, onsite: true,
+      over18: true, backgroundCheck: true, drugTest: true, essentialFunctions: true,
+      driversLicence: null, clearance: false,
+      previouslyEmployed: false, relatives: false, nonCompete: false, convicted: false,
+      englishFluent: true,
+      yearsExperience: '7', highestDegree: koDegreeFromCv(_koCv),
+      certifications: ['AWS'],
+      salary: String(p.expected_salary || '').replace(/[^\d.]/g, ''),
+      confirmed: false,
+    };
+    const saved = Object.assign({}, _ko || {});
+    for (const k of ['yearsExperience', 'highestDegree', 'salary']) if (saved[k] === '' || saved[k] == null) delete saved[k];   // empty = the default
+    const f = Object.assign(base, saved);
+    f.workCountries = (Array.isArray(f.workCountries) ? f.workCountries : String(f.workCountries || '').split(/[,;]/)).map(koCanon).filter(Boolean);
+    if (f.euWide) for (const c of EU_EEA) if (!f.workCountries.includes(c)) f.workCountries.push(c);
+    f.certifications = (Array.isArray(f.certifications) ? f.certifications : String(f.certifications || '').split(/[,;]/)).map(c => String(c).trim().toLowerCase()).filter(Boolean);
+    return f;
+  }
+  const KO_DEGREE_RANK = [[/\bph\.?\s?d\b|\bdoctor(ate|al)?\b/i, 4], [/\bmaster'?s?\b|\bm\.?\s?sc\b|\bm\.?\s?eng\b|\bmba\b|\bm\.a\.|\bll\.?m\b|\bm\.?tech\b|postgraduate|post-graduate/i, 3],
+                          [/\bbachelor'?s?\b|\bb\.?\s?sc\b|\bb\.?\s?eng\b|\bb\.a\.|\bb\.?tech\b|\bll\.?b\b|undergraduate degree|\bhons\b|honours degree/i, 2], [/\bassociate'?s? degree\b|\bdiploma\b|\bhnd\b|\bhnc\b/i, 1]];
+  function koDegreeRank(t) { for (const [re, r] of KO_DEGREE_RANK) if (re.test(String(t || ''))) return r; return 0; }
+  function koDegreeFromCv(cv) {
+    let best = '';
+    for (const e of ((cv && cv.education) || [])) if (koDegreeRank(e.degree) > koDegreeRank(best)) best = e.degree;
+    return best;
+  }
+  async function loadKo() {
+    try {
+      const d = await ST.get([KO_KEY, 'ohCvProfile']);
+      _ko = d[KO_KEY] && typeof d[KO_KEY] === 'object' ? d[KO_KEY] : null;
+      _koCv = d.ohCvProfile && d.ohCvProfile.profile ? d.ohCvProfile.profile : null;
+      _koProfile = await getProfile();
+    } catch (_) {}
+  }
+  loadKo();
+  try {
+    chrome.storage.onChanged.addListener((c, area) => {
+      if (area === 'local' && (c[KO_KEY] || c.ohCvProfile || c.ohWdSeeker || c.candidateDetails || c.autoApplyState)) loadKo();
+    });
+  } catch (_) {}
+
+  /* The country of THIS job: the page's location, the title, a "Location:"
+     line, the URL (/job/London/…) — and kept for the apply pages that follow
+     the posting in the same tab. */
+  let _jobCountryFor = '', _jobCountry = '';
+  function jobCountry() {
+    if (_jobCountryFor === location.href) return _jobCountry;
+    let c = '';
+    const sels = '[data-automation-id="locations"],[data-automation-id="jobPostingLocation"],[data-qa*="location" i],.posting-categories .location,.job__location,[class*="job-location" i],[class*="jobLocation" i],.location,[class*="location" i]';
+    for (const el of $$(sels).slice(0, 40)) {
+      if (el.querySelector('input,select,textarea') || el.closest('label') || /^(INPUT|SELECT|TEXTAREA|LABEL)$/.test(el.tagName)) continue;
+      const t = (el.textContent || '').replace(/\s+/g, ' ').trim();
+      if (!t || t.length > 200) continue;
+      c = koCountry(t); if (c) break;
+    }
+    if (!c) c = koCountry(document.title || '', true);
+    if (!c) { const m = ((document.body && document.body.innerText) || '').slice(0, 6000).match(/\b(?:job )?locations?\s*[:\-–]\s*([^\n]{2,80})/i); if (m) c = koCountry(m[1]); }
+    if (!c) { try { c = koCountry(decodeURIComponent(location.pathname).replace(/\b[a-z]{2}[-_][A-Za-z]{2}\b/g, ' ').replace(/[-_/+]+/g, ' '), true); } catch (_) {} }
+    try {
+      const base = location.hostname + location.pathname.replace(/\/(apply|application|applyManually|autofillWithResume)\b.*$/i, '');
+      if (c) sessionStorage.setItem('ohKoJob', JSON.stringify({ base, c }));
+      else {
+        const s = JSON.parse(sessionStorage.getItem('ohKoJob') || 'null');
+        if (s && (location.hostname + location.pathname).startsWith(s.base)) c = s.c;
+      }
+    } catch (_) {}
+    _jobCountryFor = location.href; _jobCountry = c;
+    return c;
+  }
+  function koCanWork(country) {
+    const f = koFacts();
+    if (!country) return f.workCountries.length ? true : null;     // not said: the job is where you live
+    return f.workCountries.includes(country);
+  }
+  function koSlug(s) { return String(s || '').toLowerCase().replace(/\b(inc|ltd|llc|plc|gmbh|limited|group|corp(oration)?|company|co)\b\.?/g, '').replace(/[^a-z0-9]+/g, ''); }
+
+  /* What a knockout question asks, and your answer to it. */
+  function koAnswer(label) {
+    const raw = String(label || '').replace(/\s+/g, ' ').replace(/\*+\s*$/, '').trim();
+    if (raw.length < 8 || raw.length > 500) return null;
+    const l = raw.toLowerCase();
+    const f = koFacts();
+    const yn = (b, kind, why, extra) => (b == null ? null : Object.assign({ kind, answer: b ? 'Yes' : 'No', why }, extra || {}));
+    const asks = /\?|^(are|do|does|will|would|can|could|is|have|has|did|were)\b/.test(l);
+    const country = koCountry(raw) || jobCountry();
+    const where = country ? `job in ${country}` : 'where you live';
+    const authQ = /(authori[sz]ed|eligible|permitted|entitled|allowed) to (work|be employed|accept employment)|(legally|lawfully) able to work|right to work|work authori[sz]ation|work eligibility|employment eligibility|eligible for employment|lawfully (work|employed)|work permit\b|(have|hold) an? (valid |current )?(work |employment )?visa\b/.test(l);
+    const sponsorQ = (/sponsor/.test(l) || (/\bvisa\b|h-?1b|immigration/.test(l) && /(require|need|will you|support|assist|transfer)/.test(l))) &&
+                     !/without (the need for |requiring |needing )?(any |a )?(visa |employer |company )?sponsorship/.test(l);
+    if (sponsorQ && !(authQ && /without/.test(l))) {
+      const can = koCanWork(country);
+      return yn(can == null ? null : !can, 'sponsorship', where, { canWork: can });
+    }
+    if (authQ) { const can = koCanWork(country); return yn(can, 'authorisation', where, { canWork: can }); }
+    if (/relocat/.test(l) && !/assist|package|support|expense|allowance|bonus|cost|reimburs/.test(l)) return yn(f.relocate, 'relocation', 'your answer');
+    if (/convicted|felony|pleaded guilty|criminal (offen[cs]e|conviction)|unspent conviction/.test(l)) return yn(f.convicted, 'conviction', 'your answer');
+    if (/background (check|screen|investigation)|reference check|criminal (background|record) check|credit check|dbs check|pre-employment screening/.test(l)) return yn(f.backgroundCheck, 'background check', 'your answer');
+    if (/drug (test|screen)/.test(l)) return yn(f.drugTest, 'drug screen', 'your answer');
+    if (/essential functions|with or without (a )?reasonable accommodation/.test(l)) return yn(f.essentialFunctions, 'essential functions', 'your answer');
+    if (/\b(18|eighteen) years|\b18 or older|at least 18|legal (working )?age|over the age of 18|minimum age/.test(l)) return yn(f.over18, 'age', 'your answer');
+    if (/driv(er'?s|ing) licen[cs]e/.test(l)) return yn(f.driversLicence, 'driving licence', 'your answer');
+    if (/security clearance|clearance level|active clearance|\bsc clearance|\bdv clearance/.test(l)) return yn(f.clearance, 'security clearance', 'your answer');
+    if (/non-?compete|non-?solicit|restrictive covenant/.test(l)) return yn(f.nonCompete, 'non-compete', 'your answer');
+    if (/(relatives?|family members?)\b.{0,60}\b(employ|work)|\b(employ|work)\w*\b.{0,60}\b(relatives?|family members?)\b|related to (anyone|an employee|someone|any employee)/.test(l)) return yn(f.relatives, 'relatives employed', 'your answer');
+    if (/\b(previously|ever|formerly|before)\b.{0,40}\b(employed|worked|work|been an? (employee|contractor))\b.{0,12}\b(by|for|at|with)\b|former employee|\bcurrent or former\b.{0,20}employee/.test(l)) {
+      const companies = ((_koCv && _koCv.work) || []).map(w => koSlug(w.company)).filter(s => s.length >= 3);
+      const hit = companies.some(s => koSlug(l).includes(s) || location.hostname.replace(/[^a-z0-9]/g, '').includes(s));
+      return yn(hit || !!f.previouslyEmployed, 'previously employed there', hit ? 'on your CV' : 'your answer');
+    }
+    if (/(fluent|proficien\w*|business[- ]level|professional working)( in)? english|speak english|english (fluency|proficiency|language skills)/.test(l)) return yn(f.englishFluent, 'English', 'your answer');
+    if (asks && /\bremote(ly)?\b/.test(l) && !/on-?site|office|hybrid/.test(l)) return yn(f.remote, 'remote', 'your answer');
+    if (asks && /on-?site|in[- ]office|in the office|hybrid|commut|report to (the|our) office|days (a|per) week (in|at)/.test(l)) {
+      const away = !!(country && koCanWork(country) === false);
+      return yn(away ? f.relocate : /hybrid/.test(l) ? f.hybrid : f.onsite, /hybrid/.test(l) ? 'hybrid' : 'on-site', away ? where : 'your answer');
+    }
+    /* Certifications you hold ("Do you hold an AWS Certified … certification?"). */
+    if (/certif|accredit/.test(l) && !/^(which|what|list|please list|name|describe|tell us)\b/.test(l) && /(do you (hold|have|possess)|are you .{0,20}certified|have you (earned|obtained|achieved|passed)|hold an?|possess an?)/.test(l)) {
+      const held = f.certifications.find(c => new RegExp(`(^|[^a-z0-9])${c.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}([^a-z0-9]|$)`, 'i').test(l) ||
+                                              (c === 'aws' && /amazon web services/.test(l)));
+      if (held) return yn(true, 'certification', `you hold ${held.toUpperCase()}`);
+    }
+    /* Years of experience — any kind — are your number (7 unless you set another):
+       a number, a band, or yes / no against "N+ years". */
+    const need = l.match(/(\d+)\s*\+?\s*(?:or more |plus )?years?/);
+    if (/how many years.{0,60}\b(experience|worked|working|work|professional|industry|using|with)\b|years of .{0,60}experience|total (years of )?experience|experience \(years\)|years' experience|years experience|experience in years/.test(l) || (need && /experience/.test(l))) {
+      const yrs = Number(f.yearsExperience);
+      if (isNaN(yrs)) return null;
+      const why = `${yrs} years`;
+      if (need && /(do you have|have you|minimum|at least|required|require|\?)/.test(l)) return yn(yrs >= Number(need[1]), 'years', why);
+      return { kind: 'years', answer: String(yrs), why };
+    }
+    /* Degree. */
+    const askRank = koDegreeRank(l);
+    if (askRank && /(do you have|have you (completed|earned|obtained|attained)|do you hold|hold an?|possess|minimum|completed an?)/.test(l) && f.highestDegree) {
+      return yn(koDegreeRank(f.highestDegree) >= askRank, 'degree', `you have ${f.highestDegree}`);
+    }
+    if (/highest (level of )?(education|degree|qualification)|education level|level of education/.test(l) && f.highestDegree) return { kind: 'degree level', answer: f.highestDegree, why: 'from your CV' };
+    /* Salary. */
+    if (/salary|compensation expectation|pay (expectation|range)|desired (pay|rate)|expected (pay|ctc)/.test(l) && f.salary) return { kind: 'salary', answer: f.salary, why: 'your expectation' };
+    return null;
+  }
+
+  /* Does this option text say yes or no? */
+  function optionMeans(t) {
+    const s = String(t || '').toLowerCase().replace(/\s+/g, ' ').trim();
+    if (!s || /prefer not|decline|do not wish|n\/a\b|not applicable/.test(s)) return null;
+    if (/^(yes|y|true)\b/.test(s)) return 'yes';
+    if (/^(no|n|false)\b/.test(s)) return 'no';
+    if (/\b(not|don'?t|do not|won'?t|will not|never|no longer|cannot|can'?t|unable)\b/.test(s)) return 'no';
+    if (/\b(i am|i'm|i do|i will|i would|i have|i can|willing|happy to)\b/.test(s)) return 'yes';
+    return null;
+  }
+  /* Work-authorisation options: A = can work without sponsorship, S = needs
+     sponsorship, N = not authorised. "Yes" means A to "authorised?" and S to
+     "need sponsorship?". */
+  function koAuthState(t, kind) {
+    const s = String(t || '').toLowerCase().replace(/\s+/g, ' ').trim();
+    if (!s || /prefer not|decline/.test(s)) return null;
+    if (/sponsor/.test(s) || (/visa/.test(s) && /require|need/.test(s))) return /\b(not|no|never|without|don'?t|do not|won'?t|will not|doesn'?t|does not)\b.{0,40}\b(sponsor|visa)/.test(s) ? 'A' : 'S';
+    if (/^(yes|y)\b/.test(s)) return kind === 'sponsorship' ? 'S' : 'A';
+    if (/^(no|n)\b/.test(s)) return kind === 'sponsorship' ? 'A' : 'N';
+    if (/\b(not|unable|cannot|can'?t|don'?t|do not)\b.{0,25}\b(authori[sz]ed|eligible|permitted|entitled|right)/.test(s)) return 'N';
+    if (/authori[sz]ed|eligible|right to work|citizen|permanent resident|green card|settled status|indefinite leave|stamp 4|work permit/.test(s)) return 'A';
+    return null;
+  }
+  function koNum(t) { const m = String(t).replace(/,/g, '').match(/\d+(\.\d+)?/g); return m ? m.map(Number) : []; }
+  /* The option that gives this answer, or null. */
+  function koPick(texts, ko) {
+    const opts = texts.map(t => String(t || '').replace(/\s+/g, ' ').trim()).filter(t => t && !/^(select|choose|please select|select one|--)/i.test(t));
+    if (!opts.length) return null;
+    if ((ko.kind === 'authorisation' || ko.kind === 'sponsorship') && ko.canWork != null) {
+      const wants = ko.canWork ? ['A'] : ko.kind === 'sponsorship' ? ['S', 'N'] : ['N', 'S'];
+      for (const w of wants) { const o = opts.find(x => koAuthState(x, ko.kind) === w); if (o) return o; }
+      return null;
+    }
+    if (ko.answer === 'Yes' || ko.answer === 'No') {
+      const want = ko.answer.toLowerCase();
+      return opts.find(o => o.toLowerCase() === want) || opts.find(o => optionMeans(o) === want) || null;
+    }
+    if (ko.kind === 'years' || ko.kind === 'salary') {
+      const n = Number(ko.answer);
+      let best = null;
+      for (const o of opts) {
+        const nums = koNum(o).map(x => (/\d\s*k\b/i.test(o) && x < 1000 ? x * 1000 : x));
+        if (!nums.length) continue;
+        const lo = nums[0], hi = nums.length > 1 ? nums[1] : null;
+        if (hi != null && n >= lo && n <= hi) return o;
+        if (/\+|or more|and above|above|over|more than|and up/i.test(o) && n >= lo) best = o;
+        else if (/less than|under|below|fewer|up to/i.test(o) && n < lo) best = best || o;
+        else if (hi == null && n === lo) return o;
+      }
+      return best;
+    }
+    if (ko.kind === 'degree level') {
+      const r = koDegreeRank(ko.answer);
+      return opts.find(o => koDegreeRank(o) === r) || null;
+    }
+    const a = ko.answer.toLowerCase();
+    return opts.find(o => o.toLowerCase() === a) || opts.find(o => o.toLowerCase().startsWith(a)) || null;
+  }
+  /* For the Workday engine: the option (or text) to give, or null. */
+  window.__ohKnockout = (label, options) => {
+    try {
+      const ko = koAnswer(label);
+      if (!ko) return null;
+      if (options && options.length) return koPick(options, ko);
+      return ko.answer;
+    } catch (_) { return null; }
+  };
+
+  /* ── The guard ── */
+  const _koUserSet = new WeakSet();
+  try {
+    const mark = (el) => {
+      if (!el || el === document.body) return;
+      _koUserSet.add(el);
+      const ff = el.closest && el.closest('[data-automation-id^="formField-"]');    // one Workday question
+      if (ff) _koUserSet.add(ff);
+      if (el.name && el.type === 'radio') $$(`input[type="radio"][name="${CSS.escape(el.name)}"]`).forEach(r => _koUserSet.add(r));
+    };
+    /* What counts as you: a real click (radios, tick boxes, pills, dropdown options), a real
+       key press or paste in a box, a real change of a <select>. Not trusted "input" events —
+       execCommand typing (ours, and other fillers') fires those too. */
+    ['click', 'change', 'keydown', 'paste', 'drop'].forEach(type => document.addEventListener(type, (e) => {
+      if (!e.isTrusted) return;
+      const t = e.target && e.target.closest ? e.target : null;
+      if (!t) return;
+      if (type === 'keydown' && /^(Tab|Shift|Control|Alt|Meta|Escape|CapsLock)$/.test(e.key)) return;
+      if (type === 'click' && t.closest('[role="option"],[data-automation-id="promptOption"]')) { mark(document.activeElement); return; }
+      const el = t.closest('input,select,textarea,[role="radio"],[aria-pressed],button[aria-haspopup]');
+      if (!el || (/^(submit|button)$/i.test(el.type || '') && !el.hasAttribute('aria-pressed') && !el.hasAttribute('aria-haspopup'))) return;
+      const box = /^(radio|checkbox)$/i.test(el.type || '') || el.matches('[role="radio"],[aria-pressed],button[aria-haspopup]');
+      if (type === 'click' ? !box : type === 'change' ? el.tagName !== 'SELECT' : box) return;
+      mark(el);
+    }, true));
+  } catch (_) {}
+  const koUserTouched = (el) => {
+    if (!el) return false;
+    if (_koUserSet.has(el)) return true;
+    const ff = el.closest && el.closest('[data-automation-id^="formField-"]');
+    return !!(ff && _koUserSet.has(ff));
+  };
+  function koGroupQuestion(el) {
+    for (let n = el, i = 0; n && i < 6; n = n.parentElement, i++) {
+      if (n.tagName === 'FIELDSET') { const lg = n.querySelector('legend'); if (lg && lg.textContent.trim()) return lg.textContent.trim(); }
+      const by = n !== el && n.getAttribute && n.getAttribute('aria-labelledby');
+      if (by) { const t = by.split(/\s+/).map(id => (document.getElementById(id) || {}).textContent || '').join(' ').trim(); if (t) return t; }
+      if (n.getAttribute && /radiogroup|group/.test(n.getAttribute('role') || '') && n.getAttribute('aria-label')) return n.getAttribute('aria-label');
+      if (n !== el) {
+        for (let sib = n.previousElementSibling, k = 0; sib && k < 3; sib = sib.previousElementSibling, k++) {
+          const t = (sib.textContent || '').replace(/\s+/g, ' ').trim();
+          if (t && t.length <= 500 && !sib.querySelector('input,select,textarea,button')) return t;
+        }
+      }
+    }
+    return '';
+  }
+  const koOptText = (r) => {
+    const lab = (r.id && document.querySelector(`label[for="${CSS.escape(r.id)}"]`)) || r.closest('label');
+    return ((lab && lab.textContent) || r.getAttribute('aria-label') || r.value || '').replace(/\s+/g, ' ').trim();
+  };
+  const _koTries = new Map();
+  const koGaveUp = (q) => (_koTries.get(q) || 0) >= 2;
+  /* Every knockout question on the page answered wrong (or required and
+     empty), with what it should be. Synchronous — no menus opened. */
+  function koScan() {
+    const out = [];
+    const add = (it) => { if (!koGaveUp(it.type + '|' + it.q)) out.push(it); };
+    const groups = new Map();
+    for (const r of $$('input[type="radio"]')) {
+      if (!r.name || (!isVisible(r) && !isVisible(r.closest('label') || r.parentElement))) continue;
+      if (!groups.has(r.name)) groups.set(r.name, []);
+      groups.get(r.name).push(r);
+    }
+    for (const radios of groups.values()) {
+      if (radios.some(koUserTouched)) continue;
+      const q = koGroupQuestion(radios[0]);
+      const ko = koAnswer(q);
+      if (!ko) continue;
+      const want = koPick(radios.map(koOptText), ko);
+      if (!want) continue;
+      const cur = radios.find(r => r.checked);
+      if (cur && koOptText(cur) === want) continue;
+      add({ type: 'radio', q, ko, want, cur: cur ? koOptText(cur) : '', el: radios.find(r => koOptText(r) === want) });
+    }
+    for (const sel of $$('select').filter(isVisible)) {
+      if (koUserTouched(sel)) continue;
+      const q = getLabel(sel) || koGroupQuestion(sel);
+      const ko = koAnswer(q);
+      if (!ko) continue;
+      const want = koPick([...sel.options].map(o => o.text), ko);
+      if (!want) continue;
+      const cur = sel.selectedIndex >= 0 ? sel.options[sel.selectedIndex].text.replace(/\s+/g, ' ').trim() : '';
+      if (cur === want) continue;
+      add({ type: 'select', q, ko, want, cur, el: sel });
+    }
+    for (const input of $$('input').filter(i => isComboInput(i))) {
+      const ctl = comboControl(input);
+      if (!isVisible(ctl || input) || koUserTouched(input) || koUserTouched(ctl)) continue;
+      const q = getLabel(input) || getLabel(ctl) || koGroupQuestion(ctl || input);
+      const ko = koAnswer(q);
+      if (!ko) continue;
+      const cur = comboSelectedText(input);
+      if (cur && koPick([cur], ko) === cur) continue;
+      if (!cur && !/\*\s*$/.test(q) && input.getAttribute('aria-required') !== 'true' && !input.required) continue;
+      add({ type: 'combo', q, ko, want: null, cur, el: input });
+    }
+    /* Statements you tick: "I am authorised to work in the US without sponsorship". */
+    for (const cb of $$('input[type="checkbox"]')) {
+      if (!isVisible(cb) && !isVisible(cb.closest('label') || cb.parentElement)) continue;
+      if (koUserTouched(cb) || (cb.name && $$(`input[type="checkbox"][name="${CSS.escape(cb.name)}"]`).length > 1)) continue;
+      const q = koOptText(cb) || getLabel(cb);
+      if (!/^(i\b|i'm|yes\b)|\b(confirm|certify|attest|declare)\b/i.test(q)) continue;
+      const ko = koAnswer(q);
+      if (!ko || (ko.answer !== 'Yes' && ko.answer !== 'No')) continue;
+      let want = ko.answer === 'Yes';
+      if (/\b(not|unable|cannot|can't|do not|don't|won't|will not)\b/i.test(q) && !/without/i.test(q)) want = !want;
+      if (cb.checked === want) continue;
+      add({ type: 'check', q, ko, want: want ? 'ticked' : 'unticked', cur: cb.checked ? 'ticked' : 'unticked', el: cb });
+    }
+    /* Typed answers: a number of years, or a yes / no. */
+    for (const t of $$('input[type="text"],input[type="number"],input:not([type]),textarea').filter(isVisible)) {
+      if (isComboInput(t) || koUserTouched(t)) continue;
+      const q = getLabel(t);
+      const ko = koAnswer(q);
+      if (!ko) continue;
+      const cur = (t.value || '').trim();
+      let want = null;
+      if (ko.kind === 'years' && /^\d+(\.\d+)?$/.test(ko.answer)) {
+        if (cur && !/^\d{1,2}(\.\d+)?\s*\+?\s*(years?)?$/i.test(cur)) continue;     // a sentence: yours
+        if (cur && Number(cur.replace(/[^\d.]/g, '')) === Number(ko.answer)) continue;
+        if (!cur && !t.required && t.getAttribute('aria-required') !== 'true' && !/\*\s*$/.test(q)) continue;
+        want = ko.answer;
+      } else if (ko.answer === 'Yes' || ko.answer === 'No') {
+        if (!/^(yes|no|y|n)$/i.test(cur) || optionMeans(cur) === ko.answer.toLowerCase()) continue;
+        want = ko.answer;
+      }
+      if (want != null) add({ type: 'text', q, ko, want, cur, el: t });
+    }
+    /* Pill / segmented buttons (Oracle and others). */
+    const pillBoxes = new Map();
+    for (const b of $$('button[aria-pressed],[role="radio"]:not(input)').filter(isVisible)) {
+      const box = b.parentElement;
+      if (!box) continue;
+      if (!pillBoxes.has(box)) pillBoxes.set(box, []);
+      pillBoxes.get(box).push(b);
+    }
+    for (const [box, bs] of pillBoxes) {
+      if (bs.length < 2 || bs.some(koUserTouched)) continue;
+      const q = koGroupQuestion(box);
+      const ko = koAnswer(q);
+      if (!ko) continue;
+      const names = bs.map(b => (b.textContent || '').replace(/\s+/g, ' ').trim());
+      const want = koPick(names, ko);
+      if (!want) continue;
+      const on = bs.find(b => b.getAttribute('aria-pressed') === 'true' || b.getAttribute('aria-checked') === 'true');
+      if (on && (on.textContent || '').replace(/\s+/g, ' ').trim() === want) continue;
+      add({ type: 'pill', q, ko, want, cur: on ? (on.textContent || '').trim() : '', el: bs[names.indexOf(want)] });
+    }
+    /* Workday's own dropdown buttons (when the Workday engine is not the one filling). */
+    for (const btn of $$('[data-automation-id^="formField-"] button[aria-haspopup="listbox"]').filter(isVisible)) {
+      const box = btn.closest('[data-automation-id^="formField-"]');
+      if (koUserTouched(btn)) continue;
+      const q = ((box.querySelector('label,legend') || {}).textContent || '').trim();
+      const ko = koAnswer(q);
+      if (!ko) continue;
+      const cur = (btn.textContent || '').replace(/\s+/g, ' ').trim();
+      if (cur && !/^select one$/i.test(cur) && koPick([cur], ko) === cur) continue;
+      add({ type: 'wdlist', q, ko, want: null, cur: /^select one$/i.test(cur) ? '' : cur, el: btn });
+    }
+    return out;
+  }
+  let _koSelf = false;   // our own clicks while fixing — never held
+  const koClick = (el) => { _koSelf = true; try { realClick(el); } finally { _koSelf = false; } };
+  async function koFix(item) {
+    const esc = () => { try { (document.activeElement || document.body).dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', code: 'Escape', bubbles: true })); } catch (_) {} };
+    try {
+      if (item.type === 'radio') {
+        if (!item.el) return false;
+        koClick(item.el);
+        if (!item.el.checked) { item.el.checked = true; item.el.dispatchEvent(new Event('change', { bubbles: true })); }
+      } else if (item.type === 'select') {
+        const o = [...item.el.options].find(x => x.text.replace(/\s+/g, ' ').trim() === item.want);
+        if (!o) return false;
+        item.el.value = o.value;
+        item.el.dispatchEvent(new Event('input', { bubbles: true }));
+        item.el.dispatchEvent(new Event('change', { bubbles: true }));
+      } else if (item.type === 'check') {
+        koClick(item.el);
+        if (item.el.checked !== (item.want === 'ticked')) { item.el.checked = item.want === 'ticked'; item.el.dispatchEvent(new Event('change', { bubbles: true })); }
+      } else if (item.type === 'text') {
+        /* Not nativeSet: its fight guard won't retype a value another filler replaced — here it must. */
+        _protoValueSet(item.el, item.want);
+        for (const ev of ['input', 'change', 'blur']) item.el.dispatchEvent(new Event(ev, { bubbles: true }));
+        if (item.el.value !== item.want) return false;
+      } else if (item.type === 'pill') {
+        if (!item.el) return false;
+        koClick(item.el);
+      } else {
+        const input = item.el;
+        if (item.type === 'combo') {
+          const ctl = comboControl(input);
+          try { koClick(ctl || input); input.focus(); } catch (_) {}
+          nativeSet(input, '');
+          try { input.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', code: 'ArrowDown', bubbles: true, cancelable: true })); } catch (_) {}
+        } else koClick(input);
+        await sleep(450);
+        const opts = item.type === 'combo' ? comboOptions() : $$('[role="listbox"] [role="option"],[data-automation-id="promptOption"]').filter(isVisible);
+        const texts = opts.map(o => (o.textContent || '').replace(/\s+/g, ' ').trim());
+        const want = koPick(texts, item.ko);
+        const hit = want && opts[texts.indexOf(want)];
+        if (!hit) { esc(); return false; }
+        koClick(hit);
+        item.want = want;
+        await sleep(250);
+      }
+      LOG(`Knockout: "${item.q.replace(/\s+/g, ' ').slice(0, 90)}" ${item.cur ? `"${item.cur}" → ` : '→ '}"${item.want}" (${item.ko.kind}: ${item.ko.why})`);
+      return true;
+    } catch (_) { return false; }
+  }
+  let _koFixP = null;   // the fix pass running now
+  function koFixAll(items) {
+    if (_koFixP) return _koFixP.then(() => 0);
+    _koFixP = (async () => {
+      let n = 0;
+      for (const item of (items || koScan())) {
+        const key = item.type + '|' + item.q;
+        if (await koFix(item)) n++;
+        else _koTries.set(key, (_koTries.get(key) || 0) + 1);
+        await sleep(120);
+      }
+      /* What still reads wrong after a fix (the site undid it) counts as a try. */
+      for (const it of koScan()) { const key = it.type + '|' + it.q; _koTries.set(key, (_koTries.get(key) || 0) + 1); }
+      if (n) { try { const d = await ST.get(['ohKnockoutFixes']); await ST.set({ ohKnockoutFixes: (Number(d.ohKnockoutFixes) || 0) + n }); } catch (_) {} }
+      return n;
+    })().catch(() => 0).finally(() => { _koFixP = null; });
+    return _koFixP;
+  }
+  let _koMasterOff = false;     // Automation OFF on the card: inert here too
+  try {
+    ST.get(['ohAutomationDisabled']).then(d => { _koMasterOff = !!(d && d.ohAutomationDisabled === true); }).catch(() => {});
+    chrome.storage.onChanged.addListener((c, area) => { if (area === 'local' && c.ohAutomationDisabled) _koMasterOff = c.ohAutomationDisabled.newValue === true; });
+  } catch (_) {}
+  function koPageOk() {
+    if (_IS_OH_PAGE || _koMasterOff || wdEngineOwns()) return false;
+    if (CURRENT_ATS) return true;
+    return !!document.querySelector('input[type="file"],[data-automation-id^="formField-"]') || /apply|application|career|job|recruit|candidate|vacanc/i.test(location.href);
+  }
+  (function installKnockoutGuard() {
+    if (_IS_OH_PAGE) return;
+    const seenAt = new Map();
+    /* Governed interval: only while a run is engaged (the Submit hold below works any time). */
+    setInterval(async () => {
+      if (_koFixP || !koPageOk()) return;
+      if (!document.querySelector('form,input[type="radio"],select,[role="radiogroup"],[data-automation-id^="formField-"],button[aria-pressed]')) return;
+      const items = koScan();
+      if (!items.length) return;
+      /* Give any filler 2.5 s to finish a question before correcting it. */
+      const now = Date.now();
+      const ready = items.filter(it => { const k = it.type + '|' + it.q; if (!seenAt.has(k)) seenAt.set(k, now); return now - seenAt.get(k) >= 2500; });
+      if (ready.length) await koFixAll(ready);
+    }, 1500);
+    /* Hold a Submit / Next click while a knockout answer is wrong (or a fix pass is running):
+       fix, then let it through. Window capture: before the page's own handlers. */
+    let replay = false;
+    const STEP_RE = /^(submit|apply|send|next|continue|save (&|and) continue|save and next|review|finish|complete)\b/i;
+    const isStep = (b, t) => {
+      if (b.hasAttribute('aria-pressed') || b.hasAttribute('aria-haspopup') || /radio|option|tab|menuitem|switch/.test(b.getAttribute('role') || '')) return false;
+      if (/^(yes|no|n\/a|back|previous|cancel|save( as)? draft|add|remove|delete|upload)\b/i.test(t)) return false;
+      return STEP_RE.test(t) || (b.type === 'submit' && !!b.form && b.tagName !== 'A');
+    };
+    const hold = (e, label, go) => {
+      e.preventDefault();
+      e.stopImmediatePropagation();
+      LOG(`Knockout: holding "${label.slice(0, 30)}" until the knockout answers are right`);
+      (async () => { if (_koFixP) await _koFixP; await koFixAll(); })()
+        .finally(() => { replay = true; try { go(); } finally { replay = false; } });
+    };
+    window.addEventListener('click', (e) => {
+      if (replay || _koSelf || !e.target || !e.target.closest) return;
+      const b = e.target.closest('button,input[type="submit"],[role="button"],a');
+      if (!b) return;
+      const t = (b.innerText || b.value || b.getAttribute('aria-label') || '').replace(/\s+/g, ' ').trim();
+      if (!isStep(b, t) || !koPageOk()) return;
+      if (!_koFixP && !koScan().length) return;
+      hold(e, t, () => b.click());
+    }, true);
+    window.addEventListener('submit', (e) => {
+      if (replay || !koPageOk()) return;
+      if (!_koFixP && !koScan().length) return;
+      const form = e.target;
+      hold(e, 'submit', () => (form.requestSubmit ? form.requestSubmit() : form.submit()));
+    }, true);
+  })();
+
   /* ── Smart value guesser ─────────────────────────────────── */
   const DEFAULTS = {
     authorized:   'Yes',
@@ -3033,7 +3587,7 @@
     gender:       'Prefer not to say',
     ethnicity:    'Prefer not to say',
     race:         'Prefer not to say',
-    years:        '7',           // passes most "at least X years" knockout questions
+    years:        '7',           // every years-of-experience question, unless Knockout answers set another number (koFacts)
     salary:       '80000',
     salaryRange:  '80000-110000',
     hourly:       '45',
@@ -3890,6 +4444,10 @@
     const l = label.toLowerCase().replace(/[^a-z0-9 ]/g, ' ');
     const fullName = `${p.first_name||''} ${p.last_name||''}`.trim();
 
+    /* Knockout questions: your true answer, per job (see koAnswer). */
+    const ko = koAnswer(label);
+    if (ko) return ko.answer;
+
     // T25: Q&A memory — an answer that went through on a confirmed
     // application wins over the generic rules below.
     const remembered = rememberedAnswer(label, inputType);
@@ -3913,7 +4471,7 @@
     if (inputType === 'email')  return p.email || '';
     if (inputType === 'tel')    return p.phone || '';
     if (inputType === 'number' && EXP_LABEL_RE.test(l))
-                                return p.years_experience || DEFAULTS.years;
+                                return koFacts().yearsExperience || p.years_experience || DEFAULTS.years;
 
     if (/first.?name/.test(l))                            return p.first_name    || '';
     if (/last.?name/.test(l))                             return p.last_name     || '';
@@ -4006,7 +4564,7 @@
     // Any question asking for a number of years → return 7 (our default)
     // This covers text inputs, number inputs, and range dropdowns.
     // The select handler will convert this to the closest range option.
-    if (EXP_LABEL_RE.test(l))                             return p.years_experience || DEFAULTS.years;
+    if (EXP_LABEL_RE.test(l))                             return koFacts().yearsExperience || p.years_experience || DEFAULTS.years;
 
     if (/notice.?period|period.?of.?notice/.test(l))       return p.notice_period || DEFAULTS.notice;
     if (/availab|start.?date|when.*start|when.*begin|earliest.*start/.test(l))
@@ -4655,7 +5213,7 @@
 
       // 3a) Experience range: pick the bracket closest to our years value
       if (!chosen && EXP_LABEL_RE.test(l)) {
-        const targetYears = parseInt((p.years_experience || DEFAULTS.years).toString()) || 7;
+        const targetYears = parseInt((koFacts().yearsExperience || p.years_experience || DEFAULTS.years).toString()) || 7;
         let bestDist = Infinity;
         for (const o of opts) {
           const nums = (o.text.match(/\d+/g) || []).map(Number).filter(Boolean);
@@ -6296,7 +6854,7 @@
       if (!profileKey) continue;
 
       const val = p[profileKey]
-        || (profileKey === 'years_of_experience' ? DEFAULTS.years : null)
+        || (profileKey === 'years_of_experience' ? (koFacts().yearsExperience || DEFAULTS.years) : null)
         || (profileKey === 'expected_salary'      ? DEFAULTS.salary : null)
         || (profileKey === 'how_did_you_hear'     ? DEFAULTS.howHeard : null)
         || (profileKey === 'country'              ? (p.country || 'Ireland') : null);
