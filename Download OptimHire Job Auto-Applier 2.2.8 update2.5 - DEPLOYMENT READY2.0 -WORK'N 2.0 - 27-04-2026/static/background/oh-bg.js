@@ -77,6 +77,9 @@
  *    and turned back on when it ends (also after a restart). ohPauseOthers:
  *    false (the switch on the side panel's Job Queue card) leaves them alone.
  *
+ * 12. The CSV Job Queue is run from here (queue-runner.js): closing the Queue
+ *    Manager no longer slows a run down to one job at a time.
+ *
  * Wiring: manifest.json background.service_worker points here. On an
  * OptimHire update, copy the new index.js in and keep this entry point.
  * Same directory as index.js on purpose, so nothing that resolves paths
@@ -680,6 +683,8 @@
 })();
 
 importScripts('index.js');
+/* 12. The CSV Job Queue runs here, not in the Queue Manager tab (queue-runner.js). */
+importScripts('queue-runner.js');
 
 /* 5. Shorter auto-skip waits. OptimHire counts down autoSkipDuration (180s)
    on a problem job — shown as "Auto skip in N Sec." — and loginWaitDuration

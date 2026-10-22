@@ -201,6 +201,15 @@
           const theirs = byId.get(mine.id);
           if (!theirs) return mine;
           const out = Object.assign({}, mine);
+          /* The run (service worker, job tabs) owns a job's status and
+             progress; this page only overrides them for jobs you changed
+             here (re-queue, mark pending). */
+          if (!_statusTouched.has(mine.id)) {
+            for (const k of ['status', 'attempts', 'lastError', 'lastActionTs', 'appliedAt', 'confirmed', 'confirmedBy']) {
+              if (k in theirs) out[k] = theirs[k];
+            }
+            return out;
+          }
           /* Terminal status recorded elsewhere always wins over our
              possibly-stale in-memory copy. */
           if (TERMINAL.has(theirs.status) && !TERMINAL.has(mine.status)) {
@@ -219,6 +228,7 @@
         const mineIds = new Set(queue.map(j => j.id));
         for (const j of stored) if (!mineIds.has(j.id) && !_removedIds.has(j.id)) merged.push(j);
         queue = merged;
+        _statusTouched.clear();
         ST.set({ [KEY_QUEUE]: merged }, res);
       });
     });
@@ -328,11 +338,13 @@
      to storage meanwhile — which also put back every job just deleted, so
      Delete, Clear and Clear all never removed anything. */
   const _removedIds = new Set();
+  /* Jobs whose status you changed on this page (saved as you set them). */
+  const _statusTouched = new Set();
   function forget(jobs) { for (const j of jobs) _removedIds.add(j.id); }
   function deleteJob(id) { forget(queue.filter(j => j.id === id)); queue = queue.filter(j => j.id !== id); }
   function deleteIds(ids) { forget(queue.filter(j => ids.has(j.id))); queue = queue.filter(j => !ids.has(j.id)); }
   function setStatusForIds(ids, status) {
-    for (const j of queue) if (ids.has(j.id)) j.status = status;
+    for (const j of queue) if (ids.has(j.id)) { j.status = status; _statusTouched.add(j.id); }
   }
   function clearByStatus(status) { forget(queue.filter(j => j.status === status)); queue = queue.filter(j => j.status !== status); }
 
@@ -598,27 +610,12 @@
     setTimeout(() => URL.revokeObjectURL(a.href), 1000);
   }
 
-  /* ════════════════════════════════════════════════════════════
-     RUNNER / ORCHESTRATOR
-     ════════════════════════════════════════════════════════════
-     This page (an extension page) owns tab lifecycle — content
-     scripts cannot create/close tabs. Each pending job opens in its
-     OWN tab; the content script fills + submits + reports terminal
-     status; this orchestrator then closes that tab and opens the
-     next pending job. Up to `concurrency` jobs run in parallel tabs
-     to save time. The OptimHire my-jobs tab is NEVER touched —
-     we only ever create/close tabs we opened ourselves (tracked in
-     _tabMap) and only navigate via fresh chrome.tabs.create.
-     ────────────────────────────────────────────────────────── */
-  /* A job may be opened at most this many times, ever. Hard backstop
-     against any race that returns an already-opened job to 'pending'. */
-  const MAX_OPEN_ATTEMPTS = 3;
+  /* ═══════════════════════ RUNNER ═══════════════════════ */
+  /* The run itself lives in the service worker (static/background/
+     queue-runner.js): it opens each job in its own background tab, closes it
+     when the job's tab reports done, opens the next, and keeps going whether
+     or not this page is open. This page starts and stops it, and shows it. */
   const KEY_CONCURRENCY = 'ohJobQueueConcurrency';
-  const KEY_ADVANCE_REQ = 'ohJobQueueAdvanceReq';
-  let _tabMap = new Map();       // jobId → tabId (tabs WE opened)
-  let _lastAdvanceTs = 0;        // de-dupe advance requests
-  let _orchestrating = false;
-
   function getConcurrency() {
     const sel = document.getElementById('concurrencySelect');
     let n = sel ? parseInt(sel.value, 10) : 1;
@@ -626,306 +623,10 @@
     if (n > 5) n = 5;
     return n;
   }
-
-  function runningWithTab() {
-    /* jobs marked running that we have an open tab for */
-    let n = 0;
-    for (const j of queue) if (j.status === 'running' && _tabMap.has(j.id)) n++;
-    return n;
-  }
-
-  /* Drop entries from _tabMap whose tab no longer exists, and return the
-     number of job tabs we ACTUALLY still have open. Trusting _tabMap (or
-     a job's stored status) alone was unsafe: if chrome.tabs.create ever
-     failed to yield a tab id, the "running with tab" count stayed 0 and
-     the fill loop kept opening tabs forever. */
-  async function liveJobTabCount() {
-    const entries = [..._tabMap.entries()];
-    let live = 0;
-    for (const [jobId, tabId] of entries) {
-      /* -1 is an in-flight reservation (tab being created right now).
-         It occupies a slot but has no real tab to query yet. */
-      if (tabId === -1) { live++; continue; }
-      const ok = await new Promise(res => {
-        try {
-          chrome.tabs.get(tabId, (t) => {
-            const err = chrome.runtime.lastError;
-            res(!err && !!t);
-          });
-        } catch (_) { res(false); }
-      });
-      if (ok) live++; else _tabMap.delete(jobId);
-    }
-    return live;
-  }
-
-  /* ── Single-orchestrator election ──────────────────────────────────
-     Every open copy of this page runs its own orchestrator with its own
-     _tabMap and _orchestrating guard, so two Queue Manager tabs meant
-     two independent fillers each opening `concurrency` tabs — a second
-     way to end up with a wall of tabs. Exactly one instance (identified
-     by its own chrome tab id) owns orchestration; the others render the
-     UI read-only. Ownership is reclaimed if the owner tab is gone. */
-  const KEY_OWNER = 'ohJobQueueOwnerTab';
-  let _myTabId = null;
-
-  function getMyTabId() {
+  function tellRunner(msg) {
     return new Promise(res => {
-      try { chrome.tabs.getCurrent(t => res(t && t.id != null ? t.id : null)); }
-      catch (_) { res(null); }
+      try { chrome.runtime.sendMessage(msg, r => { void chrome.runtime.lastError; res(r); }); } catch (_) { res(null); }
     });
-  }
-  function tabExists(tabId) {
-    return new Promise(res => {
-      if (tabId == null) return res(false);
-      try {
-        chrome.tabs.get(tabId, (t) => res(!chrome.runtime.lastError && !!t));
-      } catch (_) { res(false); }
-    });
-  }
-  /* True when this page is (or just became) the orchestration owner. */
-  async function claimOwnership() {
-    if (_myTabId == null) _myTabId = await getMyTabId();
-    if (_myTabId == null) return true;   // not in a tab context — act alone
-    const d = await new Promise(r => ST.get([KEY_OWNER], r));
-    const owner = d && d[KEY_OWNER];
-    if (owner === _myTabId) return true;
-    if (owner != null && await tabExists(owner)) return false;  // someone else owns it
-    await new Promise(r => ST.set({ [KEY_OWNER]: _myTabId }, r));
-    return true;
-  }
-
-  /* Open up to `concurrency` pending jobs, each in its own tab.
-     Hardened against the runaway-tab bug: the loop is bounded, every job
-     is re-looked-up from the LIVE queue after each await (the storage
-     listener REPLACES the `queue` array, so any reference held across an
-     await is stale and mutating it silently did nothing — leaving the job
-     'pending' so it was picked again and again), and the slot count comes
-     from tabs that verifiably exist. */
-  async function fillSlots() {
-    if (_orchestrating) return; _orchestrating = true;
-    try {
-      /* Only the elected owner opens tabs, so extra Queue Manager tabs
-         can't each spawn their own set. */
-      if (!(await claimOwnership())) return;
-      const conc = getConcurrency();
-      let opened = false;
-      /* Hard bound: never open more than `conc` tabs per invocation, no
-         matter what the counters say. */
-      for (let guard = 0; guard < conc; guard++) {
-        const live = await liveJobTabCount();
-        if (live >= conc) break;
-        /* Pick the next pending job from the LIVE queue, and capture only
-           its id — never an object reference that an await could stale.
-           Two extra guards make repeat-opening structurally impossible:
-             • attempts cap — ohJobQueue has THREE independent
-               read-modify-write writers (this saveQueue(), and the content
-               script's advance() and self-navigate fallback). A stale
-               write can clobber a job back to 'pending' after we already
-               opened it, so without a cap the same job is reopened
-               forever (this is what produced dozens of tabs for one job).
-             • URL dedupe — never open a URL we already have a tab for,
-               even if it appears under a different job id. */
-        const openUrls = new Set();
-        for (const [jid] of _tabMap) {
-          const t = queue.find(j => j.id === jid);
-          if (t && t.url) openUrls.add(normaliseUrl(t.url));
-        }
-        const candidate = pickNext(j =>
-          j.status === 'pending' &&
-          !_tabMap.has(j.id) &&
-          (j.attempts || 0) < MAX_OPEN_ATTEMPTS &&
-          !(j.url && openUrls.has(normaliseUrl(j.url)))
-        );
-        /* Retire anything that blew the attempts cap so it can't be
-           re-selected on the next pass either. */
-        let retired = false;
-        for (const j of queue) {
-          if (j.status === 'pending' && (j.attempts || 0) >= MAX_OPEN_ATTEMPTS) {
-            j.status = 'failed';
-            j.lastError = `gave up after ${MAX_OPEN_ATTEMPTS} open attempts`;
-            j.lastActionTs = Date.now();
-            retired = true;
-          }
-        }
-        if (retired) await saveQueue();
-        if (!candidate) break;
-        const jobId = candidate.id;
-        const jobUrl = safeJobUrl(candidate.url);
-        if (!jobUrl) { /* nothing (valid) to open — mark failed so we can't spin */
-          const bad = queue.find(j => j.id === jobId);
-          if (bad) { bad.status = 'failed'; bad.lastError = 'missing URL'; }
-          await saveQueue();
-          continue;
-        }
-        /* Reserve the slot BEFORE the async tab creation so a re-entrant
-           or concurrent pass can't select the same job again. */
-        _tabMap.set(jobId, -1);   // placeholder: reserved, tab not yet known
-        const jobRef = queue.find(j => j.id === jobId);
-        if (jobRef) {
-          jobRef.status = 'running';
-          jobRef.attempts = (jobRef.attempts || 0) + 1;
-          jobRef.lastActionTs = Date.now();
-        }
-        await saveQueue();
-        /* Open in a NEW tab. Kept in the background so a run can never
-           steal focus or pile visible tabs over the user's work; the
-           content script's queue runner drives the fill regardless. */
-        const tab = await new Promise(res => {
-          try {
-            chrome.tabs.create({ url: jobUrl, active: false }, (t) => {
-              const err = chrome.runtime.lastError;
-              res(err ? null : t);
-            });
-          } catch (_) { res(null); }
-        });
-        if (tab && tab.id != null) {
-          _tabMap.set(jobId, tab.id);
-          opened = true;
-          /* Paylocity stalls while hidden (2.9.0) — bring it to the front. */
-          if (isPaylocityUrl(jobUrl)) await focusJobTab(tab.id, 'paylocity-url');
-        } else {
-          /* Tab creation failed — release the reservation and mark the job
-             failed so the loop cannot retry it indefinitely. */
-          _tabMap.delete(jobId);
-          const failed = queue.find(j => j.id === jobId);
-          if (failed) {
-            failed.status = 'failed';
-            failed.lastError = 'could not open tab';
-            failed.lastActionTs = Date.now();
-          }
-          await saveQueue();
-        }
-      }
-      if (opened) render();
-    } catch (_) {} finally { _orchestrating = false; }
-  }
-
-  /* ── Paylocity auto-focus ────────────────────────────────────────────
-   * OptimHire 2.9.0's autofill does `while (document.hidden) sleep(1s)` for
-   * Paylocity — an unbounded wait. Queue tabs open in the background, so a
-   * Paylocity job sat paused until the user clicked its tab, then hit the
-   * job timeout. Such tabs are now brought to the front:
-   *   - a Paylocity URL is activated as soon as its tab is created;
-   *   - a job that only REDIRECTS to Paylocity asks from the content script
-   *     (OH_QUEUE_REQUEST_FOCUS), honoured only for tabs this queue opened.
-   * Only the tab is activated inside its Chrome window — the window is never
-   * raised, un-minimised or given OS focus. One Paylocity tab holds the front
-   * at a time, and when it finishes the user is put back on the tab they
-   * were on, unless they had already moved away themselves.
-   * ────────────────────────────────────────────────────────────────── */
-  const PAYLOCITY_RE = /(^|\.)paylocity\.com$/i;
-  const FOCUS_COOLDOWN_MS = 15000;   // never re-take the front more often than this
-  const FOCUS_MAX_PER_JOB = 4;       // then stop fighting the user for that job
-  let _focusedJobTab = null;         // job tab currently holding the front
-  let _focusReturn = null;           // { tabId, windowId } the user was on before
-  let _pendingRestore = false;
-  const _focusLog = new Map();       // tabId -> { last, count }
-
-  function isPaylocityUrl(u) {
-    try { return PAYLOCITY_RE.test(new URL(u).hostname); } catch (_) { return false; }
-  }
-  function isOurJobTab(tabId) {
-    for (const [, tid] of _tabMap) if (tid === tabId) return true;
-    return false;
-  }
-  function tabGet(tabId) {
-    return new Promise(res => {
-      try { chrome.tabs.get(tabId, t => res(chrome.runtime.lastError ? null : t)); }
-      catch (_) { res(null); }
-    });
-  }
-  function activeTabIn(windowId) {
-    return new Promise(res => {
-      try { chrome.tabs.query({ active: true, windowId }, ts => res((ts && ts[0]) || null)); }
-      catch (_) { res(null); }
-    });
-  }
-
-  async function focusJobTab(tabId, reason) {
-    if (tabId == null || tabId === -1 || !isOurJobTab(tabId)) return false;
-    /* One at a time: while another open job tab holds the front, this one
-       waits its turn (Paylocity is paused anyway until it is visible). */
-    if (_focusedJobTab != null && _focusedJobTab !== tabId && isOurJobTab(_focusedJobTab)) return false;
-    const now = Date.now();
-    const rec = _focusLog.get(tabId) || { last: 0, count: 0 };
-    if (now - rec.last < FOCUS_COOLDOWN_MS || rec.count >= FOCUS_MAX_PER_JOB) return false;
-    const t = await tabGet(tabId);
-    if (!t) return false;
-    if (t.active) { _focusedJobTab = tabId; return true; }   // already in front
-    /* Remember where the user was — unless that is one of our job tabs, or
-       an earlier Paylocity job already recorded the real starting point. */
-    if (!_focusReturn) {
-      const cur = await activeTabIn(t.windowId);
-      if (cur && cur.id !== tabId && !isOurJobTab(cur.id)) {
-        _focusReturn = { tabId: cur.id, windowId: cur.windowId };
-      }
-    }
-    rec.last = now; rec.count++;
-    _focusLog.set(tabId, rec);
-    _focusedJobTab = tabId;
-    try { chrome.tabs.update(tabId, { active: true }, () => void chrome.runtime.lastError); } catch (_) {}
-    dbg('focused job tab', { tabId, reason, attempt: rec.count });
-    return true;
-  }
-
-  /* Hand the front back once no Paylocity job needs it. */
-  async function maybeRestoreFocus() {
-    if (!_pendingRestore) return;
-    if (_focusedJobTab != null && isOurJobTab(_focusedJobTab)) return;   // the next job took over
-    _pendingRestore = false;
-    const back = _focusReturn;
-    _focusReturn = null;
-    if (!back || !(await tabGet(back.tabId))) return;
-    try { chrome.tabs.update(back.tabId, { active: true }, () => void chrome.runtime.lastError); } catch (_) {}
-  }
-
-  /* Close the tab we opened for a finished job. */
-  async function closeJobTab(jobId) {
-    const tabId = _tabMap.get(jobId);
-    if (tabId == null) return;
-    _tabMap.delete(jobId);
-    _focusLog.delete(tabId);
-    if (tabId === -1) return;   // reservation only — no real tab yet
-    if (tabId === _focusedJobTab) {
-      /* Only return the user to their tab if they were still looking at the
-         job; if they had moved away on their own, leave them there. */
-      const t = await tabGet(tabId);
-      _pendingRestore = !!(t && t.active);
-      if (!_pendingRestore) _focusReturn = null;
-      _focusedJobTab = null;
-    }
-    try { chrome.tabs.remove(tabId, () => void chrome.runtime.lastError); } catch (_) {}
-  }
-
-  /* Consume an advance request from a content script: the job already
-     wrote its terminal status; we close its tab and open the next. */
-  async function handleAdvanceReq(req) {
-    if (!req || !req.ts || req.ts === _lastAdvanceTs) return;
-    _lastAdvanceTs = req.ts;
-    dbg('advance request', { jobId: req.jobId, status: req.status });
-    await closeJobTab(req.jobId);
-    /* Clear the request so the content-script self-navigate fallback
-       knows the manager handled it. */
-    await new Promise(res => ST.set({ [KEY_ADVANCE_REQ]: null }, res));
-    /* Any pending left? open more; else finish. */
-    if (queue.some(j => j.status === 'pending')) await fillSlots();
-    /* fillSlots() can retire the last pending jobs (attempts cap / invalid
-       URL) without opening anything. Finish in that case too — otherwise the
-       run never ends and stays "active" with nothing left to do. */
-    if (!queue.some(j => j.status === 'pending') && runningWithTab() === 0) await finishQueue();
-    /* If the finished job held the front and the next one does not need
-       it, put the user back where they were. */
-    await maybeRestoreFocus();
-  }
-
-  async function finishQueue() {
-    await new Promise(res => ST.set({
-      [KEY_ACTIVE]: false, [KEY_CURRENT]: null, [KEY_ADVANCE_REQ]: null,
-    }, res));
-    setRunnerIndicator(false);
-    render();
-    toast('Queue complete', 'success');
   }
 
   async function startQueue() {
@@ -934,99 +635,19 @@
       dbg('startQueue rejected — no pending/running jobs', { queueLen: queue.length }, 'warn');
       return;
     }
-    /* Reset leftover 'running' from a prior interrupted run — we lost
-       those tabs, so re-queue them cleanly. */
-    for (const j of queue) if (j.status === 'running') j.status = 'pending';
-    _tabMap.clear();
-    /* The tab the user pressed Start in becomes the orchestration owner,
-       taking over from any stale owner. */
-    if (_myTabId == null) _myTabId = await getMyTabId();
-    if (_myTabId != null) await new Promise(r => ST.set({ [KEY_OWNER]: _myTabId }, r));
     await saveQueue();
-    await new Promise(res => ST.set({
-      [KEY_ACTIVE]: true, [KEY_CURRENT]: null, [KEY_ADVANCE_REQ]: null,
-      [KEY_STARTTS]: Date.now(),
-      /* MUTUAL EXCLUSION: stand down OptimHire's native auto-apply while
-         the CSV queue runs. Running both made the native flow reload the
-         queue's job tab in a loop and blocked the queue's autofill. */
-      ohAutoApplyEngaged: false,
-    }, res));
-    setRunnerIndicator(true);
     const conc = getConcurrency();
-    toast(`Queue started — opening up to ${conc} job${conc > 1 ? 's' : ''} in separate tabs`, 'success');
+    setRunnerIndicator(true);
+    await tellRunner({ type: 'OH_QUEUE_START', concurrency: conc });
+    toast(`Queue started — up to ${conc} job${conc > 1 ? 's' : ''} at a time, in background tabs. It keeps going if you close this page.`, 'success');
     dbg('startQueue', { concurrency: conc, total: queue.length, pending: queue.filter(j => j.status === 'pending').length });
-    await fillSlots();
   }
 
   async function stopQueue() {
-    const openTabs = _tabMap.size;
-    let wasFront = false;
-    if (_focusedJobTab != null) {
-      const ft = await tabGet(_focusedJobTab);
-      wasFront = !!(ft && ft.active);
-    }
-    await new Promise(res => ST.set({
-      [KEY_ACTIVE]: false, [KEY_CURRENT]: null, [KEY_ADVANCE_REQ]: null,
-    }, res));
-    /* Close every tab we opened and demote running jobs. */
-    for (const [, tabId] of _tabMap) {
-      if (tabId === -1) continue;   // reservation only — no real tab
-      try { chrome.tabs.remove(tabId, () => void chrome.runtime.lastError); } catch (_) {}
-    }
-    _tabMap.clear();
-    _focusLog.clear();
-    _focusedJobTab = null;
-    _pendingRestore = wasFront;
-    if (!wasFront) _focusReturn = null;
-    await maybeRestoreFocus();
-    for (const j of queue) if (j.status === 'running') j.status = 'pending';
-    await saveQueue();
-    render();
+    await tellRunner({ type: 'OH_QUEUE_STOP' });
     setRunnerIndicator(false);
     toast('Queue stopped — job tabs closed', 'info');
-    dbg('stopQueue', { closedTabs: openTabs });
-  }
-
-  /* If the user manually closes a job tab, re-queue that job and
-     keep the slots full. */
-  function wireTabClose() {
-    try {
-      chrome.tabs.onRemoved.addListener(async (tabId) => {
-        let jobId = null;
-        for (const [jid, tid] of _tabMap) if (tid === tabId) { jobId = jid; break; }
-        if (jobId == null) return;
-        _tabMap.delete(jobId);
-        _focusLog.delete(tabId);
-        if (tabId === _focusedJobTab) {   // user closed it — they chose; don't restore
-          _focusedJobTab = null;
-          _focusReturn = null;
-          _pendingRestore = false;
-        }
-        const d = await new Promise(r => ST.get([KEY_ACTIVE], r));
-        if (!d[KEY_ACTIVE]) return; // queue stopped; ignore
-        const j = queue.find(x => x.id === jobId);
-        /* Only re-queue if it didn't already finish (applied/failed/skipped) */
-        if (j && j.status === 'running') { j.status = 'pending'; await saveQueue(); }
-        await fillSlots();
-        if (!queue.some(x => x.status === 'pending') && runningWithTab() === 0) await finishQueue();
-      });
-    } catch (_) {}
-  }
-  /* A queue job that REDIRECTED to Paylocity asks to be brought forward.
-     Honoured only for tabs this queue opened, and only by the orchestrating
-     manager instance, so no other page can use it to steal focus. */
-  function wireFocusRequests() {
-    try {
-      chrome.runtime.onMessage.addListener((msg, sender) => {
-        if (!msg || msg.type !== 'OH_QUEUE_REQUEST_FOCUS') return;
-        const tabId = sender && sender.tab && sender.tab.id;
-        if (tabId == null || !isOurJobTab(tabId)) return;
-        (async () => {
-          if (!(await claimOwnership())) return;
-          await focusJobTab(tabId, msg.reason || 'content-request');
-        })();
-      });
-    } catch (_) {}
+    dbg('stopQueue', {});
   }
 
   function setRunnerIndicator(on) {
@@ -1075,7 +696,7 @@
     });
     on('btnRetryFailed', 'click', async () => {
       let n = 0;
-      for (const j of queue) if (j.status === 'failed') { j.status = 'pending'; j.lastError = ''; n++; }
+      for (const j of queue) if (j.status === 'failed') { j.status = 'pending'; j.lastError = ''; j.attempts = 0; _statusTouched.add(j.id); n++; }
       if (!n) { toast('No failed jobs to re-queue', 'info'); return; }
       await saveQueue(); render();
       toast(`${n} failed jobs back to pending`, 'success');
@@ -1220,19 +841,9 @@
       if (changes[KEY_ACTIVE]) {
         const on = !!changes[KEY_ACTIVE].newValue;
         setRunnerIndicator(on);
-        /* Stopped from elsewhere (e.g. the sidepanel's Automation OFF switch):
-           close the job tabs this manager opened and return their jobs to
-           pending, exactly like pressing Stop here. stopQueue() also clears
-           this key, so only act while tabs are still open (no loop). */
-        if (!on && _tabMap.size) stopQueue().catch(() => {});
-      }
-      if (changes[KEY_ADVANCE_REQ] && changes[KEY_ADVANCE_REQ].newValue) {
-        handleAdvanceReq(changes[KEY_ADVANCE_REQ].newValue);
+        if (!on && changes[KEY_ACTIVE].oldValue && !queue.some(j => j.status === 'pending' || j.status === 'running')) toast('Queue complete', 'success');
       }
     });
-
-    wireTabClose();
-    wireFocusRequests();
   }
 
   load()
@@ -1249,14 +860,6 @@
       if (_junkRemoved) {
         saveQueue().then(render);
         toast(`Removed ${_junkRemoved} entries that were not job links (left by an earlier CSV import)`, 'info');
-      }
-      /* If a run was active when this manager page (re)loaded, we lost
-         our in-memory tab map. Re-queue any 'running' jobs and refill
-         slots so the run continues cleanly. */
-      if (d[KEY_ACTIVE]) {
-        let changed = false;
-        for (const j of queue) if (j.status === 'running') { j.status = 'pending'; changed = true; }
-        (changed ? saveQueue() : Promise.resolve()).then(() => fillSlots());
       }
     })
     .catch(err => {
