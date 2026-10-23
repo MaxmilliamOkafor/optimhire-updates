@@ -2466,7 +2466,7 @@
        =HYPERLINK(...) would otherwise execute when the CSV is opened in
        Excel / Sheets. */
     if (/^[=+\-@\t\r]/.test(v)) v = "'" + v;
-    if (/[",\n]/.test(v)) return '"' + v.replace(/"/g, '""') + '"';
+    if (/[",\r\n]/.test(v)) return '"' + v.replace(/"/g, '""') + '"';
     return v;
   }
   function _download(name, text, mime) {
@@ -2484,51 +2484,57 @@
      (url,title,company,notes — re-importable into the Queue Manager)
      and a plain .txt URL list. Prefers the real ATS apply URL, falling
      back to the OptimHire job-view URL. */
+  /* Every job OptimHire's queue has handed out so far, as ONE formatted CSV:
+     numbered, readable headers, the full application link of each job, its
+     OptimHire page and id, what happened (submitted / skipped / closed…) and
+     when. UTF-8 with a BOM and CRLF rows, so Excel and Google Sheets open it
+     cleanly; re-importable into the Queue Manager (the "Job URL" column).
+     OptimHire's server gives the extension its queue one job at a time, so
+     the jobs still ahead in the queue are not known yet — the file grows as
+     the run goes on. */
   function exportHarvestedJobs() {
     try {
-      chrome.storage.local.get(['ohHarvestedJobs'], function (d) {
+      chrome.storage.local.get(['ohHarvestedJobs', 'matchingJobCount', 'ohRunStats'], function (d) {
         var map = (d && d.ohHarvestedJobs) || {};
         var rows = [];
-        for (var k in map) if (Object.prototype.hasOwnProperty.call(map, k)) rows.push(map[k]);
+        for (var k in map) if (Object.prototype.hasOwnProperty.call(map, k) && map[k] && (map[k].applyUrl || map[k].ohUrl)) rows.push(map[k]);
         if (!rows.length) {
-          try { addLog('No queue job URLs captured yet — start Auto-Apply first, then export', ''); } catch (_) {}
-          try { alert('No queue job URLs captured yet.\n\nStart Auto-Applying (or run the CSV queue); each job that loads is recorded, then Export.'); } catch (_) {}
+          try { addLog('No queue jobs recorded yet — start Auto-Apply first, then export', ''); } catch (_) {}
+          try { alert('No queue jobs recorded yet.\n\nStart Auto-Applying (or run the CSV queue); each job that loads is recorded, then Export.'); } catch (_) {}
           return;
         }
         rows.sort(function (a, b) { return (a.firstSeen || 0) - (b.firstSeen || 0); });
-        var stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-');
-
-        /* CSV — importable into the CSV Queue Manager (url,title,company,notes)
-           plus honest outcome columns so you can SEE which were actually
-           submitted vs merely skipped (OptimHire's counter counts skips). */
-        var cols = ['url', 'title', 'company', 'notes', 'outcome', 'outcome_detail'];
-        var lines = [cols.join(',')];
-        var urlList = [];
+        var pad = function (n) { return (n < 10 ? '0' : '') + n; };
+        var when = function (ts) {
+          if (!ts) return '';
+          var t = new Date(ts);
+          return t.getFullYear() + '-' + pad(t.getMonth() + 1) + '-' + pad(t.getDate()) + ' ' + pad(t.getHours()) + ':' + pad(t.getMinutes());
+        };
+        var STATUS = { submitted: 'Submitted (confirmed)', skipped: 'Skipped (not submitted)', closed: 'Job closed', error: 'Error', pending: 'In progress / not finished' };
+        var cols = ['#', 'Job Title', 'Company', 'Location', 'ATS', 'Job URL', 'OptimHire Job Page', 'OptimHire Job ID', 'Status', 'Reason', 'First Seen', 'Last Updated'];
+        var lines = [cols.map(_csvCell).join(',')];
         var tally = { submitted: 0, skipped: 0, closed: 0, error: 0, pending: 0 };
         for (var i = 0; i < rows.length; i++) {
           var r = rows[i];
-          var url = r.applyUrl || r.ohUrl || '';
-          if (!url) continue;
-          urlList.push(url);
           var oc = r.outcome || 'pending';
-          if (tally[oc] == null) tally[oc] = 0;
-          tally[oc]++;
-          var noteParts = [];
-          if (r.location) noteParts.push(r.location);
-          if (r.ats) noteParts.push('ATS: ' + r.ats);
-          if (r.ohUrl && r.applyUrl) noteParts.push('OptimHire: ' + r.ohUrl);
+          tally[oc] = (tally[oc] || 0) + 1;
           lines.push([
-            _csvCell(url), _csvCell(r.title), _csvCell(r.company), _csvCell(noteParts.join(' | ')),
-            _csvCell(oc), _csvCell(r.reason || '')
-          ].join(','));
+            String(i + 1), r.title, r.company, r.location, r.ats, r.applyUrl || r.ohUrl, r.applyUrl ? (r.ohUrl || '') : '', r.id,
+            STATUS[oc] || oc, r.reason, when(r.firstSeen), when(r.outcomeTs || r.lastSeen)
+          ].map(_csvCell).join(','));
         }
-        _download('optimhire-queue-urls-' + stamp + '.csv', lines.join('\n'), 'text/csv');
-        _download('optimhire-queue-urls-' + stamp + '.txt', urlList.join('\n'), 'text/plain');
-        var summary = 'Exported ' + urlList.length + ' job URLs — ✅ ' + tally.submitted +
-          ' submitted (confirmed), ⏭️ ' + tally.skipped + ' skipped, 🚫 ' + tally.closed +
-          ' closed, ⚠️ ' + tally.error + ' error, … ' + tally.pending + ' pending';
+        var stamp = new Date().toISOString().slice(0, 16).replace(/[:T]/g, '-');
+        _download('optimhire-queue-jobs-' + stamp + '.csv', '﻿' + lines.join('\r\n') + '\r\n', 'text/csv');
+        var run = d && d.ohRunStats && d.ohRunStats.summary;
+        var total = (run && run.total) || parseInt(d && d.matchingJobCount, 10) || 0;
+        var summary = 'Exported ' + rows.length + ' job' + (rows.length === 1 ? '' : 's') + (total > rows.length ? ' of the ' + total + ' in the queue' : '') +
+          ' — ' + tally.submitted + ' submitted, ' + tally.skipped + ' skipped, ' + tally.closed + ' closed, ' + tally.error + ' errors, ' + tally.pending + ' in progress';
         try { addLog(summary, tally.submitted ? 'success' : ''); } catch (_) {}
-        try { alert(summary + '\n\nTwo files downloaded:\n• CSV (with an "outcome" column — re-importable into the Queue Manager)\n• TXT (plain URL list)\n\n"submitted" = OptimHire reported a real confirmation. "skipped" = NOT submitted (usually required fields it could not fill).'); } catch (_) {}
+        try {
+          alert(summary + '\n\nOne CSV file downloaded (opens in Excel / Google Sheets; re-importable into the Queue Manager).' +
+                (total > rows.length ? '\n\nOptimHire\'s server hands its queue to the extension one job at a time, so the ' + (total - rows.length) +
+                 ' jobs still ahead are not known to the extension yet. Each job is added as OptimHire gives it out — export again later for more.' : ''));
+        } catch (_) {}
       });
     } catch (_) {}
   }
@@ -2674,7 +2680,7 @@
         '<div id="oh-qc-truth" class="qc-foot" title="OptimHire’s ‘X applied’ counter also counts skips. This counts real submission confirmations.">Results: — submitted · — skipped</div>' +
         '<div class="qc-links">' +
           '<button id="oh-qc-qamem" class="qc-link" title="Answers learned from applications confirmed as submitted. Review or forget them.">Remembered answers ' + ICON.arrow + '</button>' +
-          '<button id="oh-qc-export" class="qc-link" title="Export every job URL OptimHire auto-apply has gone through — CSV (re-importable into the Queue Manager) or a plain list">' + ICON.down + 'Export URLs</button>' +
+          '<button id="oh-qc-export" class="qc-link" title="Download every job OptimHire\'s queue has handed out so far as one CSV — title, company, full job link, status, dates (opens in Excel / Sheets; re-importable into the Queue Manager)">' + ICON.down + 'Export CSV</button>' +
         '</div>';
       /* Always append to <body> as a fixed overlay — never insert as a
          sibling of #__plasmo (that risked disturbing React). */
@@ -2999,7 +3005,7 @@
             else if (oc === 'closed' || oc === 'error') other++;
           }
           var btn = document.getElementById('oh-qc-export');
-          if (btn) btn.lastChild.textContent = 'Export URLs (' + n + ')';
+          if (btn) btn.lastChild.textContent = 'Export CSV (' + n + ')';
           var mb = document.getElementById('oh-qc-master');
           if (mb) {
             chrome.storage.local.get(['ohAutomationDisabled'], function (dd) {
