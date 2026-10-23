@@ -26,14 +26,16 @@
  *    and clears when nothing is running. Done here so it stays correct
  *    even when the side panel is closed.
  *
- * 4. ATS jobs first, Reed last. OptimHire's server hands out ONE job per
- *    request (GET /candidate/{id}/application), optionally filtered by
- *    ?jobsite=<key> (its liveATS list). With ohPreferAts on (default), each
- *    "next job" request asks the ATS sites first (sticking with the one
- *    that last had jobs), then the other job boards, and only then the
- *    normal mixed queue — which is where Reed comes from. A site with no
- *    jobs is skipped for 15 minutes, so this is ~1 request per job. A
- *    jobsite the user chose in OptimHire's own settings is left alone.
+ * 4. Ranked: quickest company ATS first, Reed last. OptimHire's server hands
+ *    out ONE job per request (GET /candidate/{id}/application), optionally
+ *    filtered by ?jobsite=<key> (its liveATS list). With ohPreferAts on
+ *    (default), each "next job" request asks the one-page company ATS sites
+ *    (Greenhouse, Lever, Ashby, Workable…), then the ATS sites that need an
+ *    account (Workday, Paylocity), then the job boards, and only then the
+ *    normal mixed queue — which is where Reed comes from; the best-ranked
+ *    site with a job wins. A site with no jobs is left out for 15 minutes,
+ *    so only the few sites with jobs are asked. A jobsite the user chose in
+ *    OptimHire's own settings is left alone.
  *    Runs driven from the optimhire.com job-apply page ask for a specific
  *    job (?job_id=); during a run, a reed.co.uk / job-board job asked for
  *    that way is held back in favour of a waiting ATS job (not skipped —
@@ -216,13 +218,36 @@
   }
 
   /* ── ATS jobs first, Reed last ── */
-  var ATS_SITES = ['greenhouse', 'lever', 'ashby', 'workday', 'smartrecruiters', 'workable', 'bamboohr',
-                   'breezyhr', 'jazzhr', 'jobvite', 'recruitee', 'rippling', 'comeet', 'paylocity',
-                   'manatal', 'freshteam', 'recooty', 'gohire'];
-  var BOARD_SITES = ['linkedin', 'indeed', 'ziprecruiter', 'ziprecruiterpaid', 'adzuna', 'adzunapaid', 'dice'];
+  /* Ranked by what gets an application to an employer fastest: one-page company ATS forms
+     first (no account, quickest, straight to the hiring team), then ATS sites that need an
+     account or several steps, then job boards; OptimHire's mixed queue — where Reed comes
+     from — last. Same order as self.ohJobRank (the CSV queue). */
+  var FAST_ATS_SITES = ['greenhouse', 'lever', 'ashby', 'workable', 'smartrecruiters', 'recruitee', 'bamboohr',
+                        'breezyhr', 'jazzhr', 'rippling', 'comeet', 'jobvite', 'freshteam', 'manatal', 'recooty', 'gohire'];
+  var SLOW_ATS_SITES = ['workday', 'paylocity'];
+  var ATS_SITES = FAST_ATS_SITES.concat(SLOW_ATS_SITES);
+  var BOARD_SITES = ['linkedin', 'indeed', 'dice', 'ziprecruiter', 'adzuna', 'ziprecruiterpaid', 'adzunapaid'];
+  var JOB_TIERS = [['quick-apply ATS', FAST_ATS_SITES], ['ATS (account sites)', SLOW_ATS_SITES], ['job boards', BOARD_SITES]];
+  /* The same order for any job link (the CSV queue, queue-runner.js): lower = sooner. */
+  var RANK_RES = [
+    [/greenhouse\.io|grnh\.se/, 0], [/lever\.co/, 1], [/ashbyhq/, 2], [/workable/, 3], [/smartrecruiters/, 4], [/recruitee/, 5],
+    [/teamtailor/, 6], [/bamboohr/, 7], [/breezy\.hr/, 8], [/jazzhr|resumatorapi|applytojob/, 9], [/pinpointhq/, 10], [/rippling/, 11],
+    [/comeet/, 12], [/personio/, 13], [/jobvite/, 14], [/freshteam|manatal|recooty|gohire|forhyre|homerun|dover|wellfound/, 15],
+    [/myworkdayjobs|myworkdaysite|workdayjobs|\.workday\.com/, 20], [/icims/, 21], [/successfactors|sapsf/, 22], [/oraclecloud/, 23],
+    [/taleo/, 24], [/paylocity|ultipro|ukg\.com|adp\.com|avature|bullhorn/, 25]];
+  var RANK_BOARDS = [[/(^|\.)linkedin\./, 40], [/(^|\.)indeed\./, 41], [/(^|\.)dice\./, 42], [/(^|\.)ziprecruiter\./, 43], [/(^|\.)adzuna\./, 44],
+    [/(^|\.)(glassdoor|totaljobs|cv-library|monster|jobsite|irishjobs|jobs\.ie|simplyhired|careerbuilder|jooble|hiring\.cafe)\./, 45]];
+  self.ohJobRank = function (url) {
+    var host = '';
+    try { host = new URL(url).hostname.toLowerCase(); } catch (_) { return 30; }
+    if (/(^|\.)reed\.co\.uk$/.test(host)) return 99;
+    var i;
+    for (i = 0; i < RANK_BOARDS.length; i++) if (RANK_BOARDS[i][0].test(host + '.')) return RANK_BOARDS[i][1];
+    for (i = 0; i < RANK_RES.length; i++) if (RANK_RES[i][0].test(String(url).toLowerCase())) return RANK_RES[i][1];
+    return 30;                                                   // a company's own career site
+  };
   var EMPTY_TTL_MS = 15 * 60 * 1000;
   var _emptyUntil = {};
-  var _sticky = null;
   var _tierSig = '';
   var NEXT_JOB_RE = /\/candidate\/[^/?#]+\/application(?:[?#]|$)/;
   var REED_HOST_RE = /(^|\.)reed\.co\.uk$/i;
@@ -294,9 +319,8 @@
       });
     }, function () { clearTimeout(timer); return cancelled ? { site: site, cancelled: true } : { site: site, failed: true }; }).then(function (r) {
       /* Learn from every answer — also ones that arrive after the search
-         gave up — so the next lookup goes straight to a site with jobs. */
-      if (r.res) { if (!_sticky) _sticky = site; }
-      else if (!r.auth && !r.cancelled) _emptyUntil[site] = Date.now() + (r.failed ? FAIL_TTL_MS : EMPTY_TTL_MS);
+         gave up — so the next lookup leaves out sites with nothing to give. */
+      if (!r.res && !r.auth && !r.cancelled) _emptyUntil[site] = Date.now() + (r.failed ? FAIL_TTL_MS : EMPTY_TTL_MS);
       return r;
     });
   }
@@ -326,26 +350,19 @@
       if (r.auth) return { auth: true };
       if (r.cancelled) return null;
       if (r.res && !(excludeId && String((r.job && r.job.copilot_job_id) || '') === excludeId)) {
-        _sticky = r.site;
         return { res: r.res, tier: tier, site: r.site };
       }
       _emptyUntil[r.site] = Date.now() + (r.failed ? FAIL_TTL_MS : EMPTY_TTL_MS);
-      if (_sticky === r.site) _sticky = null;
       return null;
     }
     for (var t = 0; t < tiers.length; t++) {
       var now = Date.now();
       var order = tiers[t][1].filter(function (k) { return !(_emptyUntil[k] > now); });
       if (!order.length) continue;
-      /* Steady state: the site that just had jobs, on its own. */
-      if (_sticky && order.indexOf(_sticky) !== -1) {
-        var first = take(await within(probe(url, init, _sticky), deadline - Date.now()), tiers[t][0]);
-        if (first === 'timeout') return null;
-        if (first) return first;
-        order = order.filter(function (k) { return k !== _sticky && !(_emptyUntil[k] > Date.now()); });
-      }
-      /* Otherwise the remaining sites in parallel (6 at a time); take the
-         best-ranked hit. */
+      /* Every site of the tier not known to be empty, in parallel (6 at a time); the
+         best-ranked one with a job wins — so a slow site that happened to have jobs last
+         time never beats a quicker one that has jobs now. Empty sites are left out for 15
+         min, so in practice only the few sites with jobs are asked. */
       var pool = probePool(order, url, init, 6);
       for (var i = 0; i < order.length; i++) {
         var hit = take(await within(pool.results[i], deadline - Date.now()), tiers[t][0]);
@@ -358,7 +375,7 @@
   /* "Give me the next job": ATS first, then other boards, then the normal
      mixed queue (where Reed comes from). */
   async function nextJobAtsFirst(url, init) {
-    var hit = await firstJobFrom([['ATS', ATS_SITES], ['job boards', BOARD_SITES]], url, init, '');
+    var hit = await firstJobFrom(JOB_TIERS, url, init, '');
     if (hit && hit.res) { noteTier(hit.tier, hit.site, ''); return hit.res; }
     if (!(hit && hit.auth)) noteTier('everything else (incl. Reed)', '', '');
     return _fetch(url, init);
@@ -383,7 +400,7 @@
     var kind = jobKind(j);
     if (kind !== 'reed' && kind !== 'board') return res;
     var base = url.replace(/[?#].*$/, '');
-    var tiers = kind === 'reed' ? [['ATS', ATS_SITES], ['job boards', BOARD_SITES]] : [['ATS', ATS_SITES]];
+    var tiers = kind === 'reed' ? JOB_TIERS : JOB_TIERS.slice(0, 2);
     var hit = await firstJobFrom(tiers, base, init, String(j.copilot_job_id || ''));
     if (hit && hit.res) {
       noteTier(hit.tier, hit.site, kind);
@@ -429,6 +446,69 @@
       });
     });
   }
+  /* 14. "Loading your Job" for ever. OptimHire opens each job with chrome.tabs.update and then
+     waits — with no time limit — for that tab to report status "complete" (three such waits in
+     its background). A page that never reports it (ad / tracking scripts that never finish), a
+     navigation that never loads anything new, or a page that finished before OptimHire started
+     listening, left the panel on "Loading your Job" for good — and Skip, which opens the next
+     job the same way, went down the same road. Those waits are told the page is ready once it
+     is: at once when the tab already says "complete", 6 s after the page's DOMContentLoaded, and
+     at the latest 25 s after its navigation started. Only those waits (a short listener that
+     removes itself on "complete") are told — nothing else sees a made-up event. */
+  var LOAD_DCL_GRACE_MS = 6000, LOAD_CAP_MS = 25000, LOAD_MIN_WAIT_MS = 3000;
+  (function loadWatchdog() {
+    var ev = chrome.tabs && chrome.tabs.onUpdated;
+    if (!ev || typeof ev.addListener !== 'function') return;
+    var waiters = [];                                   // { fn, since }
+    var navs = {};                                      // tabId → { start, dcl }
+    var realAdd = ev.addListener.bind(ev), realRemove = ev.removeListener.bind(ev);
+    function isWaiter(fn) {
+      try {
+        var src = Function.prototype.toString.call(fn);
+        return src.length < 600 && /["']complete["']/.test(src) && /removeListener/.test(src);
+      } catch (_) { return false; }
+    }
+    ev.addListener = function (fn) {
+      if (typeof fn === 'function' && isWaiter(fn)) waiters.push({ fn: fn, since: Date.now() });
+      return realAdd.apply(null, arguments);
+    };
+    ev.removeListener = function (fn) {
+      waiters = waiters.filter(function (w) { return w.fn !== fn; });
+      return realRemove.apply(null, arguments);
+    };
+    try {
+      var wn = chrome.webNavigation;
+      wn.onBeforeNavigate.addListener(function (d) { if (d.frameId === 0) navs[d.tabId] = { start: Date.now(), dcl: 0 }; });
+      wn.onDOMContentLoaded.addListener(function (d) { if (d.frameId === 0) (navs[d.tabId] || (navs[d.tabId] = { start: Date.now() })).dcl = Date.now(); });
+      wn.onCompleted.addListener(function (d) { if (d.frameId === 0) delete navs[d.tabId]; });
+      chrome.tabs.onRemoved.addListener(function (tabId) { delete navs[tabId]; });
+    } catch (_) {}
+    setInterval(function () {
+      var now = Date.now();
+      var due = waiters.filter(function (w) { return now - w.since >= LOAD_MIN_WAIT_MS; });
+      if (!due.length) return;
+      chrome.tabs.query({}, function (tabs) {
+        void chrome.runtime.lastError;
+        (tabs || []).forEach(function (t) {
+          var n = navs[t.id];
+          var why = t.status === 'complete' ? 'already loaded'
+                  : n && n.dcl && now - n.dcl >= LOAD_DCL_GRACE_MS ? 'page usable, never reported complete'
+                  : n && now - n.start >= LOAD_CAP_MS ? 'still loading after ' + Math.round(LOAD_CAP_MS / 1000) + ' s'
+                  : '';
+          if (!why) return;
+          due.forEach(function (w) {
+            if (waiters.indexOf(w) === -1) return;          // released by a real event meanwhile
+            try { w.fn(t.id, { status: 'complete' }, t); } catch (_) {}
+          });
+          if (t.status !== 'complete' && due.some(function (w) { return waiters.indexOf(w) === -1; })) {
+            try { console.info('[OH-BG] job tab ' + t.id + ': ' + why + ' — OptimHire told to carry on'); } catch (_) {}
+            delete navs[t.id];
+          }
+        });
+      });
+    }, 2000);
+  })();
+
   /* 13. Your own CV unless "Tailor CV to each job" is on (ohTailorCv — Queue Manager / the
      panel's card). Off: before OptimHire starts a job, its "Optimize My Resume" step is set
      to skip (its own "hide for 24 h", resumeHide24Hr, kept fresh), so the CV on your profile

@@ -4386,6 +4386,25 @@
     });
   })();
 
+  /* Which job to apply to first (the CSV queue): quickest company ATS first, then ATS sites
+     that need an account, company career sites, job boards, Reed last — lower = sooner.
+     Same order as self.ohJobRank in oh-bg.js. */
+  function jobRank(u) {
+    let h = ''; try { h = new URL(u).hostname.toLowerCase(); } catch (_) { return 30; }
+    if (/(^|\.)reed\.co\.uk$/.test(h)) return 99;
+    const boards = [[/(^|\.)linkedin\./, 40], [/(^|\.)indeed\./, 41], [/(^|\.)dice\./, 42], [/(^|\.)ziprecruiter\./, 43], [/(^|\.)adzuna\./, 44],
+      [/(^|\.)(glassdoor|totaljobs|cv-library|monster|jobsite|irishjobs|jobs\.ie|simplyhired|careerbuilder|jooble|hiring\.cafe)\./, 45]];
+    for (const [re, r] of boards) if (re.test(h + '.')) return r;
+    const ats = [[/greenhouse\.io|grnh\.se/, 0], [/lever\.co/, 1], [/ashbyhq/, 2], [/workable/, 3], [/smartrecruiters/, 4], [/recruitee/, 5],
+      [/teamtailor/, 6], [/bamboohr/, 7], [/breezy\.hr/, 8], [/jazzhr|resumatorapi|applytojob/, 9], [/pinpointhq/, 10], [/rippling/, 11],
+      [/comeet/, 12], [/personio/, 13], [/jobvite/, 14], [/freshteam|manatal|recooty|gohire|forhyre|homerun|dover|wellfound/, 15],
+      [/myworkdayjobs|myworkdaysite|workdayjobs|\.workday\.com/, 20], [/icims/, 21], [/successfactors|sapsf/, 22], [/oraclecloud/, 23],
+      [/taleo/, 24], [/paylocity|ultipro|ukg\.com|adp\.com|avature|bullhorn/, 25]];
+    const lu = String(u).toLowerCase();
+    for (const [re, r] of ats) if (re.test(lu)) return r;
+    return 30;
+  }
+
   async function rawResumeFile(url, filename = 'resume.pdf') {
     if (!url) return null;
     try {
@@ -9576,13 +9595,7 @@
             if (!dd.ohJobQueueActive) return;            // queue stopped
             let qq = Array.isArray(dd.ohJobQueue) ? dd.ohJobQueue : [];
             /* Same order as the Queue Manager: ATS jobs first, Reed last. */
-            const tier = (u) => {
-              let h = ''; try { h = new URL(u).hostname.toLowerCase(); } catch (_) { return 1; }
-              if (/(^|\.)reed\.co\.uk$/.test(h)) return 3;
-              if (/(^|\.)(indeed|linkedin|ziprecruiter|adzuna|dice|glassdoor|monster|totaljobs|cv-library|simplyhired|hiring\.cafe)\./.test(h)) return 2;
-              if (/greenhouse|lever\.co|myworkdayjobs|workday|ashbyhq|icims|smartrecruiters|workable|breezy|jobvite|bamboohr|paylocity|jazzhr|teamtailor|recruitee|pinpoint|oraclecloud|taleo|successfactors|ultipro|avature|rippling|comeet|manatal/.test(h)) return 0;
-              return 1;
-            };
+            const tier = jobRank;
             const pending = qq.filter(j => j.status === 'pending');
             const nx = dd.ohPreferAts === false ? pending[0]
               : pending.reduce((best, j) => (!best || tier(j.url) < tier(best.url) ? j : best), null);

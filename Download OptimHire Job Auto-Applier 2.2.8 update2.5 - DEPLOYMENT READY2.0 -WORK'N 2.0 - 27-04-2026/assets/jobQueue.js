@@ -80,35 +80,9 @@
     } catch (_) { return 'Other'; }
   }
 
-  /* ───── Order: ATS jobs first, Reed last ─────
-     Direct ATS applications (Greenhouse, Lever, Workday…) go first, then
-     company career sites we don't recognise, then job boards, and Reed
-     last. Within a tier the queue keeps its own order. On by default;
-     "ATS first, Reed last" in the header turns it off (ohPreferAts). */
-  const BOARD_ATS = new Set(['LinkedIn', 'Indeed', 'Dice', 'ZipRecruiter', 'HiringCafe']);
-  const BOARD_HOST_RE = /(^|\.)(indeed|linkedin|ziprecruiter|adzuna|dice|glassdoor|monster|totaljobs|cv-library|jobsite|irishjobs|jobs\.ie|simplyhired|careerbuilder|jooble|talent|hiring\.cafe)\./i;
-  const REED_HOST_RE = /(^|\.)reed\.co\.uk$/i;
+  /* "ATS first, Reed last" (ohPreferAts): the order itself is the service worker's
+     (self.ohJobRank in oh-bg.js, used by queue-runner.js). */
   let _preferAts = true;
-  function jobTier(url) {
-    let host = '';
-    try { host = new URL(url).hostname.toLowerCase(); } catch (_) { return 1; }
-    if (REED_HOST_RE.test(host)) return 3;
-    const ats = detectAts(url);
-    if (ats !== 'Other' && !BOARD_ATS.has(ats)) return 0;
-    if (BOARD_ATS.has(ats) || BOARD_HOST_RE.test(host)) return 2;
-    return 1;
-  }
-  /* First eligible job of the best tier (queue order within a tier). */
-  function pickNext(eligible) {
-    if (!_preferAts) return queue.find(eligible) || null;
-    let best = null, bestTier = 9;
-    for (const j of queue) {
-      if (!eligible(j)) continue;
-      const t = jobTier(j.url);
-      if (t < bestTier) { best = j; bestTier = t; if (t === 0) break; }
-    }
-    return best;
-  }
 
   /* ───── CSV parsing / writing ───── */
   /* Real exports are comma, semicolon (European Excel), tab (pasted

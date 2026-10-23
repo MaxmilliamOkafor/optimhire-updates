@@ -1736,7 +1736,7 @@
    * a fresh batch. Rate-limited so it can never loop.
    * ─────────────────────────────────────────────────────────────────── */
   (function installLoadingStallWatchdog() {
-    var STALL_MS = 30_000;        // spinner must persist this long (was 45s)
+    var STALL_MS = 50_000;        // last resort: the service worker releases a stuck page load within 25 s (oh-bg.js 14)
     var COOLDOWN_MS = 60_000;     // min gap between recovery attempts
     var LOADING_RE = /loading your job|loading job|fetching your job/i;
     var _since = 0, _lastRecoveryTs = 0, _escalated = false;
@@ -2671,8 +2671,8 @@
           'title="Hard stop: makes the extension completely inert — no auto-clicking, no auto-submitting, no background loops — until you turn it back on">' +
           '<span class="qc-switch-text"><b>Automation</b><small id="oh-qc-master-sub">Applies and submits for you</small></span><span class="qc-toggle"></span></button>' +
         '<button id="oh-qc-prio" class="qc-switch" role="switch" aria-checked="true" ' +
-          'title="Apply to jobs on company ATS sites (Greenhouse, Lever, Workday…) first, then other job boards, and Reed last — for OptimHire\'s queue and the CSV Job Queue.">' +
-          '<span class="qc-switch-text"><b>ATS jobs first</b><small>Then other boards, Reed last</small></span><span class="qc-toggle"></span></button>' +
+          'title="Order that saves the most time and reaches employers directly: one-page company ATS (Greenhouse, Lever, Ashby, Workable, SmartRecruiters…) first, then ATS that need an account (Workday, iCIMS, SuccessFactors…), company career sites, job boards (LinkedIn, Indeed…), and Reed last — for OptimHire\'s queue and the CSV Job Queue.">' +
+          '<span class="qc-switch-text"><b>Quickest ATS first</b><small>Greenhouse, Lever… → Workday… → boards → Reed last</small></span><span class="qc-toggle"></span></button>' +
         '<button id="oh-qc-tailor" class="qc-switch" role="switch" aria-checked="false" ' +
           'title="Off: your own CV, unchanged, on every job (OptimHire\'s Optimize My Resume step is skipped). On: OptimHire\'s runs use Optimize My Resume and CSV jobs a copy of your CV ordered to the job. Workday always keeps your own CV.">' +
           '<span class="qc-switch-text"><b>Tailor CV to each job</b><small id="oh-qc-tailor-sub">Off — your own CV</small></span><span class="qc-toggle"></span></button>' +
