@@ -4,7 +4,9 @@
  * so the Workday engine calls window.__ohCv.
  */
 import { cvText } from "./cvtext.js";
-import { parseCv } from "./cvparse.js";
+import { parseCv, type CvProfile } from "./cvparse.js";
+import { profileFromCv, tailoredCv, type JobText, type Person } from "./tailorcv.js";
+import type { Profile } from "../workday/types.js";
 
 (window as unknown as { __ohCv: unknown }).__ohCv = {
   text: cvText,
@@ -12,5 +14,10 @@ import { parseCv } from "./cvparse.js";
   async read(base64: string, mime: string) {
     const text = await cvText(base64, mime);
     return { text, profile: parseCv(text) };
+  },
+  /** This job's copy of your CV (a full imported profile, or your parsed CV + your details), or null. */
+  tailor(input: { profile?: Profile; cv?: CvProfile; person?: Person; job: JobText }) {
+    const p = input.profile ?? (input.cv ? profileFromCv(input.cv, input.person || {}) : null);
+    return p ? tailoredCv(p, input.job) : null;
   },
 };

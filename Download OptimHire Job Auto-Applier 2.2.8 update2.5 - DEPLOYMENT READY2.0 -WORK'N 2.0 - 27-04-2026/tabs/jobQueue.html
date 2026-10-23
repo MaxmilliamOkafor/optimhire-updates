@@ -222,6 +222,9 @@
         <label class="switch-inline" title="Apply to jobs on company ATS sites (Greenhouse, Lever, Workday…) first, then company career sites, then job boards, and Reed last. Also applies to OptimHire's own auto-apply queue.">
           <input type="checkbox" id="preferAts" checked><span class="sw"></span>ATS first, Reed last
         </label>
+        <label class="switch-inline" title="Off: your own CV, unchanged, on every job (OptimHire's &quot;Optimize My Resume&quot; step is skipped). On: OptimHire's runs use its &quot;Optimize My Resume&quot;; CSV jobs get a copy of your CV with your skills and each role's bullets ordered by how well they match the job description — nothing reworded or added — as a plain, ATS-friendly PDF (your own CV when a job has no description). Workday jobs always keep your own CV.">
+          <input type="checkbox" id="tailorCv"><span class="sw"></span>Tailor CV to each job
+        </label>
         <button id="btnStop" class="btn-danger" disabled><svg class="i" viewBox="0 0 16 16" aria-hidden="true"><rect x="4" y="4" width="8" height="8" rx="1.5" fill="currentColor"/></svg>Stop</button>
         <button id="btnStart" class="btn-primary"><svg class="i" viewBox="0 0 16 16" aria-hidden="true"><path d="M5 3.5v9l7-4.5z" fill="currentColor"/></svg>Start queue</button>
       </div>
@@ -384,7 +387,8 @@
         Every company's Workday site needs its own account before you can apply. During a run the automation signs in
         with these details — or creates the account with them if there is none yet — so Workday jobs are applied to
         instead of skipped. The password was made for you; keep it (or change it) to sign in to those sites yourself.
-        A site that insists on an e-mail link being clicked first is skipped.
+        Accounts you made before are signed in to with the passwords below; with emailed codes on, Workday's e-mail links
+        (verify your account, reset your password) are opened for you.
       </div>
       <label>E-mail</label>
       <input type="email" id="wdEmail" placeholder="your OptimHire e-mail is used when empty">
@@ -394,6 +398,11 @@
         <button id="wdCopy" class="btn-small">Copy</button>
       </div>
       <div class="help-text">At least 8 characters with an upper-case letter, a lower-case letter, a number and a symbol.</div>
+      <label for="wdOtherPw">Other passwords you have used on Workday sites</label>
+      <textarea id="wdOtherPw" rows="2" autocomplete="off" spellcheck="false" placeholder="One per line (up to 5)" style="font-family:ui-monospace,SFMono-Regular,Menlo,monospace;min-height:56px"></textarea>
+      <div class="help-text">For accounts you made before (yourself or with another tool): each is tried once. At most 3 failed
+        sign-ins per site a day, so an account is never locked; a site that still can't be signed in to is not tried again
+        until you give its password below or press Retry.</div>
       <div id="wdSites" class="qa-list"></div>
       <div class="section">
         <label class="switch-row">
@@ -415,9 +424,16 @@
         <label class="switch-row">
           <span><b>Emailed verification codes</b>
           <small>Oracle ("Confirm Your Identity"), Workday and others email a code mid-application. With this on it is
-          read from the Gmail you are signed in to in this browser and typed for you. Read-only: only mail from the
-          last few minutes that reads like a verification email; nothing is kept.</small></span>
+          read from the Gmail you are signed in to in this browser and typed for you. Only mail from the last few minutes
+          that reads like a verification or password email is looked at; nothing is kept.</small></span>
           <input type="checkbox" id="gmailCodesOn"><span class="sw"></span>
+        </label>
+        <label class="switch-row" style="margin-top:14px !important">
+          <span><b>Reset the password by email when it doesn't work</b>
+          <small>Needs emailed codes on. An account made before with a password you don't have here, or a locked one:
+          "Forgot your password?" is used, the emailed link opened and your Workday password above set — then the job carries
+          on. The same way, "verify your email" links are opened for you. At most twice per site a day.</small></span>
+          <input type="checkbox" id="wdResetOn"><span class="sw"></span>
         </label>
       </div>
       <div class="modal-actions">

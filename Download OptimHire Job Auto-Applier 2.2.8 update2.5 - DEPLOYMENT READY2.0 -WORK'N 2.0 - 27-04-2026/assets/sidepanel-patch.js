@@ -2667,9 +2667,9 @@
         '<button id="oh-qc-prio" class="qc-switch" role="switch" aria-checked="true" ' +
           'title="Apply to jobs on company ATS sites (Greenhouse, Lever, Workday…) first, then other job boards, and Reed last — for OptimHire\'s queue and the CSV Job Queue.">' +
           '<span class="qc-switch-text"><b>ATS jobs first</b><small>Then other boards, Reed last</small></span><span class="qc-toggle"></span></button>' +
-        '<button id="oh-qc-others" class="qc-switch" role="switch" aria-checked="true" ' +
-          'title="Other job-autofill extensions fill the same forms and undo each other. They are switched off while a run is going and back on when it ends.">' +
-          '<span class="qc-switch-text"><b>Pause other autofill extensions during runs</b><small id="oh-qc-others-sub">None found</small></span><span class="qc-toggle"></span></button>' +
+        '<button id="oh-qc-tailor" class="qc-switch" role="switch" aria-checked="false" ' +
+          'title="Off: your own CV, unchanged, on every job (OptimHire\'s Optimize My Resume step is skipped). On: OptimHire\'s runs use Optimize My Resume and CSV jobs a copy of your CV ordered to the job. Workday always keeps your own CV.">' +
+          '<span class="qc-switch-text"><b>Tailor CV to each job</b><small id="oh-qc-tailor-sub">Off — your own CV</small></span><span class="qc-toggle"></span></button>' +
         '<div class="qc-sep"></div>' +
         '<div id="oh-qc-truth" class="qc-foot" title="OptimHire’s ‘X applied’ counter also counts skips. This counts real submission confirmations.">Results: — submitted · — skipped</div>' +
         '<div class="qc-links">' +
@@ -2702,20 +2702,15 @@
           });
         });
       });
-      var othersLine = document.getElementById('oh-qc-others');
-      if (othersLine) othersLine.addEventListener('click', function () {
-        chrome.storage.local.get(['ohPauseOthers'], function (d) {
-          var on = !(d && d.ohPauseOthers !== false);   // toggle
-          chrome.storage.local.set({ ohPauseOthers: on }, function () {
-            addLog(on ? 'Other autofill extensions will be paused during runs' : 'Other autofill extensions are left alone', '');
+      var tailorLine = document.getElementById('oh-qc-tailor');
+      if (tailorLine) tailorLine.addEventListener('click', function () {
+        chrome.storage.local.get(['ohTailorCv'], function (d) {
+          var on = !(d && d.ohTailorCv === true);   // toggle
+          chrome.storage.local.set({ ohTailorCv: on }, function () {
+            addLog(on ? 'CV tailored to each job (Workday keeps your own CV)' : 'Your own CV on every job', '');
             refresh();
           });
         });
-      });
-      var koLine = document.getElementById('oh-qc-ko');
-      if (koLine) koLine.addEventListener('click', function () {
-        try { chrome.tabs.create({ url: chrome.runtime.getURL('tabs/jobQueue.html#knockout'), active: true }); }
-        catch (_) {}
       });
       var qaLine = document.getElementById('oh-qc-qamem');
       if (qaLine) qaLine.addEventListener('click', function () {
@@ -2961,27 +2956,6 @@
       });
     }
 
-    /* Which other autofill extensions are installed / paused right now. */
-    var OTHER_FILLER_RE = /ats ?tailor|job ?genie|simplify|jobright|speedy ?apply|lazy ?apply|auto ?fill|auto[- ]?appl|job ?assist|careerflow|huntr|job ?copilot|\bteal\b|apply ?ai|ai ?apply|jobscan|massapply|loopcv|sonara/i;
-    function paintOthers() {
-      var row = document.getElementById('oh-qc-others'), sub = document.getElementById('oh-qc-others-sub');
-      if (!row || !sub) return;
-      chrome.storage.local.get(['ohPauseOthers', 'ohPausedExts'], function (d) {
-        var on = !(d && d.ohPauseOthers === false);
-        row.setAttribute('aria-checked', on ? 'true' : 'false');
-        var paused = (d && Array.isArray(d.ohPausedExts)) ? d.ohPausedExts : [];
-        if (paused.length) { sub.textContent = 'Paused now: ' + paused.map(function (e) { return e.name; }).join(', '); return; }
-        if (!chrome.management || !chrome.management.getAll) { sub.textContent = on ? 'On' : 'Off'; return; }
-        chrome.management.getAll(function (list) {
-          void chrome.runtime.lastError;
-          var names = (list || []).filter(function (e) {
-            return e.id !== chrome.runtime.id && e.enabled && e.type === 'extension' && OTHER_FILLER_RE.test((e.name || '') + ' ' + (e.shortName || ''));
-          }).map(function (e) { return e.name; });
-          sub.textContent = !names.length ? 'None installed' : (on ? 'Will pause: ' : 'Found: ') + names.join(', ');
-        });
-      });
-    }
-
     function refresh() {
       try {
         ensureCard();
@@ -3003,12 +2977,14 @@
         });
         chrome.storage.local.get(['ohHarvestedJobs', RUN_KEY, 'matchingJobCount', 'isAutoProcessStartJob',
                                   'isManuallyStartJob', 'autoApplyState', 'ohAutomationDisabled',
-                                  'ohPreferAts', 'ohQueueTier'], function (d) {
+                                  'ohPreferAts', 'ohQueueTier', 'ohTailorCv'], function (d) {
           try {
             var pl = document.getElementById('oh-qc-prio');
             if (pl) pl.setAttribute('aria-checked', d && d.ohPreferAts === false ? 'false' : 'true');
-            paintOthers();
             paintKo();
+            var tl = document.getElementById('oh-qc-tailor'), ts = document.getElementById('oh-qc-tailor-sub');
+            if (tl) tl.setAttribute('aria-checked', d && d.ohTailorCv === true ? 'true' : 'false');
+            if (ts) ts.textContent = d && d.ohTailorCv === true ? 'On — Workday keeps your own CV' : 'Off — your own CV';
           } catch (_) {}
           _queueTier = (d && d.ohPreferAts !== false && d.ohQueueTier) || null;
           var map = (d && d.ohHarvestedJobs) || {};
@@ -3070,7 +3046,7 @@
           if (changes.ohKnockout || changes.ohKnockoutFixes) paintKo();
           if (changes[KEY_QUEUE] || changes[KEY_ACTIVE] || changes.ohHarvestedJobs ||
               changes.isAutoProcessStartJob || changes.isManuallyStartJob || changes.matchingJobCount ||
-              changes.ohPreferAts || changes.ohQueueTier) refresh();
+              changes.ohPreferAts || changes.ohQueueTier || changes.ohTailorCv) refresh();
           var qt = changes.ohQueueTier && changes.ohQueueTier.newValue;
           if (qt && qt.heldBack) {
             addLog('⇅ Held back a ' + (qt.heldBack === 'reed' ? 'reed.co.uk' : 'job-board') + ' job — applying an ' +

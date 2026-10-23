@@ -66,8 +66,16 @@
     }
     return best;
   }
+  /* A Workday link straight into "Autofill with Resume" or "Use My Last Application" opens
+     "Apply Manually" instead — every field is filled from your details. */
   function safeUrl(u) {
-    try { var x = new URL(String(u || '').trim()); return /^https?:$/.test(x.protocol) ? x.href : ''; } catch (_) { return ''; }
+    try {
+      var x = new URL(String(u || '').trim());
+      if (!/^https?:$/.test(x.protocol)) return '';
+      if (/myworkday(jobs|site)?\.com$|workdayjobs\.com$/i.test(x.hostname))
+        x.pathname = x.pathname.replace(/\/apply\/(autofillWithResume|useMyLastApplication)\b/i, '/apply/applyManually');
+      return x.href;
+    } catch (_) { return ''; }
   }
   function normUrl(u) { try { return new URL(u).href; } catch (_) { return String(u || ''); } }
 

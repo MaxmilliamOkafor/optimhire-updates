@@ -5,6 +5,12 @@
  * Safety: at most 2 sign-in attempts and 2 create attempts per run, so a wrong
  * password never locks the account; CAPTCHAs and email verification are always
  * handed to the user.
+ *
+ * [oh] Under OptimHire the host keeps a per-employer record instead: it offers
+ * each of your passwords once (at most 3 failed sign-ins per employer a day,
+ * across every job there), resets the password from the emailed link when none
+ * works or the account is locked (your Gmail, opt-in), and says "stop" for an
+ * employer that can't be signed in to, so its next jobs never try again.
  */
 import { NeedsHuman, buttonByText, byAid, humanClick, isVisible, qa, sleep, text, waitStable } from "./dom.js";
 import { setCheckbox, setText } from "./controls.js";
@@ -15,6 +21,66 @@ import { ACCOUNT_EXISTS_RX, AUTH_FAILED_RX, CREATE_ACCOUNT_TEXT_RX, LOCKED_RX, S
 interface CredReply {
   cred: { email: string; password: string } | null;
   master: { email: string; password: string } | null;
+  blocked?: string; // [oh] don't try to sign in here (why)
+  reset?: boolean;  // [oh] reset the password by email first
+}
+
+/** [oh] What the host says after a rejected sign-in. */
+interface AuthNext {
+  retry?: boolean;  // another of your passwords to try
+  reset?: boolean;  // reset the password by email
+  reason?: string;  // stop: why
+}
+
+// [oh] "You may have entered the wrong email address or password or your account might be locked"
+// is Workday's wording for a wrong password, not a lock.
+function isLocked(errs: string): boolean {
+  return LOCKED_RX.test(errs) && !/(might|may|could) be locked|possibly locked/i.test(errs);
+}
+
+const FORGOT_RX = /forgot (your )?password|passwort vergessen|mot de passe oubli|olvid\S* (su |tu )?contraseña|esqueceu (a |sua )?senha|password dimenticata|wachtwoord vergeten|nie pamiętasz hasła/i;
+
+async function askHost<T>(msg: Record<string, unknown>): Promise<T | null> {
+  try {
+    return ((await chrome.runtime.sendMessage(msg)) as T) ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/** [oh] The account exists with a password we don't have, or is locked: "Forgot your password?",
+ *  then the host opens the emailed link and sets your Workday password with it. null = done. */
+async function resetByEmail(ctx: Ctx, email: string): Promise<string | null> {
+  const link = byAid("forgotPassword") ?? buttonByText(FORGOT_RX);
+  if (!link || !email) return "no \"Forgot your password?\" link here";
+  ctx.log("This employer already has an account with another password (or it is locked) — resetting it by email");
+  await humanClick(link);
+  await waitStable(600);
+  const em = byAid("email") ?? qa<HTMLInputElement>('input[type="email"]').find(isVisible) ?? null;
+  if (em) {
+    await setText(em, email);
+    await pace(ctx);
+  }
+  const btn =
+    byAid("forgotPasswordSubmit") ??
+    buttonByText(/^(submit|reset( my)? password|send( reset)?( link| email)?|request( reset)?|continue|next)\b/i);
+  if (!btn) return "the reset form has no submit button";
+  const since = Date.now();
+  await humanClick(btn);
+  await sleep(400);
+  await waitStable(700, 15000);
+  const r = await askHost<{ ok?: boolean; reason?: string }>({ type: "wd:auth:mailReset", tenantHost: ctx.run.tenantHost, email, since });
+  if (!r?.ok) return r?.reason || "the reset email didn't arrive";
+  ctx.log("Password reset from the emailed link — signing in with it");
+  const back = byAid("signInLink") ?? buttonByText(/^(back to |return to )?sign in$/i);
+  if (back) {
+    await humanClick(back);
+    await waitStable(600);
+  } else {
+    location.reload(); // the run carries on after the reload
+    await sleep(15000);
+  }
+  return null;
 }
 
 async function getCreds(host: string): Promise<CredReply> {
@@ -53,6 +119,13 @@ export async function handleSignIn(ctx: Ctx): Promise<void> {
   if (captchaPresent()) throw new NeedsHuman("Solve the CAPTCHA, then click Resume.");
   const host = ctx.run.tenantHost;
   const creds = await getCreds(host);
+  if (creds.blocked) throw new NeedsHuman(creds.blocked); // [oh]
+  if (creds.reset) {
+    // [oh]
+    const why = await resetByEmail(ctx, emailFor(ctx, creds));
+    if (why) throw new NeedsHuman(`Couldn't reset the password by email (${why}). Reset it from the sign-in page, then retry the site in Queue Manager → Workday & sign-in.`);
+    return;
+  }
   const cred = creds.cred ?? (ctx.settings.useMasterPassword ? creds.master : null);
 
   if (!cred) {
@@ -65,7 +138,8 @@ export async function handleSignIn(ctx: Ctx): Promise<void> {
     }
     throw new NeedsHuman("No saved password for this employer. Sign in yourself (it will be remembered if you use Create Account here), then click Resume.");
   }
-  if (ctx.run.authAttempts >= 2) {
+  // [oh] was 2: the host caps failed sign-ins per employer (lockout-safe) and offers your other passwords
+  if (ctx.run.authAttempts >= 5) {
     throw new NeedsHuman("Sign-in failed twice. Use 'Forgot password' or update the saved password in Workday settings, then click Resume.");
   }
 
@@ -81,9 +155,19 @@ export async function handleSignIn(ctx: Ctx): Promise<void> {
   await submit("signInSubmit", SIGN_IN_TEXT_RX);
 
   const errs = errorMessages().map((e) => e.text).join(" ");
-  if (AUTH_FAILED_RX.test(errs) || LOCKED_RX.test(errs)) {
-    if (LOCKED_RX.test(errs)) throw new NeedsHuman("This account is locked. Reset the password from the sign-in page, then click Resume.");
+  const locked = isLocked(errs); // [oh]
+  if (AUTH_FAILED_RX.test(errs) || locked) {
     ctx.log(`Sign-in rejected: ${errs}`, "warn");
+    // [oh] The host decides: another of your passwords, a reset by email, or stop for this employer.
+    const next = await askHost<AuthNext>({ type: "wd:auth:rejected", tenantHost: host, password: cred.password, locked });
+    if (next?.retry) return;
+    if (next?.reset) {
+      const why = await resetByEmail(ctx, cred.email || emailFor(ctx, creds));
+      if (!why) return;
+      throw new NeedsHuman(`Couldn't reset the password by email (${why}). Reset it from the sign-in page, then retry the site in Queue Manager → Workday & sign-in.`);
+    }
+    if (next?.reason) throw new NeedsHuman(next.reason);
+    if (locked) throw new NeedsHuman("This account is locked. Reset the password from the sign-in page, then click Resume.");
     if (!creds.cred && ctx.run.createAttempts < 2) {
       const create = byAid("createAccountLink");
       if (create) {
@@ -104,6 +188,7 @@ export async function handleCreateAccount(ctx: Ctx): Promise<void> {
   if (captchaPresent()) throw new NeedsHuman("Solve the CAPTCHA, then click Resume.");
   const host = ctx.run.tenantHost;
   const creds = await getCreds(host);
+  if (creds.blocked) throw new NeedsHuman(creds.blocked); // [oh]
 
   if (creds.cred && ctx.run.authAttempts < 2) {
     // We already have an account here; go back to sign in rather than make a duplicate.
