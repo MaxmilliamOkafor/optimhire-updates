@@ -343,6 +343,12 @@
   function within(p, ms) {
     return Promise.race([p, new Promise(function (r) { setTimeout(function () { r(null); }, Math.max(0, ms)); })]);
   }
+  /* Rank of each jobsite key (position in JOB_TIERS), and the best-ranked site that had a job
+     last time: a lookup asks only sites ranked at or above it (better ones are known empty for
+     15 min, so that is ~1 request per job), and widens to the rest once it runs dry. */
+  var SITE_ORDER = ATS_SITES.concat(BOARD_SITES);
+  var _bestRank = null;
+  function siteRank(k) { var i = SITE_ORDER.indexOf(k); return i < 0 ? 999 : i; }
   async function firstJobFrom(tiers, url, init, excludeId) {
     var deadline = Date.now() + BUDGET_MS;
     function take(r, tier) {
@@ -355,22 +361,26 @@
       _emptyUntil[r.site] = Date.now() + (r.failed ? FAIL_TTL_MS : EMPTY_TTL_MS);
       return null;
     }
-    for (var t = 0; t < tiers.length; t++) {
-      var now = Date.now();
-      var order = tiers[t][1].filter(function (k) { return !(_emptyUntil[k] > now); });
-      if (!order.length) continue;
-      /* Every site of the tier not known to be empty, in parallel (6 at a time); the
-         best-ranked one with a job wins — so a slow site that happened to have jobs last
-         time never beats a quicker one that has jobs now. Empty sites are left out for 15
-         min, so in practice only the few sites with jobs are asked. */
-      var pool = probePool(order, url, init, 6);
-      for (var i = 0; i < order.length; i++) {
-        var hit = take(await within(pool.results[i], deadline - Date.now()), tiers[t][0]);
-        if (hit === 'timeout') { pool.stop(); return null; }
-        if (hit) { pool.stop(); return hit; }
+    async function search(limit) {
+      for (var t = 0; t < tiers.length; t++) {
+        var now = Date.now();
+        var order = tiers[t][1].filter(function (k) { return !(_emptyUntil[k] > now) && (limit == null || siteRank(k) <= limit); });
+        if (!order.length) continue;
+        /* The tier's sites in parallel (6 at a time), taken in rank order: the best-ranked
+           one with a job wins, so a slow site that had jobs last time never beats a quicker
+           one that has jobs now. Worse-ranked lookups still running are cancelled. */
+        var pool = probePool(order, url, init, 6);
+        for (var i = 0; i < order.length; i++) {
+          var hit = take(await within(pool.results[i], deadline - Date.now()), tiers[t][0]);
+          if (hit === 'timeout') { pool.stop(); return 'timeout'; }
+          if (hit) { pool.stop(); if (hit.site) _bestRank = siteRank(hit.site); return hit; }
+        }
       }
+      return null;
     }
-    return null;
+    var found = await search(_bestRank);
+    if (found === null && _bestRank != null) { _bestRank = null; found = await search(null); }    // that site ran dry
+    return found === 'timeout' ? null : found;
   }
   /* "Give me the next job": ATS first, then other boards, then the normal
      mixed queue (where Reed comes from). */
