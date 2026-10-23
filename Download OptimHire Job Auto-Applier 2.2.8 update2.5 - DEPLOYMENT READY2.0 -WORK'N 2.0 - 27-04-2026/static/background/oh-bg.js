@@ -77,9 +77,13 @@
  *    Workday password set there — and "verify your email".
  *
  * 11. Other job-autofill extensions (ATS TAILOR, Job Genie, Simplify…) are
- *    paused while a run is going — two fillers on one form undo each other —
- *    and turned back on when it ends (also after a restart). ohPauseOthers:
- *    false (the switch on the side panel's Job Queue card) leaves them alone.
+ *    left alone unless you turn on "Pause other autofill extensions during
+ *    runs" (ohPauseOthers: true, the side panel's card): then they are paused
+ *    while a run is going and turned back on when it ends. What was paused is
+ *    kept in storage.sync as well as storage.local — OptimHire wipes
+ *    storage.local on every reload/update, which used to leave them off — and
+ *    anything still paused is turned back on as soon as no run needs it
+ *    (switch off, run over, browser or extension restarted).
  *
  * 12. The CSV Job Queue is run from here (queue-runner.js): closing the Queue
  *    Manager no longer slows a run down to one job at a time.
@@ -201,18 +205,40 @@
     } catch (_) {}
   }
 
-  /* 11. Other autofill extensions, paused during runs. */
+  /* 11. Other autofill extensions, paused during runs — only if you turn it on. */
   var OTHER_FILLER_RE = /ats ?tailor|job ?genie|simplify|jobright|speedy ?apply|lazy ?apply|auto ?fill|auto[- ]?appl|job ?assist|careerflow|huntr|job ?copilot|\bteal\b|apply ?ai|ai ?apply|jobscan|massapply|loopcv|sonara/i;
-  var _othersBusy = false;
+  var _othersBusy = false, _othersAgain = false;
+  /* What we paused: storage.local + storage.sync (the sync copy survives OptimHire's wipe). */
+  function readPaused(cb) {
+    chrome.storage.local.get(['ohPausedExts'], function (l) {
+      var a = (l && Array.isArray(l.ohPausedExts)) ? l.ohPausedExts : [];
+      var merge = function (b) {
+        var seen = {}, all = [];
+        a.concat(b || []).forEach(function (e) { if (e && e.id && !seen[e.id]) { seen[e.id] = 1; all.push(e); } });
+        cb(all);
+      };
+      try { chrome.storage.sync.get(['ohPausedExts'], function (s2) { void chrome.runtime.lastError; merge(s2 && Array.isArray(s2.ohPausedExts) ? s2.ohPausedExts : []); }); }
+      catch (_) { merge([]); }
+    });
+  }
+  function writePaused(list, cb) {
+    chrome.storage.local.set({ ohPausedExts: list }, function () {
+      try { chrome.storage.sync.set({ ohPausedExts: list }, function () { void chrome.runtime.lastError; cb(); }); }
+      catch (_) { cb(); }
+    });
+  }
   function syncOthers(d) {
     var mg = chrome.management;
-    if (!mg || _othersBusy) return;
+    if (!mg) return;
+    if (_othersBusy) { _othersAgain = true; return; }
     var live = !!(isLive(d) || d.ohJobQueueActive);
-    var want = live && d.ohPauseOthers !== false && d.ohAutomationDisabled !== true;
+    var want = live && d.ohPauseOthers === true && d.ohAutomationDisabled !== true;
     _othersBusy = true;
-    chrome.storage.local.get(['ohPausedExts'], function (st) {
-      var paused = (st && Array.isArray(st.ohPausedExts)) ? st.ohPausedExts : [];
-      var done = function () { _othersBusy = false; };
+    readPaused(function (paused) {
+      var done = function () {
+        _othersBusy = false;
+        if (_othersAgain) { _othersAgain = false; syncOthers(snap); }    // a change that came in meanwhile
+      };
       if (want && !paused.length) {
         mg.getAll(function (list) {
           void chrome.runtime.lastError;
@@ -221,13 +247,16 @@
                    OTHER_FILLER_RE.test((e.name || '') + ' ' + (e.shortName || ''));
           });
           if (!hit.length) { done(); return; }
-          hit.forEach(function (e) { mg.setEnabled(e.id, false, function () { void chrome.runtime.lastError; }); });
-          chrome.storage.local.set({ ohPausedExts: hit.map(function (e) { return { id: e.id, name: e.name }; }) }, done);
-          try { console.info('[OH-BG] paused during the run: ' + hit.map(function (e) { return e.name; }).join(', ')); } catch (_) {}
+          /* Written down before anything is switched off, so it can always be switched back on. */
+          writePaused(hit.map(function (e) { return { id: e.id, name: e.name }; }), function () {
+            hit.forEach(function (e) { mg.setEnabled(e.id, false, function () { void chrome.runtime.lastError; }); });
+            try { console.info('[OH-BG] paused during the run: ' + hit.map(function (e) { return e.name; }).join(', ')); } catch (_) {}
+            done();
+          });
         });
       } else if (!want && paused.length) {
         paused.forEach(function (e) { mg.setEnabled(e.id, true, function () { void chrome.runtime.lastError; }); });
-        chrome.storage.local.set({ ohPausedExts: [] }, done);
+        writePaused([], done);
         try { console.info('[OH-BG] turned back on: ' + paused.map(function (e) { return e.name; }).join(', ')); } catch (_) {}
       } else done();
     });

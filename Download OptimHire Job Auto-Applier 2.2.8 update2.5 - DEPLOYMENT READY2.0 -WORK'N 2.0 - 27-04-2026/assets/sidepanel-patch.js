@@ -2670,8 +2670,8 @@
         '<button id="oh-qc-tailor" class="qc-switch" role="switch" aria-checked="false" ' +
           'title="Off: your own CV, unchanged, on every job (OptimHire\'s Optimize My Resume step is skipped). On: OptimHire\'s runs use Optimize My Resume and CSV jobs a copy of your CV ordered to the job. Workday always keeps your own CV.">' +
           '<span class="qc-switch-text"><b>Tailor CV to each job</b><small id="oh-qc-tailor-sub">Off — your own CV</small></span><span class="qc-toggle"></span></button>' +
-        '<button id="oh-qc-others" class="qc-switch" role="switch" aria-checked="true" ' +
-          'title="Other job-autofill extensions fill the same forms and undo each other. They are switched off while a run is going and back on when it ends.">' +
+        '<button id="oh-qc-others" class="qc-switch" role="switch" aria-checked="false" ' +
+          'title="Off (the default): your other extensions are left alone. On: other job-autofill extensions (they fill the same forms and undo each other) are switched off while a run is going and back on when it ends.">' +
           '<span class="qc-switch-text"><b>Pause other autofill extensions during runs</b><small id="oh-qc-others-sub">None found</small></span><span class="qc-toggle"></span></button>' +
         '<div class="qc-sep"></div>' +
         '<div id="oh-qc-truth" class="qc-foot" title="OptimHire’s ‘X applied’ counter also counts skips. This counts real submission confirmations.">Results: — submitted · — skipped</div>' +
@@ -2718,7 +2718,7 @@
       var othersLine = document.getElementById('oh-qc-others');
       if (othersLine) othersLine.addEventListener('click', function () {
         chrome.storage.local.get(['ohPauseOthers'], function (d) {
-          var on = !(d && d.ohPauseOthers !== false);   // toggle
+          var on = !(d && d.ohPauseOthers === true);   // toggle (off unless you turned it on)
           chrome.storage.local.set({ ohPauseOthers: on }, function () {
             addLog(on ? 'Other autofill extensions will be paused during runs' : 'Other autofill extensions are left alone', '');
             refresh();
@@ -2980,7 +2980,7 @@
       var row = document.getElementById('oh-qc-others'), sub = document.getElementById('oh-qc-others-sub');
       if (!row || !sub) return;
       chrome.storage.local.get(['ohPauseOthers', 'ohPausedExts'], function (d) {
-        var on = !(d && d.ohPauseOthers === false);
+        var on = !!(d && d.ohPauseOthers === true);
         row.setAttribute('aria-checked', on ? 'true' : 'false');
         var paused = (d && Array.isArray(d.ohPausedExts)) ? d.ohPausedExts : [];
         if (paused.length) { sub.textContent = 'Paused now: ' + paused.map(function (e) { return e.name; }).join(', '); return; }
@@ -2990,7 +2990,7 @@
           var names = (list || []).filter(function (e) {
             return e.id !== chrome.runtime.id && e.enabled && e.type === 'extension' && OTHER_FILLER_RE.test((e.name || '') + ' ' + (e.shortName || ''));
           }).map(function (e) { return e.name; });
-          sub.textContent = !names.length ? 'None installed' : (on ? 'Will pause: ' : 'Found: ') + names.join(', ');
+          sub.textContent = !names.length ? (on ? 'None installed' : 'Off — your extensions are left alone') : (on ? 'Will pause: ' : 'Off — left alone: ') + names.join(', ');
         });
       });
     }
