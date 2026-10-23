@@ -2670,9 +2670,6 @@
         '<button id="oh-qc-tailor" class="qc-switch" role="switch" aria-checked="false" ' +
           'title="Off: your own CV, unchanged, on every job (OptimHire\'s Optimize My Resume step is skipped). On: OptimHire\'s runs use Optimize My Resume and CSV jobs a copy of your CV ordered to the job. Workday always keeps your own CV.">' +
           '<span class="qc-switch-text"><b>Tailor CV to each job</b><small id="oh-qc-tailor-sub">Off — your own CV</small></span><span class="qc-toggle"></span></button>' +
-        '<button id="oh-qc-others" class="qc-switch" role="switch" aria-checked="false" ' +
-          'title="Off (the default): your other extensions are left alone. On: other job-autofill extensions (they fill the same forms and undo each other) are switched off while a run is going and back on when it ends.">' +
-          '<span class="qc-switch-text"><b>Pause other autofill extensions during runs</b><small id="oh-qc-others-sub">None found</small></span><span class="qc-toggle"></span></button>' +
         '<div class="qc-sep"></div>' +
         '<div id="oh-qc-truth" class="qc-foot" title="OptimHire’s ‘X applied’ counter also counts skips. This counts real submission confirmations.">Results: — submitted · — skipped</div>' +
         '<div class="qc-links">' +
@@ -2714,21 +2711,6 @@
             refresh();
           });
         });
-      });
-      var othersLine = document.getElementById('oh-qc-others');
-      if (othersLine) othersLine.addEventListener('click', function () {
-        chrome.storage.local.get(['ohPauseOthers'], function (d) {
-          var on = !(d && d.ohPauseOthers === true);   // toggle (off unless you turned it on)
-          chrome.storage.local.set({ ohPauseOthers: on }, function () {
-            addLog(on ? 'Other autofill extensions will be paused during runs' : 'Other autofill extensions are left alone', '');
-            refresh();
-          });
-        });
-      });
-      var koLine = document.getElementById('oh-qc-ko');
-      if (koLine) koLine.addEventListener('click', function () {
-        try { chrome.tabs.create({ url: chrome.runtime.getURL('tabs/jobQueue.html#knockout'), active: true }); }
-        catch (_) {}
       });
       var qaLine = document.getElementById('oh-qc-qamem');
       if (qaLine) qaLine.addEventListener('click', function () {
@@ -2974,27 +2956,6 @@
       });
     }
 
-    /* Which other autofill extensions are installed / paused right now. */
-    var OTHER_FILLER_RE = /ats ?tailor|job ?genie|simplify|jobright|speedy ?apply|lazy ?apply|auto ?fill|auto[- ]?appl|job ?assist|careerflow|huntr|job ?copilot|\bteal\b|apply ?ai|ai ?apply|jobscan|massapply|loopcv|sonara/i;
-    function paintOthers() {
-      var row = document.getElementById('oh-qc-others'), sub = document.getElementById('oh-qc-others-sub');
-      if (!row || !sub) return;
-      chrome.storage.local.get(['ohPauseOthers', 'ohPausedExts'], function (d) {
-        var on = !!(d && d.ohPauseOthers === true);
-        row.setAttribute('aria-checked', on ? 'true' : 'false');
-        var paused = (d && Array.isArray(d.ohPausedExts)) ? d.ohPausedExts : [];
-        if (paused.length) { sub.textContent = 'Paused now: ' + paused.map(function (e) { return e.name; }).join(', '); return; }
-        if (!chrome.management || !chrome.management.getAll) { sub.textContent = on ? 'On' : 'Off'; return; }
-        chrome.management.getAll(function (list) {
-          void chrome.runtime.lastError;
-          var names = (list || []).filter(function (e) {
-            return e.id !== chrome.runtime.id && e.enabled && e.type === 'extension' && OTHER_FILLER_RE.test((e.name || '') + ' ' + (e.shortName || ''));
-          }).map(function (e) { return e.name; });
-          sub.textContent = !names.length ? (on ? 'None installed' : 'Off — your extensions are left alone') : (on ? 'Will pause: ' : 'Off — left alone: ') + names.join(', ');
-        });
-      });
-    }
-
     function refresh() {
       try {
         ensureCard();
@@ -3020,7 +2981,6 @@
           try {
             var pl = document.getElementById('oh-qc-prio');
             if (pl) pl.setAttribute('aria-checked', d && d.ohPreferAts === false ? 'false' : 'true');
-            paintOthers();
             paintKo();
             var tl = document.getElementById('oh-qc-tailor'), ts = document.getElementById('oh-qc-tailor-sub');
             if (tl) tl.setAttribute('aria-checked', d && d.ohTailorCv === true ? 'true' : 'false');

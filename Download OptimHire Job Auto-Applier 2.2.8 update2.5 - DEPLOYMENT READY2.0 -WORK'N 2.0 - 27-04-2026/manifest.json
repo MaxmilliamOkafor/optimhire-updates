@@ -39,8 +39,7 @@
         "webRequest",
         "webNavigation",
         "alarms",
-        "offscreen",
-        "management"
+        "offscreen"
     ],
     "content_scripts": [
         {

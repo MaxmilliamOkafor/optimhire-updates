@@ -76,14 +76,8 @@
  *    password (or locked) — the link is opened in a background tab and your
  *    Workday password set there — and "verify your email".
  *
- * 11. Other job-autofill extensions (ATS TAILOR, Job Genie, Simplify…) are
- *    left alone unless you turn on "Pause other autofill extensions during
- *    runs" (ohPauseOthers: true, the side panel's card): then they are paused
- *    while a run is going and turned back on when it ends. What was paused is
- *    kept in storage.sync as well as storage.local — OptimHire wipes
- *    storage.local on every reload/update, which used to leave them off — and
- *    anything still paused is turned back on as soon as no run needs it
- *    (switch off, run over, browser or extension restarted).
+ * 11. (Removed: other extensions are never switched off — this extension
+ *    no longer has the "management" permission that could do it.)
  *
  * 12. The CSV Job Queue is run from here (queue-runner.js): closing the Queue
  *    Manager no longer slows a run down to one job at a time.
@@ -98,7 +92,7 @@
   'use strict';
   var KEYS = ['copilotTabId', 'isAutoProcessStartJob', 'isManuallyStartJob', 'autoApplyState',
               'ohRunStats', 'ohJobQueueActive', 'ohJobQueue', 'ohAutomationDisabled', 'ohPreferAts',
-              'ohAutoApplyEngaged', 'ohAutoApplyEngagedTs', 'ohAutoPressTs', 'preferredJobsite', 'ohWdEngineOff', 'ohPauseOthers', 'ohTailorCv'];
+              'ohAutoApplyEngaged', 'ohAutoApplyEngagedTs', 'ohAutoPressTs', 'preferredJobsite', 'ohWdEngineOff', 'ohTailorCv'];
   var state = { tab: null, live: false, loaded: false };
   var ohSuccessWatch = null;      // OptimHire's handler, once it registers it
   var registered = null;          // { fn, tab } currently registered with Chrome
@@ -205,66 +199,8 @@
     } catch (_) {}
   }
 
-  /* 11. Other autofill extensions, paused during runs — only if you turn it on. */
-  var OTHER_FILLER_RE = /ats ?tailor|job ?genie|simplify|jobright|speedy ?apply|lazy ?apply|auto ?fill|auto[- ]?appl|job ?assist|careerflow|huntr|job ?copilot|\bteal\b|apply ?ai|ai ?apply|jobscan|massapply|loopcv|sonara/i;
-  var _othersBusy = false, _othersAgain = false;
-  /* What we paused: storage.local + storage.sync (the sync copy survives OptimHire's wipe). */
-  function readPaused(cb) {
-    chrome.storage.local.get(['ohPausedExts'], function (l) {
-      var a = (l && Array.isArray(l.ohPausedExts)) ? l.ohPausedExts : [];
-      var merge = function (b) {
-        var seen = {}, all = [];
-        a.concat(b || []).forEach(function (e) { if (e && e.id && !seen[e.id]) { seen[e.id] = 1; all.push(e); } });
-        cb(all);
-      };
-      try { chrome.storage.sync.get(['ohPausedExts'], function (s2) { void chrome.runtime.lastError; merge(s2 && Array.isArray(s2.ohPausedExts) ? s2.ohPausedExts : []); }); }
-      catch (_) { merge([]); }
-    });
-  }
-  function writePaused(list, cb) {
-    chrome.storage.local.set({ ohPausedExts: list }, function () {
-      try { chrome.storage.sync.set({ ohPausedExts: list }, function () { void chrome.runtime.lastError; cb(); }); }
-      catch (_) { cb(); }
-    });
-  }
-  function syncOthers(d) {
-    var mg = chrome.management;
-    if (!mg) return;
-    if (_othersBusy) { _othersAgain = true; return; }
-    var live = !!(isLive(d) || d.ohJobQueueActive);
-    var want = live && d.ohPauseOthers === true && d.ohAutomationDisabled !== true;
-    _othersBusy = true;
-    readPaused(function (paused) {
-      var done = function () {
-        _othersBusy = false;
-        if (_othersAgain) { _othersAgain = false; syncOthers(snap); }    // a change that came in meanwhile
-      };
-      if (want && !paused.length) {
-        mg.getAll(function (list) {
-          void chrome.runtime.lastError;
-          var hit = (list || []).filter(function (e) {
-            return e.id !== chrome.runtime.id && e.enabled && e.type === 'extension' && e.mayDisable !== false &&
-                   OTHER_FILLER_RE.test((e.name || '') + ' ' + (e.shortName || ''));
-          });
-          if (!hit.length) { done(); return; }
-          /* Written down before anything is switched off, so it can always be switched back on. */
-          writePaused(hit.map(function (e) { return { id: e.id, name: e.name }; }), function () {
-            hit.forEach(function (e) { mg.setEnabled(e.id, false, function () { void chrome.runtime.lastError; }); });
-            try { console.info('[OH-BG] paused during the run: ' + hit.map(function (e) { return e.name; }).join(', ')); } catch (_) {}
-            done();
-          });
-        });
-      } else if (!want && paused.length) {
-        paused.forEach(function (e) { mg.setEnabled(e.id, true, function () { void chrome.runtime.lastError; }); });
-        writePaused([], done);
-        try { console.info('[OH-BG] turned back on: ' + paused.map(function (e) { return e.name; }).join(', ')); } catch (_) {}
-      } else done();
-    });
-  }
-
   function apply(d) {
     try { paintBadge(d); } catch (_) {}
-    try { syncOthers(d); } catch (_) {}
     var wasLive = state.live, wasTab = state.tab;
     state.tab = d.copilotTabId == null ? null : d.copilotTabId;
     state.live = isLive(d);
@@ -837,6 +773,10 @@
       return true;
     });
   } catch (_) {}
+
+  /* The removed "pause other extensions" setting and its list: gone from storage. */
+  try { chrome.storage.local.remove(['ohPauseOthers', 'ohPausedExts']); } catch (_) {}
+  try { chrome.storage.sync.remove(['ohPausedExts'], function () { void chrome.runtime.lastError; }); } catch (_) {}
 
   /* CSV queue entries that are not job links (an old import turned a scraped
      page's cells into "jobs" like https://font-semibold/) can never be
