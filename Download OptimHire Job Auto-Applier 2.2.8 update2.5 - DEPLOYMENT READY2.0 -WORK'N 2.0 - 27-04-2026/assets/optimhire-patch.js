@@ -1650,11 +1650,20 @@
       return null;
     }
 
-    /* Identify the current job so we press Apply at most once per job. */
+    /* Identify the current job so we press Apply at most once per job.
+       Not "the first h1/h2": on this page that is the fixed "Explore Our
+       Success Stories" heading, the same for every job — so after the
+       first job Apply was never pressed again, and each later job sat
+       until a timeout skipped it. The job's own title (h1.jva-job-title),
+       its company line and the "Job N of …" counter change per job. */
     function jobKey() {
       try {
-        const h = document.querySelector('h1,h2');
-        return ((h && (h.innerText || h.textContent)) || '').trim().slice(0, 120);
+        const own = el => ((el && (el.innerText || el.textContent)) || '').replace(/\s+/g, ' ').trim();
+        const title = document.querySelector('.jva-job-title') ||
+                      [...document.querySelectorAll('h1')].find(isVisible) || null;
+        const head = title && title.closest('[class*="job-head"]');
+        const counter = [...document.querySelectorAll('div,span,p')].find(e => e.children.length === 0 && /^job \d+ of\b/i.test(own(e)));
+        return [own(title), own(head && head.parentElement), own(counter)].filter(Boolean).join(' | ').slice(0, 240);
       } catch (_) { return ''; }
     }
 
