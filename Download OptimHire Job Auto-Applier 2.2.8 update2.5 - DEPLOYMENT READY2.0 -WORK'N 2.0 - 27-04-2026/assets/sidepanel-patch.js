@@ -2683,10 +2683,11 @@
       var email = (use.checked ? (profileEmail || em.value) : em.value).trim();
       var password = pw.value;
       if (email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) { say('That e-mail doesn’t look right.'); return; }
-      if (password && (password.length < 8 || !/[a-z]/.test(password) || !/[A-Z]/.test(password) || !/\d/.test(password) || !/[^A-Za-z0-9]/.test(password))) {
-        say('Password needs 8+ characters with upper, lower, a number and a symbol (Workday’s rule).');
-        return;
-      }
+      /* A password Workday would refuse is not saved — but the e-mail still is (a refused
+         password used to stop the e-mail being saved too, and every account page then said
+         "Add your email"). */
+      var weak = password && (password.length < 8 || !/[a-z]/.test(password) || !/[A-Z]/.test(password) || !/\d/.test(password) || !/[^A-Za-z0-9]/.test(password));
+      if (weak) password = '';
       chrome.storage.local.get(['ohWorkdayLogin'], function (d) {
         var login = Object.assign({ sites: {} }, (d && d.ohWorkdayLogin) || {});
         if (password && login.password && login.password !== password) {
@@ -2699,7 +2700,10 @@
         var patch = { ohWorkdayLogin: login, ohAppAccountUseProfile: use.checked };
         if (email) patch.appAccountEmail = email;
         if (password) patch.appAccountPassword = password;
-        chrome.storage.local.set(patch, function () { say(why || 'Saved'); });
+        chrome.storage.local.set(patch, function () {
+          say(weak ? 'E-mail saved. Password NOT saved: Workday needs 8+ characters with upper, lower, a number and a symbol.'
+                   : (why || 'Saved') + (email ? ' — ' + email : ''));
+        });
       });
     }
     use.addEventListener('change', function () {

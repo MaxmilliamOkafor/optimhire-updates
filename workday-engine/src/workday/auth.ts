@@ -229,7 +229,7 @@ export async function handleCreateAccount(ctx: Ctx): Promise<void> {
   if (ctx.run.createAttempts >= 2) throw new NeedsHuman("Account creation failed twice. Finish it yourself, then click Resume.");
 
   const email = ctx.profile.personal.email || creds.master?.email || typedEmail();
-  if (!email) throw new NeedsHuman("Add your email to the Workday profile (Settings) first.");
+  if (!email) throw new NeedsHuman("No e-mail to create the account with: open the side panel → Job Queue card → Applications Account, untick \"Use profile email\", type your e-mail (it saves when you leave the box), then click Resume.");
 
   let password: string;
   if (ctx.settings.useMasterPassword && creds.master) {
