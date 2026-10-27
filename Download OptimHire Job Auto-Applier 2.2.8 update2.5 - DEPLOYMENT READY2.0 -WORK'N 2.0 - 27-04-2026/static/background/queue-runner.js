@@ -24,6 +24,14 @@
     conc: 'ohJobQueueConcurrency', adv: 'ohJobQueueAdvanceReq', tabs: 'ohQueueTabs', prefer: 'ohPreferAts', owner: 'ohJobQueueOwnerTab',
   };
   var MAX_OPEN_ATTEMPTS = 3;
+  /* Backstop, checked every minute: a job still "running" this long after its tab opened has its
+     tab closed, is marked failed and the next job opens. The job page's own limits (3 min, 8 on
+     Workday) normally end it first, but only while its script runs on a page that still matches
+     the CSV link: after a redirect (Citi → Workday, a board → the company site), a login wall, an
+     error page or a hung tab, nothing ended the job and the queue stood still. */
+  var JOB_HARD_CAP_MS = 6 * 60 * 1000;
+  var WD_JOB_HARD_CAP_MS = 14 * 60 * 1000;
+  var WD_URL_RE = /myworkday(jobs|site)?\.com|workdayjobs\.com|\.workday\.com/i;
   var MAX_CONCURRENCY = 8;
   var TERMINAL = { applied: 1, failed: 1, skipped: 1 };
   var ALARM = 'ohQueueBeat';
@@ -130,6 +138,23 @@
     var conc = Math.min(MAX_CONCURRENCY, Math.max(1, parseInt(d[K.conc], 10) || 1));
     var map = await liveTabs(d[K.tabs] || {});
     var changes = {}, now = Date.now();
+    for (var si = 0; si < q.length; si++) {
+      var sj = q[si];
+      if (sj.status !== 'running' || !(sj.id in map) || !sj.lastActionTs) continue;
+      var cap = WD_URL_RE.test(String(sj.url || '')) ? WD_JOB_HARD_CAP_MS : JOB_HARD_CAP_MS;
+      if (now - sj.lastActionTs < cap) continue;
+      var stuckTab = map[sj.id];
+      var mins = Math.round((now - sj.lastActionTs) / 60000);
+      log('timed out after ' + mins + ' min, moving on: ' + (sj.title || sj.url));
+      changes[sj.id] = { status: 'failed', lastError: 'timed out after ' + mins + ' min with no result from the job page', lastActionTs: now };
+      sj.status = 'failed';
+      delete map[sj.id];
+      if (stuckTab != null && stuckTab !== -1) {
+        await releaseFocus(stuckTab);
+        chrome.tabs.remove(stuckTab, function () { void chrome.runtime.lastError; });
+      }
+    }
+    if (Object.keys(changes).length) await set({ [K.tabs]: map });
     q.forEach(function (j) {
       /* "running" with no tab: its tab was lost (closed, crashed) — back in line. */
       if (j.status === 'running' && !(j.id in map)) { changes[j.id] = { status: 'pending' }; j.status = 'pending'; }
