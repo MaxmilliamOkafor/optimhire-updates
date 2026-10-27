@@ -2901,6 +2901,19 @@ OPTIONS: ${JSON.stringify(options.slice(0, 150))}`
     const r = crypto.getRandomValues(new Uint32Array(12));
     return "Oh" + Array.from(r, (n) => abc[n % abc.length]).join("") + "!7q";
   }
+  function anyEmail(o, depth = 0) {
+    if (!o || typeof o !== "object" || depth > 3) return "";
+    const keys = Object.keys(o).sort((a, b) => Number(/email/i.test(b)) - Number(/email/i.test(a)));
+    for (const k of keys) {
+      const v = o[k];
+      if (typeof v === "string" && /email/i.test(k) && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(v.trim())) return v.trim();
+      if (v && typeof v === "object") {
+        const f = anyEmail(v, depth + 1);
+        if (f) return f;
+      }
+    }
+    return "";
+  }
   async function workdayLogin() {
     const d = await ST.get([LOGIN_KEY, "appAccountEmail", "appAccountPassword", "ohGmailCodes"]);
     const login = Object.assign({ sites: {} }, d[LOGIN_KEY] || {});
@@ -2908,7 +2921,8 @@ OPTIONS: ${JSON.stringify(options.slice(0, 150))}`
       login.password = d.appAccountPassword || makePassword();
       await ST.set({ [LOGIN_KEY]: login });
     }
-    let email = login.email || d.appAccountEmail || (await profileSources()).email || "";
+    const src = await profileSources();
+    let email = login.email || d.appAccountEmail || src.email || anyEmail(src) || "";
     if (!email) {
       const box = document.querySelector('[data-automation-id="email"], input[type="email"]');
       const typed = (box?.value || "").trim();
@@ -3250,7 +3264,7 @@ OPTIONS: ${JSON.stringify(options.slice(0, 150))}`
         firstName: pick(s, "first_name", "firstName", "given_name"),
         lastName: pick(s, "last_name", "lastName", "family_name", "surname"),
         preferredName: "",
-        email: pick(s, "email", "email_address", "emailAddress"),
+        email: pick(s, "email", "email_address", "emailAddress") || anyEmail(s),
         phone: { countryName: DIAL[code] || country, countryCode: code ? `+${code}` : "", number: num, deviceType: "Mobile" },
         address: {
           line1: pick(s, "street", "address_line1", "address1", "street_address") || pick(s, "address").split(",")[0] || "",

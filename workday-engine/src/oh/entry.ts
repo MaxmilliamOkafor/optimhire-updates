@@ -140,6 +140,21 @@ function makePassword(): string {
   return "Oh" + Array.from(r, (n) => abc[n % abc.length]).join("") + "!7q";
 }
 
+/** Your e-mail wherever OptimHire keeps it: any field named "…email…" holding an address. */
+function anyEmail(o: Any, depth = 0): string {
+  if (!o || typeof o !== "object" || depth > 3) return "";
+  const keys = Object.keys(o).sort((a, b) => Number(/email/i.test(b)) - Number(/email/i.test(a)));
+  for (const k of keys) {
+    const v = o[k];
+    if (typeof v === "string" && /email/i.test(k) && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(v.trim())) return v.trim();
+    if (v && typeof v === "object") {
+      const f = anyEmail(v, depth + 1);
+      if (f) return f;
+    }
+  }
+  return "";
+}
+
 /** One e-mail + password for every Workday site (ohWorkdayLogin), made once and kept. */
 async function workdayLogin(): Promise<{ email: string; password: string; login: Any; d: Any }> {
   const d = await ST.get([LOGIN_KEY, "appAccountEmail", "appAccountPassword", "ohGmailCodes"]);
@@ -148,7 +163,8 @@ async function workdayLogin(): Promise<{ email: string; password: string; login:
     login.password = d.appAccountPassword || makePassword();
     await ST.set({ [LOGIN_KEY]: login });
   }
-  let email = login.email || d.appAccountEmail || (await profileSources()).email || "";
+  const src = await profileSources();
+  let email = login.email || d.appAccountEmail || src.email || anyEmail(src) || "";
   // A fresh install has no saved login e-mail yet: the address in the form's email box becomes it,
   // and is SAVED, so every later job and employer signs in with it.
   if (!email) {
@@ -477,7 +493,7 @@ async function buildProfile(ad?: Any, cvUrl = ""): Promise<Profile> {
       firstName: pick(s, "first_name", "firstName", "given_name"),
       lastName: pick(s, "last_name", "lastName", "family_name", "surname"),
       preferredName: "",
-      email: pick(s, "email", "email_address", "emailAddress"),
+      email: pick(s, "email", "email_address", "emailAddress") || anyEmail(s),
       phone: { countryName: DIAL[code] || country, countryCode: code ? `+${code}` : "", number: num, deviceType: "Mobile" },
       address: {
         line1: pick(s, "street", "address_line1", "address1", "street_address") || pick(s, "address").split(",")[0] || "",
