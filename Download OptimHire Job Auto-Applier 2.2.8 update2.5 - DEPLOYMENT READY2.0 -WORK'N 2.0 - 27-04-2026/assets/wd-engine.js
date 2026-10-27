@@ -113,6 +113,21 @@
     "申请已提交",
     "感谢您的申请"
   ]);
+  var ALREADY_APPLIED_RX = rx([
+    "(you'?ve|you have) already applied",
+    "already applied (for|to) this (job|position|role)",
+    "already submitted an application",
+    "bereits (beworben|eine bewerbung)",
+    "déjà postulé",
+    "ya (te has|se ha) postulado",
+    "ya has aplicado",
+    "já se candidatou",
+    "già candidato",
+    "al gesolliciteerd",
+    "już aplikowałeś",
+    "既に応募",
+    "已申请"
+  ]);
   var VERIFY_EMAIL_RX = rx([
     "verify your (email|account)",
     "verification (email|link)",
@@ -855,6 +870,20 @@
     await humanClick(match);
     await sleep(120);
     await waitStable(250, 4e3);
+    if (dropdownValue(target)) return true;
+    const idx = opts.indexOf(match);
+    btn.focus();
+    if (!openListbox(btn)) btn.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowDown", code: "ArrowDown", keyCode: 40, bubbles: true }));
+    await sleep(150);
+    const list2 = openListbox(btn);
+    if (!list2) return false;
+    for (let i = 0; i <= idx; i++) {
+      (document.activeElement ?? btn).dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowDown", code: "ArrowDown", keyCode: 40, bubbles: true }));
+      await sleep(30);
+    }
+    (document.activeElement ?? btn).dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", code: "Enter", keyCode: 13, bubbles: true }));
+    await sleep(150);
+    await waitStable(250, 4e3);
     return !!dropdownValue(target);
   }
   function dropdownOptions(btn) {
@@ -876,6 +905,10 @@
   function visibleOptions() {
     return qa(sel("promptOption")).filter(isVisible);
   }
+  async function searchSettled() {
+    await waitFor(() => !qa(sel("spinner")).some(isVisible), 6e3, 100).catch(() => null);
+    await sleep(120);
+  }
   async function multiselectPick(target, wanted, opts = {}) {
     const min = opts.min ?? 0.6;
     if (multiselectSelected(target).some((s) => similarity(wanted, s) >= 0.85)) return true;
@@ -886,6 +919,7 @@
     input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", code: "Enter", keyCode: 13, bubbles: true }));
     await sleep(250);
     for (let depth = 0; depth < 3; depth++) {
+      await searchSettled();
       const options = await waitFor(() => {
         const o = visibleOptions();
         return o.length ? o : null;
@@ -905,6 +939,14 @@
     blur(input);
     await sleep(80);
     return multiselectSelected(target).some((s) => similarity(wanted, s) >= 0.6);
+  }
+  function searchVariants(value) {
+    const out = [value];
+    const paren = value.match(/^(.*?)\s*\(([^)]+)\)\s*$/);
+    if (paren) out.push(paren[2], paren[1]);
+    const first = value.split(/[\s/,&-]+/).find((w) => w.length > 2);
+    if (first && first !== value) out.push(first);
+    return [...new Set(out.map((v) => v.trim()).filter(Boolean))];
   }
   function radios(target) {
     return qa('input[type="radio"], [role="radio"]', target);
@@ -992,7 +1034,8 @@
     if (day && d) ok = await setSegment(day, d) && ok;
     if (year && y) ok = await setSegment(year, y) && ok;
     if (!month && !year) {
-      return setText(target, [m, d, y].filter(Boolean).join("/"));
+      const parts = [m, d, y].filter(Boolean);
+      return await setText(target, parts.join("")) || setText(target, parts.join("/"));
     }
     if (year) blur(year);
     return ok;
@@ -1905,10 +1948,20 @@ OPTIONS: ${JSON.stringify(options.slice(0, 150))}`
     if (sourceEl) {
       const c = containerOf(sourceEl);
       handled.add(c);
-      if (!readValue(c) && ctx.profile.answers.source) {
+      const want = ctx.profile.answers.source;
+      if (!readValue(c) && want) {
         await pace(ctx);
-        const ok = await multiselectPick(c, ctx.profile.answers.source) || await selectDropdown(c, ctx.profile.answers.source);
-        if (!ok && isRequired(c)) ctx.flag(labelOf(c) || "How did you hear about us", `No option like "${ctx.profile.answers.source}"`);
+        let ok = await multiselectPick(c, want) || await selectDropdown(c, want);
+        for (const folder of ["Social Media", "Social Network", "Job Board", "Online Job Board", "Internet", "Website"]) {
+          if (ok) break;
+          if (kindOf(c) === "multiselect" && await multiselectPick(c, folder, { min: 0.7 })) {
+            ok = true;
+            break;
+          }
+          ok = await selectDropdown(c, folder, 0.7);
+        }
+        if (ok) ctx.log(`How did you hear → ${readValue(c) || want}`);
+        else if (isRequired(c)) ctx.flag(labelOf(c) || "How did you hear about us", `No option like "${want}"`);
       }
     }
     const prev = field("previousWorker");
@@ -1917,7 +1970,17 @@ OPTIONS: ${JSON.stringify(options.slice(0, 150))}`
       handled.add(c);
       if (!readValue(c)) await selectRadio(c, ctx.profile.answers.previouslyWorkedHere ? "Yes" : "No");
     }
-    if (await fill(ctx, "country", me.address.country)) await waitStable(500, 8e3);
+    const countryEl = field("country");
+    const shown = countryEl ? readValue(containerOf(countryEl)) : "";
+    if (countryEl && shown && me.address.country && similarity(shown, me.address.country) < 0.85) {
+      const c = containerOf(countryEl);
+      handled.add(c);
+      await pace(ctx);
+      if (await writeValue(c, me.address.country).catch(() => false)) {
+        ctx.log(`Country was "${shown}" — set to ${me.address.country}`);
+        await waitStable(500, 8e3);
+      } else if (isRequired(c)) ctx.flag(labelOf(c) || "Country", `Shows "${shown}", couldn't set "${me.address.country}"`);
+    } else if (await fill(ctx, "country", me.address.country)) await waitStable(500, 8e3);
     await fill(ctx, "firstName", me.firstName);
     await fill(ctx, "lastName", me.lastName);
     if (me.preferredName && me.preferredName !== me.firstName) {
@@ -1944,7 +2007,10 @@ OPTIONS: ${JSON.stringify(options.slice(0, 150))}`
         if (!ok) ctx.flag("Country Phone Code", `No option like "${want}"`);
       }
     }
-    await fill(ctx, "phoneNumber", me.phone.number.replace(/^\+\d+\s*/, ""));
+    const dial = me.phone.countryCode.replace(/\D/g, "");
+    let national = me.phone.number.replace(/\D/g, "");
+    if (dial && me.phone.number.trim().startsWith("+") && national.startsWith(dial)) national = national.slice(dial.length);
+    await fill(ctx, "phoneNumber", national.replace(/^0+/, ""));
     const email = field("email");
     if (email && !readValue(containerOf(email))) await fill(ctx, "email", me.email);
   }
@@ -2098,7 +2164,12 @@ OPTIONS: ${JSON.stringify(options.slice(0, 150))}`
       for (const s of list) {
         if (multiselectSelected(c).some((x) => similarity(x, s) >= 0.85)) continue;
         await pace(ctx);
-        if (await multiselectPick(c, s, { min: 0.75 })) added++;
+        for (const v of searchVariants(s)) {
+          if (await multiselectPick(c, v, { min: 0.75 })) {
+            added++;
+            break;
+          }
+        }
       }
       ctx.log(`Skills: ${added} added`);
     }
@@ -2154,7 +2225,20 @@ OPTIONS: ${JSON.stringify(options.slice(0, 150))}`
       if (ctx.settings.consentDisclosureTerms) await setCheckbox(c, true);
       else if (readValue(c) !== "true") ctx.flag("Terms and conditions", "Your consent is required — tick it yourself or allow it once in settings");
     }
+    for (const c of qa('[data-automation-id^="formField-"]').filter(isVisible)) {
+      if (handled.has(c) || kindOf(c) !== "checkbox" || !isRequired(c) || readValue(c) === "true") continue;
+      const label = labelOf(c) || text(c);
+      if (!CONSENT_RX.test(label) || /marketing|newsletter|talent community|job alerts?|future (vacancies|opportunities)|text message|sms/i.test(label)) continue;
+      handled.add(c);
+      if (!ctx.settings.consentDisclosureTerms) {
+        ctx.flag(label.slice(0, 80), "Your consent is required — tick it yourself or allow it once in settings");
+        continue;
+      }
+      if (await setCheckbox(c, true)) ctx.log(`Ticked required consent: ${label.slice(0, 80)}`);
+      else ctx.flag(label.slice(0, 80), "Couldn't tick the required consent box");
+    }
   }
+  var CONSENT_RX = /i have read|acknowledge|consent|i agree|i accept|privacy (statement|notice|policy)|terms and conditions|ich (habe|stimme|akzeptiere)|j'ai lu|j'accepte|he leído|acepto|li e (aceito|concordo)|ho letto|accetto|ik heb gelezen|ik ga akkoord|przeczytałem|akceptuję/iu;
   async function selfIdentify(ctx) {
     const name = `${ctx.profile.personal.firstName} ${ctx.profile.personal.lastName}`.trim();
     await fill(ctx, "selfIdName", name);
@@ -2484,6 +2568,9 @@ OPTIONS: ${JSON.stringify(options.slice(0, 150))}`
   var ASSIST_PAGES = ["resumeUpload", "myInformation", "myExperience", "questions", "voluntaryDisclosures", "selfIdentify"];
   async function handlePage(ctx, page) {
     if (hooks.advance && !hooks.advance() && !ASSIST_PAGES.includes(page)) return "stop";
+    if (["jobPosting", "applyMethod", "candidateHome", "unknown"].includes(page) && ALREADY_APPLIED_RX.test(text(document.body).slice(0, 6e3))) {
+      throw new NeedsHuman("You have already applied to this job (Workday allows one application per job).");
+    }
     switch (page) {
       case "jobPosting": {
         if (ctx.job) chrome.runtime.sendMessage({ type: "wd:jobCaptured", job: ctx.job }).catch(() => {
@@ -3378,7 +3465,7 @@ OPTIONS: ${JSON.stringify(options.slice(0, 150))}`
     let errorType = "failure";
     let missingQuestions = [];
     if (/captcha/i.test(reason)) errorType = "captcha";
-    else if (/no apply button|may be closed/i.test(reason)) errorType = "jobClosed";
+    else if (/no apply button|may be closed|already applied/i.test(reason)) errorType = "jobClosed";
     else if (run.flags.length) {
       errorType = "missing-questions";
       missingQuestions = run.flags.map((f) => ({ question: f.label, name: f.label, reason: f.reason }));

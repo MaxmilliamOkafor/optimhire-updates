@@ -26,6 +26,7 @@ import {
   multiselectSelected,
   optionsOf,
   readValue,
+  searchVariants,
   selectDropdown,
   selectRadio,
   setCheckbox,
@@ -219,10 +220,22 @@ export async function myInformation(ctx: Ctx): Promise<void> {
   if (sourceEl) {
     const c = containerOf(sourceEl);
     handled.add(c);
-    if (!readValue(c) && ctx.profile.answers.source) {
+    const want = ctx.profile.answers.source;
+    if (!readValue(c) && want) {
       await pace(ctx);
-      const ok = (await multiselectPick(c, ctx.profile.answers.source)) || (await selectDropdown(c, ctx.profile.answers.source));
-      if (!ok && isRequired(c)) ctx.flag(labelOf(c) || "How did you hear about us", `No option like "${ctx.profile.answers.source}"`);
+      let ok = (await multiselectPick(c, want)) || (await selectDropdown(c, want));
+      // Folder-style lists (Mastercard, Workday): the site sits under a category — open it, then
+      // pick the site; else the category itself ("LinkedIn, else Job Board").
+      for (const folder of ["Social Media", "Social Network", "Job Board", "Online Job Board", "Internet", "Website"]) {
+        if (ok) break;
+        if (kindOf(c) === "multiselect" && (await multiselectPick(c, folder, { min: 0.7 }))) {
+          ok = true;
+          break;
+        }
+        ok = await selectDropdown(c, folder, 0.7);
+      }
+      if (ok) ctx.log(`How did you hear → ${readValue(c) || want}`);
+      else if (isRequired(c)) ctx.flag(labelOf(c) || "How did you hear about us", `No option like "${want}"`);
     }
   }
   const prev = field("previousWorker");
@@ -232,8 +245,19 @@ export async function myInformation(ctx: Ctx): Promise<void> {
     if (!readValue(c)) await selectRadio(c, ctx.profile.answers.previouslyWorkedHere ? "Yes" : "No");
   }
 
-  // Country first: it re-renders the address and phone fields.
-  if (await fill(ctx, "country", me.address.country)) await waitStable(500, 8000);
+  // Country first: it re-renders the address and phone fields. Some tenants pre-select
+  // "United States of America": a different country is corrected even when existing values are kept.
+  const countryEl = field("country");
+  const shown = countryEl ? readValue(containerOf(countryEl)) : "";
+  if (countryEl && shown && me.address.country && similarity(shown, me.address.country) < 0.85) {
+    const c = containerOf(countryEl);
+    handled.add(c);
+    await pace(ctx);
+    if (await writeValue(c, me.address.country).catch(() => false)) {
+      ctx.log(`Country was "${shown}" — set to ${me.address.country}`);
+      await waitStable(500, 8000);
+    } else if (isRequired(c)) ctx.flag(labelOf(c) || "Country", `Shows "${shown}", couldn't set "${me.address.country}"`);
+  } else if (await fill(ctx, "country", me.address.country)) await waitStable(500, 8000);
 
   await fill(ctx, "firstName", me.firstName);
   await fill(ctx, "lastName", me.lastName);
@@ -262,7 +286,11 @@ export async function myInformation(ctx: Ctx): Promise<void> {
       if (!ok) ctx.flag("Country Phone Code", `No option like "${want}"`);
     }
   }
-  await fill(ctx, "phoneNumber", me.phone.number.replace(/^\+\d+\s*/, ""));
+  // Workday wants the national number: no country code, no spaces, no leading 0 (874261508 with +353).
+  const dial = me.phone.countryCode.replace(/\D/g, "");
+  let national = me.phone.number.replace(/\D/g, "");
+  if (dial && me.phone.number.trim().startsWith("+") && national.startsWith(dial)) national = national.slice(dial.length);
+  await fill(ctx, "phoneNumber", national.replace(/^0+/, ""));
   const email = field("email");
   if (email && !readValue(containerOf(email))) await fill(ctx, "email", me.email);
 }
@@ -431,7 +459,13 @@ export async function myExperience(ctx: Ctx): Promise<void> {
     for (const s of list) {
       if (multiselectSelected(c).some((x) => similarity(x, s) >= 0.85)) continue;
       await pace(ctx);
-      if (await multiselectPick(c, s, { min: 0.75 })) added++;
+      // A slow or empty result list: try the shorter forms (AWS for "Amazon Web Services (AWS)").
+      for (const v of searchVariants(s)) {
+        if (await multiselectPick(c, v, { min: 0.75 })) {
+          added++;
+          break;
+        }
+      }
     }
     ctx.log(`Skills: ${added} added`);
   }
@@ -497,7 +531,23 @@ export async function voluntaryDisclosures(ctx: Ctx): Promise<void> {
     if (ctx.settings.consentDisclosureTerms) await setCheckbox(c, true);
     else if (readValue(c) !== "true") ctx.flag("Terms and conditions", "Your consent is required — tick it yourself or allow it once in settings");
   }
+  // Other REQUIRED consent ticks on this page ("Yes, I have read and acknowledge … Candidate Privacy
+  // Statement", "I have read and consent to the above terms"). Optional opt-ins stay unticked.
+  for (const c of qa('[data-automation-id^="formField-"]').filter(isVisible)) {
+    if (handled.has(c) || kindOf(c) !== "checkbox" || !isRequired(c) || readValue(c) === "true") continue;
+    const label = labelOf(c) || text(c);
+    if (!CONSENT_RX.test(label) || /marketing|newsletter|talent community|job alerts?|future (vacancies|opportunities)|text message|sms/i.test(label)) continue;
+    handled.add(c);
+    if (!ctx.settings.consentDisclosureTerms) {
+      ctx.flag(label.slice(0, 80), "Your consent is required — tick it yourself or allow it once in settings");
+      continue;
+    }
+    if (await setCheckbox(c, true)) ctx.log(`Ticked required consent: ${label.slice(0, 80)}`);
+    else ctx.flag(label.slice(0, 80), "Couldn't tick the required consent box");
+  }
 }
+
+const CONSENT_RX = /i have read|acknowledge|consent|i agree|i accept|privacy (statement|notice|policy)|terms and conditions|ich (habe|stimme|akzeptiere)|j'ai lu|j'accepte|he leído|acepto|li e (aceito|concordo)|ho letto|accetto|ik heb gelezen|ik ga akkoord|przeczytałem|akceptuję/iu;
 
 /* ---------------- Self Identify (disability, CC-305) ---------------- */
 

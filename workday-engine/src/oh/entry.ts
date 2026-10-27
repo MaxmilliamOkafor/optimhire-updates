@@ -719,7 +719,7 @@ async function finish(mode: Mode, run: RunState, outcome: Outcome) {
   let errorType = "failure";
   let missingQuestions: Any[] = [];
   if (/captcha/i.test(reason)) errorType = "captcha";
-  else if (/no apply button|may be closed/i.test(reason)) errorType = "jobClosed";
+  else if (/no apply button|may be closed|already applied/i.test(reason)) errorType = "jobClosed"; // skipped, never retried
   else if (run.flags.length) {
     errorType = "missing-questions";
     missingQuestions = run.flags.map((f) => ({ question: f.label, name: f.label, reason: f.reason }));

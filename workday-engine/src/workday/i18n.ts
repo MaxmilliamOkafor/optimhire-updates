@@ -69,6 +69,13 @@ export const SUBMITTED_RX = rx([
   "応募が完了", "ご応募ありがとう", "申请已提交", "感谢您的申请",
 ]);
 
+/** Workday blocks a second application to the same job ("You've already applied for this job"). */
+export const ALREADY_APPLIED_RX = rx([
+  "(you'?ve|you have) already applied", "already applied (for|to) this (job|position|role)", "already submitted an application",
+  "bereits (beworben|eine bewerbung)", "déjà postulé", "ya (te has|se ha) postulado", "ya has aplicado", "já se candidatou",
+  "già candidato", "al gesolliciteerd", "już aplikowałeś", "既に応募", "已申请",
+]);
+
 export const VERIFY_EMAIL_RX = rx([
   "verify your (email|account)", "verification (email|link)", "check your (email|inbox)", "activate your account",
   "e-?mail(-adresse)? (bestätigen|verifizieren)", "bestätigungs-?e-?mail", "konto aktivieren",

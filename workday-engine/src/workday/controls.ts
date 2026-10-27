@@ -158,6 +158,21 @@ export async function selectDropdown(target: HTMLElement, wanted: string, min = 
   await humanClick(match);
   await sleep(120);
   await waitStable(250, 4000);
+  if (dropdownValue(target)) return true;
+  // Some tenants ignore the option click: focus the box, Down arrow to the option, Enter.
+  const idx = opts.indexOf(match);
+  btn.focus();
+  if (!openListbox(btn)) btn.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowDown", code: "ArrowDown", keyCode: 40, bubbles: true }));
+  await sleep(150);
+  const list2 = openListbox(btn);
+  if (!list2) return false;
+  for (let i = 0; i <= idx; i++) {
+    (document.activeElement ?? btn).dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowDown", code: "ArrowDown", keyCode: 40, bubbles: true }));
+    await sleep(30);
+  }
+  (document.activeElement ?? btn).dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", code: "Enter", keyCode: 13, bubbles: true }));
+  await sleep(150);
+  await waitStable(250, 4000);
   return !!dropdownValue(target);
 }
 
@@ -185,6 +200,12 @@ function visibleOptions(): HTMLElement[] {
   return qa(sel("promptOption")).filter(isVisible);
 }
 
+/** Search results still loading (spinner shown): picking now takes a stale option or nothing. */
+async function searchSettled(): Promise<void> {
+  await waitFor(() => !qa(sel("spinner")).some(isVisible), 6000, 100).catch(() => null);
+  await sleep(120);
+}
+
 /**
  * Multiselect with search (source, skills, phone code, school, field of
  * study, ethnicity). Hierarchical prompts are walked one level at a time.
@@ -199,6 +220,7 @@ export async function multiselectPick(target: HTMLElement, wanted: string, opts:
   input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", code: "Enter", keyCode: 13, bubbles: true }));
   await sleep(250);
   for (let depth = 0; depth < 3; depth++) {
+    await searchSettled();
     const options = await waitFor(() => {
       const o = visibleOptions();
       return o.length ? o : null;
@@ -219,6 +241,19 @@ export async function multiselectPick(target: HTMLElement, wanted: string, opts:
   blur(input);
   await sleep(80);
   return multiselectSelected(target).some((s) => similarity(wanted, s) >= 0.6);
+}
+
+/**
+ * Shorter searches for a value the tenant's list doesn't match as typed:
+ * "Amazon Web Services (AWS)" → "AWS" / "Amazon Web Services", "Incident Management" → "Incident".
+ */
+export function searchVariants(value: string): string[] {
+  const out = [value];
+  const paren = value.match(/^(.*?)\s*\(([^)]+)\)\s*$/);
+  if (paren) out.push(paren[2], paren[1]);
+  const first = value.split(/[\s/,&-]+/).find((w) => w.length > 2);
+  if (first && first !== value) out.push(first);
+  return [...new Set(out.map((v) => v.trim()).filter(Boolean))];
 }
 
 function radios(target: HTMLElement): HTMLElement[] {
@@ -323,8 +358,10 @@ export async function setDate(target: HTMLElement, ym: string): Promise<boolean>
   if (day && d) ok = (await setSegment(day, d)) && ok;
   if (year && y) ok = (await setSegment(year, y)) && ok;
   if (!month && !year) {
-    // Plain text date field fallback (MM/YYYY or MM/DD/YYYY).
-    return setText(target, [m, d, y].filter(Boolean).join("/"));
+    // Plain text date field fallback. Workday auto-inserts the slash: typing "12/" gives
+    // "Invalid Date", so digits only first (012023), with slashes only if that doesn't stick.
+    const parts = [m, d, y].filter(Boolean);
+    return (await setText(target, parts.join(""))) || setText(target, parts.join("/"));
   }
   if (year) blur(year);
   return ok;
