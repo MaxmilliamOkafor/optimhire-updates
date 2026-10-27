@@ -738,7 +738,12 @@ async function startFromOptimHire(msg: Any): Promise<void> {
   const ad: Any = msg.applicationDetails || {};
   let ci: Any = msg.complexInstructions;
   if (typeof ci === "string") ci = parse(ci);
-  const mode: Mode = { auto: true, submit: true, startedAt: Date.now(), jobId: String(ad.copilot_job_id || ad.application_id || "") };
+  // OptimHire 2.10.0's "Autofill Application" button on a job page (pageAutofillApplicationId):
+  // a job you picked to fill and check yourself — filled, then left on Review, never submitted.
+  const { pageAutofillApplicationId: pageFill } = await ST.get("pageAutofillApplicationId");
+  const pageOnly = !!pageFill && String(pageFill) === String(ad.application_id ?? "");
+  if (pageOnly) say("page autofill: filling this job and stopping on Review for you");
+  const mode: Mode = { auto: true, submit: !pageOnly, startedAt: Date.now(), jobId: String(ad.copilot_job_id || ad.application_id || "") };
   writeMode(mode);
   answerCache.clear();
   for (let i = 0; i < 40 && !hasWorkdayApp(); i++) await new Promise((r) => setTimeout(r, 500));   // the app may still be rendering

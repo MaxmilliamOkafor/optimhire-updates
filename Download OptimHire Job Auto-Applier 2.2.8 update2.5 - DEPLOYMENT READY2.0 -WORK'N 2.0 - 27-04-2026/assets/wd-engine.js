@@ -3487,7 +3487,10 @@ OPTIONS: ${JSON.stringify(options.slice(0, 150))}`
     const ad = msg.applicationDetails || {};
     let ci = msg.complexInstructions;
     if (typeof ci === "string") ci = parse(ci);
-    const mode = { auto: true, submit: true, startedAt: Date.now(), jobId: String(ad.copilot_job_id || ad.application_id || "") };
+    const { pageAutofillApplicationId: pageFill } = await ST.get("pageAutofillApplicationId");
+    const pageOnly = !!pageFill && String(pageFill) === String(ad.application_id ?? "");
+    if (pageOnly) say("page autofill: filling this job and stopping on Review for you");
+    const mode = { auto: true, submit: !pageOnly, startedAt: Date.now(), jobId: String(ad.copilot_job_id || ad.application_id || "") };
     writeMode(mode);
     answerCache.clear();
     for (let i = 0; i < 40 && !hasWorkdayApp(); i++) await new Promise((r) => setTimeout(r, 500));

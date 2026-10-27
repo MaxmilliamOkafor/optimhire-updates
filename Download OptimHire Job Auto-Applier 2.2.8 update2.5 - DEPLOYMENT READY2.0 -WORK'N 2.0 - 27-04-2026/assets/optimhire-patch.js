@@ -236,10 +236,30 @@
 
   /* May we take ACTION (click Apply, submit a form, skip a job)?
      `d` is a storage snapshot containing the keys below. */
+  /* OptimHire 2.10.0's "Autofill Application" button on a job page: it
+     fills that one job for you to check (it says "please review and
+     submit"), and marks it with pageAutofillApplicationId. Its run looks
+     like any other, so our flow pressed "SUBMIT APPLICATION" by itself
+     (seen live on Lever). That job is filled, never submitted or skipped. */
+  function isPageAutofillJob(d) {
+    const want = d && d.pageAutofillApplicationId;
+    if (!want) return false;
+    for (const k of ['complexFormData', 'manualApplicationDetail']) {
+      try {
+        let v = d[k];
+        if (typeof v === 'string') v = JSON.parse(v);
+        const ad = v && (v.applicationDetails || v);
+        if (ad && ad.application_id != null && String(ad.application_id) === String(want)) return true;
+      } catch (_) {}
+    }
+    return false;
+  }
+
   function mayAutomate(d) {
     if (!d) return false;
     if (d.ohAutomationDisabled === true) return false;          // master OFF
     if (notTheJobTab(d)) return false;                          // another tab is the job tab
+    if (isPageAutofillJob(d)) return false;                     // you review and submit this one
     const st = d.autoApplyState;
     if (st && st.isActive === true) return true;                // live session
     if (d.isAutoProcessStartJob) return true;                   // live session
@@ -253,7 +273,8 @@
     return false;
   }
   const AUTOMATION_KEYS = ['autoApplyState', 'isAutoProcessStartJob', 'isManuallyStartJob', 'ohJobQueueActive',
-                           'ohAutoApplyEngaged', 'ohAutoApplyEngagedTs', 'ohAutomationDisabled', 'ohJobTab'];
+                           'ohAutoApplyEngaged', 'ohAutoApplyEngagedTs', 'ohAutomationDisabled', 'ohJobTab',
+                           'pageAutofillApplicationId', 'complexFormData', 'manualApplicationDetail'];
 
   /* ── Idle governor (CRITICAL for CPU) ────────────────────────────────
    * This file installs ~22 polling loops and ~14 subtree
@@ -883,7 +904,8 @@
          terminal-submit (T43) bails on its very first line when
          automation is inactive, the run sat on "Review and submit the
          form" waiting for a human click. */
-      const active = (!!csvActiveJobId || isRunning || mayAutomate(d)) && !notTheJobTab(d);
+      const active = (!!csvActiveJobId || isRunning || mayAutomate(d)) && !notTheJobTab(d) &&
+                     !isPageAutofillJob(d);   // a job you autofilled by hand: you submit it
       _automationCache = { active, ts: Date.now() };
       return active;
     } catch (_) {
