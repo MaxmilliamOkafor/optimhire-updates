@@ -1484,8 +1484,12 @@
       'iframe[src*="recaptcha"], iframe[src*="hcaptcha"], iframe[src*="challenges.cloudflare"], iframe[title*="captcha" i], [data-automation-id*="captcha" i] iframe'
     ).some(isVisible);
   }
+  function typedEmail() {
+    const v = (byAid("email")?.value || "").trim();
+    return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(v) ? v : "";
+  }
   function emailFor(ctx, creds) {
-    return creds.cred?.email || ctx.profile.personal.email || creds.master?.email || "";
+    return creds.cred?.email || ctx.profile.personal.email || creds.master?.email || typedEmail();
   }
   async function chooseEmailSignIn() {
     const btn = byAid("signInWithEmail") ?? buttonByText(SIGN_IN_WITH_EMAIL_RX);
@@ -1581,7 +1585,7 @@
       }
     }
     if (ctx.run.createAttempts >= 2) throw new NeedsHuman("Account creation failed twice. Finish it yourself, then click Resume.");
-    const email = ctx.profile.personal.email || creds.master?.email;
+    const email = ctx.profile.personal.email || creds.master?.email || typedEmail();
     if (!email) throw new NeedsHuman("Add your email to the Workday profile (Settings) first.");
     let password;
     if (ctx.settings.useMasterPassword && creds.master) {
