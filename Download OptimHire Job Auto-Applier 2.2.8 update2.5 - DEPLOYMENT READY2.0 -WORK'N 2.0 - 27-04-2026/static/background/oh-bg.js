@@ -57,6 +57,7 @@
  *    fetching the next job 1 s → 0.25 s, and the settle after a job page
  *    loads 2 s (5 s on redirecting sites) → 1 s (2.5 s). Search index.js
  *    for "setTimeout(e,400)" etc. to re-apply after an OptimHire update.
+ *    (2.10.0 waits 4 s after a closed job on the error path: now 0.5 s, others 0.4 s.)
  *
  * 9. Workday jobs go to the Workday engine (assets/wd-engine.js, built from
  *    workday-engine/): OptimHire's FILL_COMPLEX_FORM for a Workday tab is
