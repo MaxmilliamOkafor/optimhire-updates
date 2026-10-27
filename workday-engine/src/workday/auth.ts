@@ -191,8 +191,21 @@ export async function handleSignIn(ctx: Ctx): Promise<void> {
     }
     throw new NeedsHuman("Sign-in was rejected. Check the saved password (Workday settings) or use 'Forgot password', then click Resume.");
   }
-  if (VERIFY_EMAIL_RX.test(text(document.body).slice(0, 3000)) && !byAid("next")) {
-    throw new NeedsHuman("Workday wants you to verify your email. Click the link in the email it sent, sign in again if asked, then click Resume.");
+  if (VERIFY_EMAIL_RX.test(errs + " " + text(document.body).slice(0, 3000)) && !byAid("next")) {
+    // [oh] "Verify your account before you sign in" (seen at Medtronic, on the sign-in page): with
+    // "Read verification emails" on, the host opens the link Workday emailed; then sign in again.
+    const r = await askHost<{ ok?: boolean; reason?: string }>({
+      type: "wd:auth:mailVerify", tenantHost: host, email: cred.email || emailFor(ctx, creds), since: Date.now() - 30 * 60_000,
+    });
+    if (r?.ok) {
+      ctx.log("Email verified from the link Workday sent — signing in again");
+      ctx.run.authAttempts = Math.max(0, ctx.run.authAttempts - 1);
+      await waitStable(600, 8000);
+      return;
+    }
+    throw new NeedsHuman(
+      `Workday wants you to verify your email${r?.reason ? ` (${r.reason})` : ""}. Click the link in the email it sent — or turn on "Read verification emails" in the side panel — then click Resume.`
+    );
   }
   ctx.log("Signed in");
 }

@@ -2657,10 +2657,11 @@
     var use = document.getElementById('oh-qc-acct-useprofile');
     var pw = document.getElementById('oh-qc-acct-pw');
     var eye = document.getElementById('oh-qc-acct-eye');
+    var mail = document.getElementById('oh-qc-acct-mail');
     var note = document.getElementById('oh-qc-acct-saved');
     if (!em || !use || !pw || em.dataset.wired) return;
     em.dataset.wired = '1';
-    var KEYS = ['appAccountEmail', 'appAccountPassword', 'ohAppAccountUseProfile', 'ohWorkdayLogin',
+    var KEYS = ['appAccountEmail', 'appAccountPassword', 'ohAppAccountUseProfile', 'ohWorkdayLogin', 'ohGmailCodes',
                 'candidateDetails', 'userDetails', 'seekerDetails', 'cachedSeekerInfo', 'ohWdSeeker'];
     var profileEmail = '';
     function say(t) { if (note) note.textContent = t; }
@@ -2672,6 +2673,7 @@
         var useProfile = d.ohAppAccountUseProfile !== false;
         use.checked = useProfile;
         em.disabled = useProfile;
+        if (mail) mail.checked = d.ohGmailCodes === true;
         em.value = useProfile ? (profileEmail || login.email || d.appAccountEmail || '') : (d.appAccountEmail || login.email || '');
         if (document.activeElement !== pw) pw.value = d.appAccountPassword || login.password || '';
         if (useProfile && !profileEmail && !em.value) say('No e-mail on your OptimHire profile yet: untick and type one.');
@@ -2708,6 +2710,13 @@
     });
     em.addEventListener('change', function () { save('Saved'); });
     pw.addEventListener('change', function () { save('Saved'); });
+    /* The opt-in the Gmail code / link reader (oh-bg.js 10, 10b) already checks; it was only
+       reachable in Queue Manager → Workday & sign-in. */
+    if (mail) mail.addEventListener('change', function () {
+      chrome.storage.local.set({ ohGmailCodes: mail.checked }, function () {
+        say(mail.checked ? 'Verification emails: on (Gmail in this Chrome must be signed in)' : 'Verification emails: off');
+      });
+    });
     eye.addEventListener('click', function () {
       var show = pw.type === 'password';
       pw.type = show ? 'text' : 'password';
@@ -2721,7 +2730,7 @@
     });
     try {
       chrome.storage.onChanged.addListener(function (c, area) {
-        if (area === 'local' && (c.candidateDetails || c.ohWorkdayLogin || c.appAccountEmail)) load();
+        if (area === 'local' && (c.candidateDetails || c.ohWorkdayLogin || c.appAccountEmail || c.ohGmailCodes)) load();
       });
     } catch (_) {}
   }
@@ -2810,6 +2819,11 @@
                 '<button id="oh-qc-acct-eye" class="qc-acct-eye" type="button" title="Show / hide" aria-label="Show password">' +
                   '<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M1.5 8S4 3.5 8 3.5 14.5 8 14.5 8 12 12.5 8 12.5 1.5 8 1.5 8z" stroke="currentColor" stroke-width="1.3" fill="none"/><circle cx="8" cy="8" r="2" stroke="currentColor" stroke-width="1.3" fill="none"/></svg>' +
                 '</button></div></div></div>' +
+            '<div class="qc-acct-row"><label for="oh-qc-acct-mail">Emails</label>' +
+              '<div class="qc-acct-field">' +
+                '<label class="qc-acct-check"><input type="checkbox" id="oh-qc-acct-mail">Read verification emails</label>' +
+                '<div class="qc-acct-sub" style="margin:0">Only emails from the site you are applying to, from the last few minutes: its one-time code, or its verify / password-reset link. Uses the Gmail signed in to this Chrome; nothing is sent anywhere or kept.</div>' +
+              '</div></div>' +
           '</div>' +
           '<div id="oh-qc-acct-saved" class="qc-acct-saved"></div>' +
         '</div>' +

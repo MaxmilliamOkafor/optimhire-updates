@@ -1565,8 +1565,22 @@
       }
       throw new NeedsHuman("Sign-in was rejected. Check the saved password (Workday settings) or use 'Forgot password', then click Resume.");
     }
-    if (VERIFY_EMAIL_RX.test(text(document.body).slice(0, 3e3)) && !byAid("next")) {
-      throw new NeedsHuman("Workday wants you to verify your email. Click the link in the email it sent, sign in again if asked, then click Resume.");
+    if (VERIFY_EMAIL_RX.test(errs + " " + text(document.body).slice(0, 3e3)) && !byAid("next")) {
+      const r = await askHost({
+        type: "wd:auth:mailVerify",
+        tenantHost: host2,
+        email: cred.email || emailFor(ctx, creds),
+        since: Date.now() - 30 * 6e4
+      });
+      if (r?.ok) {
+        ctx.log("Email verified from the link Workday sent — signing in again");
+        ctx.run.authAttempts = Math.max(0, ctx.run.authAttempts - 1);
+        await waitStable(600, 8e3);
+        return;
+      }
+      throw new NeedsHuman(
+        `Workday wants you to verify your email${r?.reason ? ` (${r.reason})` : ""}. Click the link in the email it sent — or turn on "Read verification emails" in the side panel — then click Resume.`
+      );
     }
     ctx.log("Signed in");
   }
