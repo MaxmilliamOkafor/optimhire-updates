@@ -281,9 +281,17 @@
     try { host = new URL(src.apply_now_url || src.job_url || '').hostname.toLowerCase(); } catch (_) {}
     var ai = j && j.additional_info && !Array.isArray(j.additional_info) ? j.additional_info : {};
     var names = [j && j.ats_name, ai.source_name, src.source_name, src.job_board].filter(Boolean).join(' ');
-    if (REED_HOST_RE.test(host) || /\breed\b/i.test(names)) return 'reed';
-    if (BOARD_HOST_RE.test(host) || /\b(linkedin|indeed|ziprecruiter|adzuna|dice)\b/i.test(names)) return 'board';
-    if (ATS_HOST_RE.test(host) || ATS_HOST_RE.test(names)) return 'ats';
+    /* Where you APPLY decides, before where OptimHire found the job: a
+       Workday / Greenhouse job it found on LinkedIn has source_name
+       "LinkedIn", and was taken for a job-board job — held back and
+       swapped for another job, which looked like jobs skipped at random
+       (seen live: a Medtronic Workday job replaced by a Lever one). */
+    if (REED_HOST_RE.test(host)) return 'reed';
+    if (ATS_HOST_RE.test(host)) return 'ats';
+    if (BOARD_HOST_RE.test(host)) return 'board';
+    if (/\breed\b/i.test(names)) return 'reed';
+    if (/\b(linkedin|indeed|ziprecruiter|adzuna|dice)\b/i.test(names)) return 'board';
+    if (ATS_HOST_RE.test(names)) return 'ats';
     return 'other';
   }
   /* First job from these jobsite tiers (ATS, then boards…), skipping sites
@@ -403,9 +411,18 @@
     if (now - (+snap.ohAutoPressTs || 0) < 30000) return true;         // our auto-clicker just pressed Apply
     return !!snap.ohAutoApplyEngaged && now - (+snap.ohAutoApplyEngagedTs || 0) < 10 * 60 * 1000;
   }
+  /* A job you picked yourself — the "Autofill Application" button OptimHire
+     2.10.0 draws on a job page (START_PAGE_AUTOFILL) — is never swapped. */
+  var _pageAutofillTs = 0;
+  try {
+    chrome.runtime.onMessage.addListener(function (msg) {
+      if (msg && msg.action === 'START_PAGE_AUTOFILL') _pageAutofillTs = Date.now();
+    });
+  } catch (_) {}
   async function heldBackSwap(url, init) {
     var res = await _fetch(url, init);
     if (!automationDriven() || snap.preferredJobsite) return res;
+    if (Date.now() - _pageAutofillTs < 60000) return res;
     var j = await jobOf(res);
     if (!j) return res;
     var kind = jobKind(j);
