@@ -1695,8 +1695,13 @@
         /* Only while the user has actually engaged auto-apply (or a
            session/queue is running) — never while they are just browsing
            jobs by hand. */
-        const d = await ST.get(AUTOMATION_KEYS.concat(['copilotTabId']));
+        const d = await ST.get(AUTOMATION_KEYS.concat(['copilotTabId', 'ohPageAutofillTs', 'ohStoppedTs']));
         if (!mayAutomate(d)) return;
+        /* A page autofill shows this page while it loads ITS job: pressing
+           Apply here started OptimHire's whole queue instead. Same just
+           after Stop. */
+        if (Date.now() - (+d.ohPageAutofillTs || 0) < 180_000) return;
+        if (Date.now() - (+d.ohStoppedTs || 0) < 60_000) return;
         /* Only one tab may drive applications: the pinned job tab, or —
            when no side panel is pinning — the elected owner. */
         if (!isPingedJobTab() && !(await isAutomationOwnerTab())) return;

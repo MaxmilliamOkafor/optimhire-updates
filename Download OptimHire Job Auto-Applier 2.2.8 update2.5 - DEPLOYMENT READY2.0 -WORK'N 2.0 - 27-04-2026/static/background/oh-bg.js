@@ -416,7 +416,22 @@
   var _pageAutofillTs = 0;
   try {
     chrome.runtime.onMessage.addListener(function (msg) {
-      if (msg && msg.action === 'START_PAGE_AUTOFILL') _pageAutofillTs = Date.now();
+      if (!msg) return;
+      /* A page autofill is one job, not a run; Stop ends the run. Either way
+         our "you pressed Start" engagement ends here — it outlived Stop by
+         up to 10 minutes (the panel's heartbeat even renewed it), and in
+         that time our job-apply clicker pressed Apply on whatever job the
+         page showed: Stop, or a page autofill passing through "Loading your
+         Job", restarted the whole queue. */
+      var stop = msg.type === 'AUTO_APPLY_STOP' || msg.type === 'STOP_ALL_PROCESSES' || msg.type === 'MANUAL_APPLY_STOP';
+      var page = msg.action === 'START_PAGE_AUTOFILL';
+      if (!stop && !page) return;
+      var now = Date.now();
+      if (page) _pageAutofillTs = now;
+      try {
+        chrome.storage.local.set(Object.assign({ ohAutoApplyEngaged: false, ohAutoApplyEngagedTs: 0 },
+          page ? { ohPageAutofillTs: now } : { ohStoppedTs: now }));
+      } catch (_) {}
     });
   } catch (_) {}
   async function heldBackSwap(url, init) {
