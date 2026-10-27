@@ -1480,7 +1480,9 @@
     return await chrome.runtime.sendMessage({ type: "wd:cred:get", tenantHost: host2 });
   }
   function captchaPresent() {
-    return qa('iframe[src*="recaptcha"], iframe[src*="hcaptcha"], iframe[title*="captcha" i], [data-automation-id*="captcha" i]').some(isVisible);
+    return qa(
+      'iframe[src*="recaptcha"], iframe[src*="hcaptcha"], iframe[src*="challenges.cloudflare"], iframe[title*="captcha" i], [data-automation-id*="captcha" i] iframe'
+    ).some(isVisible);
   }
   function emailFor(ctx, creds) {
     return creds.cred?.email || ctx.profile.personal.email || creds.master?.email || "";

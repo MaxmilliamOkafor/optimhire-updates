@@ -88,7 +88,12 @@ async function getCreds(host: string): Promise<CredReply> {
 }
 
 function captchaPresent(): boolean {
-  return qa('iframe[src*="recaptcha"], iframe[src*="hcaptcha"], iframe[title*="captcha" i], [data-automation-id*="captcha" i]').some(isVisible);
+  // [oh] Not [data-automation-id*="captcha"]: "noCaptchaWrapper" is Workday's wrapper around the
+  // Create Account / Sign In button itself (seen at Medtronic), so every account page "had a CAPTCHA".
+  // A real challenge is a reCAPTCHA / hCaptcha / Turnstile frame.
+  return qa(
+    'iframe[src*="recaptcha"], iframe[src*="hcaptcha"], iframe[src*="challenges.cloudflare"], iframe[title*="captcha" i], [data-automation-id*="captcha" i] iframe'
+  ).some(isVisible);
 }
 
 function emailFor(ctx: Ctx, creds: CredReply): string {
