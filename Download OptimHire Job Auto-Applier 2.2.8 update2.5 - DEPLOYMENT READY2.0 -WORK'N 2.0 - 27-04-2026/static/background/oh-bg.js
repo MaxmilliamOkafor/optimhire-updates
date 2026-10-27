@@ -981,6 +981,60 @@
   } catch (_) {}
 })();
 
+/* 15. "Autofill Application" on a Workday job page applies to THAT job.
+   OptimHire 2.10.0 draws the button (atsInject → START_PAGE_AUTOFILL).
+   Its own handler refuses while its saved "a run is going" flags are set —
+   and those survive Stop and extension reloads — and then the old run
+   resumes instead: seen live, pressing it on a Medtronic Workday job ran
+   a London Reed job, then OptimHire's whole queue, in that tab. On a
+   Workday tab the press now goes straight to the Workday engine on that
+   page (OH_AUTOFILL_THIS_PAGE, as the panel's "Fill & submit" does): it
+   applies — sign-in, every step, Submit — and OptimHire's handler never
+   sees it. ohWdEngineOff (Queue Manager) gives it back to OptimHire. */
+(function workdayPageButtonToEngine() {
+  var WD_PAGE_RE = /(^|\.)(myworkdayjobs|myworkdaysite|myworkday|workdayjobs)\.com$/i;
+  var ev = chrome.runtime && chrome.runtime.onMessage;
+  if (!ev || typeof ev.addListener !== 'function') return;
+  var engineOff = false;
+  try {
+    chrome.storage.local.get(['ohWdEngineOff', 'ohAutomationDisabled'], function (d) {
+      engineOff = !!(d && (d.ohWdEngineOff === true || d.ohAutomationDisabled === true));
+    });
+    chrome.storage.onChanged.addListener(function (c, area) {
+      if (area !== 'local' || !(c.ohWdEngineOff || c.ohAutomationDisabled)) return;
+      chrome.storage.local.get(['ohWdEngineOff', 'ohAutomationDisabled'], function (d) {
+        engineOff = !!(d && (d.ohWdEngineOff === true || d.ohAutomationDisabled === true));
+      });
+    });
+  } catch (_) {}
+  function isWorkdayPagePress(msg, sender) {
+    if (engineOff || !msg || msg.action !== 'START_PAGE_AUTOFILL' || !sender || !sender.tab) return false;
+    var host = '';
+    try { host = new URL(sender.tab.url || '').hostname; } catch (_) {}
+    return WD_PAGE_RE.test(host);
+  }
+  /* Ours runs first and answers the button. */
+  ev.addListener(function (msg, sender, reply) {
+    if (!isWorkdayPagePress(msg, sender)) return;
+    var tabId = sender.tab.id;
+    try { console.info('[OH-BG] Autofill Application on a Workday job — the Workday engine applies on this page'); } catch (_) {}
+    chrome.tabs.sendMessage(tabId, { type: 'OH_AUTOFILL_THIS_PAGE', submit: true, pageOnly: false }, { frameId: 0 }, function () {
+      void chrome.runtime.lastError;
+    });
+    try { reply({ success: true, jobRunning: false }); } catch (_) {}
+  });
+  /* Every listener added after this point (OptimHire's) skips that press. */
+  var realAdd = ev.addListener.bind(ev);
+  ev.addListener = function (fn) {
+    if (typeof fn !== 'function') return realAdd.apply(null, arguments);
+    var wrapped = function (msg, sender) {
+      if (isWorkdayPagePress(msg, sender)) return false;
+      return fn.apply(this, arguments);
+    };
+    return realAdd(wrapped);
+  };
+})();
+
 importScripts('index.js');
 /* 12. The CSV Job Queue runs here, not in the Queue Manager tab (queue-runner.js). */
 importScripts('queue-runner.js');
