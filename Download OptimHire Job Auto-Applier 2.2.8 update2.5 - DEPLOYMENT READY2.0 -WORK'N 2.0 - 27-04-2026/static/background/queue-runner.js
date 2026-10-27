@@ -45,24 +45,16 @@
     return p;
   }
 
-  /* ── order: ATS jobs first, then career sites, then job boards, Reed last ── */
-  var ATS_RE = /greenhouse\.io|grnh\.se|lever\.co|myworkdayjobs|myworkdaysite|workday\.com|ashbyhq|icims|smartrecruiters|workable|breezy\.hr|jobvite|bamboohr|paylocity|jazzhr|resumatorapi|teamtailor|recruitee|pinpoint|oraclecloud|taleo|successfactors|sapsf|ukg\.com|ultipro|avature|rippling|gohire|forhyre|manatal|bullhorn/i;
-  var BOARD_RE = /(^|\.)(indeed|linkedin|ziprecruiter|adzuna|dice|glassdoor|monster|totaljobs|cv-library|jobsite|irishjobs|jobs\.ie|simplyhired|careerbuilder|jooble|talent|hiring\.cafe)\./i;
-  function tier(url) {
-    var host = '';
-    try { host = new URL(url).hostname.toLowerCase(); } catch (_) { return 1; }
-    if (/(^|\.)reed\.co\.uk$/i.test(host)) return 3;
-    if (BOARD_RE.test(host + '.')) return 2;
-    if (ATS_RE.test(url)) return 0;
-    return 1;
-  }
+  /* ── order: quickest company ATS first, then account ATS, career sites, job boards, Reed last ──
+     self.ohJobRank (oh-bg.js): Greenhouse 0, Lever 1 … Workday 20 … career sites 30, boards 40+, Reed 99. */
+  function tier(url) { return typeof self.ohJobRank === 'function' ? self.ohJobRank(url) : 30; }
   function pickNext(q, ok, preferAts) {
     if (!preferAts) { for (var i = 0; i < q.length; i++) if (ok(q[i])) return q[i]; return null; }
-    var best = null, bestTier = 9;
+    var best = null, bestTier = 1e9;
     for (var j = 0; j < q.length; j++) {
       if (!ok(q[j])) continue;
       var t = tier(q[j].url);
-      if (t < bestTier) { best = q[j]; bestTier = t; if (t === 0) break; }
+      if (t < bestTier) { best = q[j]; bestTier = t; if (t === 0) break; }      // queue order within a rank
     }
     return best;
   }

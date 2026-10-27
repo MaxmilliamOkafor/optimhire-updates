@@ -11,7 +11,7 @@
 import { Aborted, NeedsHuman, byAid, humanClick, isVisible, labelOf, qa, setAbort, sleep, text, waitFor, waitStable } from "./dom.js";
 import { enableTrustedFallback, readValue } from "./controls.js";
 import { activeStepName, detectPage, errorMessages, isSubmitButton, jobKeyFor, nextButton, reqIdFromUrl, scrapeJob, tenantHost } from "./detect.js";
-import { APPLY_TEXT_RX } from "./i18n.js";
+import { ALREADY_APPLIED_RX, APPLY_TEXT_RX } from "./i18n.js";
 import { handleCreateAccount, handleSignIn } from "./auth.js";
 import { addFlag, type Ctx } from "./context.js";
 import {
@@ -214,6 +214,10 @@ const ASSIST_PAGES: PageKind[] = ["resumeUpload", "myInformation", "myExperience
 
 async function handlePage(ctx: Ctx, page: PageKind): Promise<StepResult> {
   if (hooks.advance && !hooks.advance() && !ASSIST_PAGES.includes(page)) return "stop"; // [oh]
+  // [oh] Workday refuses a second application to the same job: stop at once instead of retrying.
+  if (["jobPosting", "applyMethod", "candidateHome", "unknown"].includes(page) && ALREADY_APPLIED_RX.test(text(document.body).slice(0, 6000))) {
+    throw new NeedsHuman("You have already applied to this job (Workday allows one application per job).");
+  }
   switch (page) {
     case "jobPosting": {
       if (ctx.job) chrome.runtime.sendMessage({ type: "wd:jobCaptured", job: ctx.job }).catch(() => {});

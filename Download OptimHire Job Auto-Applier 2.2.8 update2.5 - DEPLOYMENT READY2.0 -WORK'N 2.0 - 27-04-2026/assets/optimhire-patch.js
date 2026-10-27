@@ -139,7 +139,7 @@
          board — so dozens of frames per page ran the full machinery.
          An unknown ATS's iframe loses nothing important: the top frame
          still handles the page. */
-      const ATS_HOST_RE = /(greenhouse|lever\.co|breezy|workday|icims|taleo|oraclecloud|smartrecruiters|ashbyhq|bamboohr|jobvite|workable|paylocity|jazzhr|resumatorapi|teamtailor|ziprecruiter|manatal|bullhorn|hiring\.cafe|gohire|forhyre|careers-page|gh-widget|successfactors|sapsf|ultipro|avature|recruitee|pinpoint|rippling)/i;
+      const ATS_HOST_RE = /(greenhouse|lever\.co|breezy|workday|icims|taleo|oraclecloud|smartrecruiters|ashbyhq|bamboohr|jobvite|workable|paylocity|jazzhr|resumatorapi|teamtailor|ziprecruiter|manatal|bullhorn|hiring\.cafe|gohire|forhyre|careers-page|gh-widget|successfactors|sapsf|ultipro|avature|recruitee|pinpoint|rippling|applytojob|brassring|\.adp\.com|zohorecruit|personio|homerun|catsone|dover\.com|gusto\.com|careerpuck|jobs\.gem\.com|trakstar|join\.com|dayforcehcm|factorialhr)/i;
       if (!ATS_HOST_RE.test(h)) {
         /* Quietly no-op in non-ATS iframes (analytics, ads, etc.) */
         return;
@@ -802,6 +802,28 @@
     'gohire.io':            'GoHire',
     'app.gohire.io':        'GoHire',
     'hire.li':              'GoHire',   // GoHire short-link domain
+    // 27-10 ATS test: platforms applied to that were not recognised as an ATS at all
+    'applytojob.com':       'JazzHR',      // JazzHR's apply pages (company.applytojob.com)
+    'brassring.com':        'BrassRing',   // Kenexa (sjobs.brassring.com)
+    'workforcenow.adp.com': 'ADP',
+    'myjobs.adp.com':       'ADP',
+    'recruiting.adp.com':   'ADP',
+    'homerun.co':           'Homerun',
+    'catsone.com':          'CATS',
+    'zohorecruit.com':      'ZohoRecruit',
+    'zohorecruit.eu':       'ZohoRecruit',
+    'zohorecruit.in':       'ZohoRecruit',
+    'jobs.personio.com':    'Personio',
+    'jobs.personio.de':     'Personio',
+    'ats.rippling.com':     'Rippling',
+    'app.dover.com':        'Dover',
+    'jobs.gusto.com':       'Gusto',
+    'careerpuck.com':       'CareerPuck',
+    'jobs.gem.com':         'Gem',
+    'hire.trakstar.com':    'Trakstar',
+    'join.com':             'JOIN',
+    'dayforcehcm.com':      'Dayforce',
+    'factorialhr.com':      'Factorial',
   };
 
   const HOST = location.hostname.toLowerCase().replace(/^www\./, '');
@@ -814,7 +836,9 @@
   // LinkedIn: only activate on /jobs path — not on feeds, profiles, or messaging
   const CURRENT_ATS = _rawATS === 'LinkedIn'
     ? (location.pathname.startsWith('/jobs') ? 'LinkedIn' : null)
-    : _rawATS;
+    : _rawATS === 'ADP' && HOST.includes('workforcenow.adp.com')
+      ? (/recruit|career|job/i.test(location.pathname + location.hash) ? 'ADP' : null)   // else: payroll / HR, never an application
+      : _rawATS;
 
   LOG(`Page: ${HOST} | ATS: ${CURRENT_ATS || 'unknown'}`);
 
@@ -4386,6 +4410,25 @@
     });
   })();
 
+  /* Which job to apply to first (the CSV queue): quickest company ATS first, then ATS sites
+     that need an account, company career sites, job boards, Reed last — lower = sooner.
+     Same order as self.ohJobRank in oh-bg.js. */
+  function jobRank(u) {
+    let h = ''; try { h = new URL(u).hostname.toLowerCase(); } catch (_) { return 30; }
+    if (/(^|\.)reed\.co\.uk$/.test(h)) return 99;
+    const boards = [[/(^|\.)linkedin\./, 40], [/(^|\.)indeed\./, 41], [/(^|\.)dice\./, 42], [/(^|\.)ziprecruiter\./, 43], [/(^|\.)adzuna\./, 44],
+      [/(^|\.)(glassdoor|totaljobs|cv-library|monster|jobsite|irishjobs|jobs\.ie|simplyhired|careerbuilder|jooble|hiring\.cafe)\./, 45]];
+    for (const [re, r] of boards) if (re.test(h + '.')) return r;
+    const ats = [[/greenhouse\.io|grnh\.se/, 0], [/lever\.co/, 1], [/ashbyhq/, 2], [/workable/, 3], [/smartrecruiters/, 4], [/recruitee/, 5],
+      [/teamtailor/, 6], [/bamboohr/, 7], [/breezy\.hr/, 8], [/jazzhr|resumatorapi|applytojob/, 9], [/pinpointhq/, 10], [/rippling/, 11],
+      [/comeet/, 12], [/personio/, 13], [/jobvite/, 14], [/freshteam|manatal|recooty|gohire|forhyre|homerun|dover|wellfound/, 15],
+      [/myworkdayjobs|myworkdaysite|workdayjobs|\.workday\.com/, 20], [/icims/, 21], [/successfactors|sapsf/, 22], [/oraclecloud/, 23],
+      [/taleo/, 24], [/paylocity|ultipro|ukg\.com|adp\.com|avature|bullhorn/, 25]];
+    const lu = String(u).toLowerCase();
+    for (const [re, r] of ats) if (re.test(lu)) return r;
+    return 30;
+  }
+
   async function rawResumeFile(url, filename = 'resume.pdf') {
     if (!url) return null;
     try {
@@ -4538,6 +4581,13 @@
     // application wins over the generic rules below.
     const remembered = rememberedAnswer(label, inputType);
     if (remembered != null) return remembered;
+
+    /* Opt-ins are never yours to accept on someone's behalf: "May we text
+       you?" (Paylocity), SMS / WhatsApp updates, marketing, newsletters,
+       talent communities, job alerts → No. The yes-leaning rules below
+       (consent, "would you", catch-all) used to say Yes to these. */
+    if (/\b(may|can) we (text|sms|message)\b|\btext (message|messaging)s?\b|\b(by|via|receive|send( me)?) (sms|whatsapp)\b|\b(sms|whatsapp) (updates?|messages?|alerts?|notifications?|consent)\b|marketing (communications?|e ?mails?|messages|materials|purposes|updates)|newsletter|talent (community|network|pool)|job alerts?|receive (job )?(updates|alerts|offers|news)/.test(l))
+                                                          return 'No';
 
     /* "Are you currently an employee of <company/agency>?", "Have you
        worked for us before?", relatives employed there… → No. (A yes-bias
@@ -7781,7 +7831,7 @@
 
   /* ── JazzHR autofill ─────────────────────────────────────────── */
   async function jazzhrAutofill() {
-    const isJazzHR = HOST.includes('jazzhr.com') || HOST.includes('resumatorapi.com') ||
+    const isJazzHR = HOST.includes('jazzhr.com') || HOST.includes('resumatorapi.com') || HOST.includes('applytojob.com') ||
       !!$('[class*="jazzhr"],form[class*="jazz"],#apply-form');
     if (!isJazzHR) return;
     const p = await getProfile();
@@ -8033,6 +8083,79 @@
      came back with Citizenship 1, "How did you hear", Gender and the Terms
      of Use all undone, while the optional Citizenship 2 got filled). Each
      select is answered by what its label asks. */
+  /* SAP SuccessFactors refuses to submit with more than 100 skills ("You
+     can only add up to 100 skills. Retain skills that add value") — an old
+     profile held 260. The extras go, from the end of the list. */
+  const SF_SKILL_CAP = 100;
+  async function sfTrimSkills() {
+    const warn = $$('div,span,p,li').find(e => isVisible(e) && e.children.length < 3 && /only add up to \d+ skills/i.test(e.textContent || ''));
+    if (!warn) return 0;
+    const cap = +((warn.textContent.match(/up to (\d+) skills/i) || [])[1]) || SF_SKILL_CAP;
+    const isRemover = b => isVisible(b) && /remove|delete/i.test(`${b.getAttribute('aria-label') || ''} ${b.title || ''}`);
+    /* The smallest ancestor of the warning that holds more remove buttons than the cap: the skills list. */
+    let box = warn;
+    for (let i = 0; i < 8 && box.parentElement; i++) {
+      box = box.parentElement;
+      if ($$('button,[role="button"],a', box).filter(isRemover).length > cap) break;
+    }
+    let removed = 0;
+    for (let guard = 0; guard < 400; guard++) {
+      const r = $$('button,[role="button"],a', box).filter(isRemover);
+      if (r.length <= cap) break;
+      r[r.length - 1].click();
+      removed++;
+      await sleep(60);
+    }
+    if (removed) LOG(`SuccessFactors: removed ${removed} skill(s) over the ${cap}-skill limit`);
+    return removed;
+  }
+
+  /* ── Stale or mangled prefills (27-10 ATS test) ──────────────────────
+     Resume parsers and saved profiles put the wrong thing in filled boxes,
+     which every filler then leaves alone because the box "has a value":
+     Paylocity's parser wrote the name in capitals and the phone as
+     "+353: 0874261508"; SAP SuccessFactors and BrassRing loaded an old
+     name, phone and London address. On the sites that prefill like this,
+     a filled identity box is compared with your profile and corrected —
+     once per box, so a site that reformats the value is not fought. */
+  const PREFILL_REPAIR_ATS = ['SuccessFactors', 'BrassRing', 'Paylocity', 'ADP', 'iCIMS', 'OracleCloud', 'Taleo', 'ZohoRecruit', 'JOIN', 'Dayforce'];
+  const _prefillRepaired = new WeakSet();
+  function nationalDigits(v, dial) {
+    let d = String(v || '').replace(/\D/g, '');
+    if (dial && d.startsWith(dial) && d.length > dial.length + 6) d = d.slice(dial.length);
+    return d.replace(/^0+/, '');
+  }
+  async function repairPrefills() {
+    if (!PREFILL_REPAIR_ATS.includes(CURRENT_ATS)) return 0;
+    const p = await getProfile();
+    const dial = String(p.phone_country_code || _profileDialCode || '').replace(/\D/g, '');
+    const squash = v => String(v || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+    const RULES = [
+      { rx: /^(legal )?(first|given) ?names?$|^vorname$|^pr[eé]nom$/i, want: p.first_name, same: (a, b) => a === b },
+      { rx: /^(legal )?(last|family) ?names?$|^surname$|^nachname$|^nom de famille$/i, want: p.last_name, same: (a, b) => a === b },
+      { rx: /^(mobile|cell|primary|home)? ?(phone|telephone|mobile)( number| no)?$/i, want: p.phone, same: (a, b) => nationalDigits(a, dial) === nationalDigits(b, dial) && !/:|^\+\d{1,3}\D*0/.test(a) },   // "+353: 0874…" is mangled
+      { rx: /^(city|town|city or town|locality)$/i, want: p.city, same: (a, b) => squash(a) === squash(b) },
+      { rx: /^(zip|postal|post) ?code$|^zip$|^eircode$|^(zip|postal) ?\/ ?(zip|postal) ?code$/i, want: p.postal_code, same: (a, b) => squash(a) === squash(b) },
+      { rx: /^(street )?address( line)? ?1?$|^street$/i, want: p.street, same: (a, b) => squash(a) === squash(b) },
+    ];
+    let fixed = 0;
+    for (const el of $$('input[type="text"],input[type="tel"],input:not([type])')) {
+      if (_prefillRepaired.has(el) || !isVisible(el) || el.disabled || el.readOnly || isTrapField(el)) continue;
+      const cur = (el.value || '').trim();
+      if (!cur) continue;
+      const label = String(getLabel(el) || el.getAttribute('aria-label') || el.getAttribute('placeholder') || '').replace(/[*:]/g, ' ').replace(/\s+/g, ' ').trim();
+      const rule = label && RULES.find(r => r.rx.test(label));
+      if (!rule || !rule.want || rule.same(cur, String(rule.want).trim())) continue;
+      _prefillRepaired.add(el);
+      if (nativeSet(el, String(rule.want).trim())) {
+        fixed++;
+        LOG(`Prefill repaired: "${label.slice(0, 40)}" was "${cur.slice(0, 40)}"`);
+        await sleep(40);
+      }
+    }
+    return fixed;
+  }
+
   const SF_EMPTY_RE = /^(no selection|select( one)?|please select|choose|--+|\s*)$/i;
   function sfLabel(el) { return String(getLabel(el) || '').replace(/[*:]/g, ' ').replace(/\s+/g, ' ').trim(); }
   function sfSelectEmpty(sel) {
@@ -8238,6 +8361,10 @@
       if (!['Ashby','BambooHR','Jobvite','Lever','Workable','iCIMS','Paylocity','JazzHR','Teamtailor','Recruitee','Pinpoint','SuccessFactors','UKG','Avature'].includes(CURRENT_ATS)) {
         await autoFillPage();
       }
+
+      // Stale or mangled prefills (old saved profile, resume parser) — see repairPrefills.
+      try { await repairPrefills(); } catch (_) {}
+      if (CURRENT_ATS === 'SuccessFactors') { try { await sfTrimSkills(); } catch (_) {} }
 
       // T29: Resume upload — try once after main fill (non-adapter ATS already covered)
       try {
@@ -9576,13 +9703,7 @@
             if (!dd.ohJobQueueActive) return;            // queue stopped
             let qq = Array.isArray(dd.ohJobQueue) ? dd.ohJobQueue : [];
             /* Same order as the Queue Manager: ATS jobs first, Reed last. */
-            const tier = (u) => {
-              let h = ''; try { h = new URL(u).hostname.toLowerCase(); } catch (_) { return 1; }
-              if (/(^|\.)reed\.co\.uk$/.test(h)) return 3;
-              if (/(^|\.)(indeed|linkedin|ziprecruiter|adzuna|dice|glassdoor|monster|totaljobs|cv-library|simplyhired|hiring\.cafe)\./.test(h)) return 2;
-              if (/greenhouse|lever\.co|myworkdayjobs|workday|ashbyhq|icims|smartrecruiters|workable|breezy|jobvite|bamboohr|paylocity|jazzhr|teamtailor|recruitee|pinpoint|oraclecloud|taleo|successfactors|ultipro|avature|rippling|comeet|manatal/.test(h)) return 0;
-              return 1;
-            };
+            const tier = jobRank;
             const pending = qq.filter(j => j.status === 'pending');
             const nx = dd.ohPreferAts === false ? pending[0]
               : pending.reduce((best, j) => (!best || tier(j.url) < tier(best.url) ? j : best), null);
