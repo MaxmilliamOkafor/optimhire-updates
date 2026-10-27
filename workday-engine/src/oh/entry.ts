@@ -148,7 +148,19 @@ async function workdayLogin(): Promise<{ email: string; password: string; login:
     login.password = d.appAccountPassword || makePassword();
     await ST.set({ [LOGIN_KEY]: login });
   }
-  const email = login.email || d.appAccountEmail || (await profileSources()).email || "";
+  let email = login.email || d.appAccountEmail || (await profileSources()).email || "";
+  // A fresh install has no saved login e-mail yet: the address in the form's email box becomes it,
+  // and is SAVED, so every later job and employer signs in with it.
+  if (!email) {
+    const box = document.querySelector<HTMLInputElement>('[data-automation-id="email"], input[type="email"]');
+    const typed = (box?.value || "").trim();
+    if (/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(typed)) email = typed;
+  }
+  if (email && !login.email) {
+    login.email = email;
+    await ST.set({ [LOGIN_KEY]: login });
+    say(`Workday sign-in e-mail saved: ${email}`);
+  }
   return { email, password: login.password, login, d };
 }
 

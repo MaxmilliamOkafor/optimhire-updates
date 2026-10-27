@@ -2908,7 +2908,17 @@ OPTIONS: ${JSON.stringify(options.slice(0, 150))}`
       login.password = d.appAccountPassword || makePassword();
       await ST.set({ [LOGIN_KEY]: login });
     }
-    const email = login.email || d.appAccountEmail || (await profileSources()).email || "";
+    let email = login.email || d.appAccountEmail || (await profileSources()).email || "";
+    if (!email) {
+      const box = document.querySelector('[data-automation-id="email"], input[type="email"]');
+      const typed = (box?.value || "").trim();
+      if (/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(typed)) email = typed;
+    }
+    if (email && !login.email) {
+      login.email = email;
+      await ST.set({ [LOGIN_KEY]: login });
+      say(`Workday sign-in e-mail saved: ${email}`);
+    }
     return { email, password: login.password, login, d };
   }
   async function noteSite(state, extra = {}, host2 = tenantHost()) {
