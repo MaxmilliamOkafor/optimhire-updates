@@ -3558,6 +3558,21 @@ OPTIONS: ${JSON.stringify(options.slice(0, 150))}`
     await installHooks(mode);
     await startRun(null);
   }
+  var FOREIGN_RUN_RE = /automation in progress|auto-?applying|auto-?filling|autofilling|applying to (this )?job|filling (the |your )?(application|form)/i;
+  function otherAutomationOnPage() {
+    try {
+      if (document.getElementById("ua-ctrl")) return true;
+      const roots = [...Array.from(document.documentElement.children), ...document.body ? Array.from(document.body.children) : []];
+      for (const el of roots) {
+        if (el === document.body || el === document.head || /^(oh-|wd-)|optimhire/i.test(el.id || "")) continue;
+        const cs = getComputedStyle(el);
+        if (cs.position !== "fixed" || cs.display === "none" || cs.visibility === "hidden") continue;
+        if (FOREIGN_RUN_RE.test((el.innerText || "").slice(0, 400))) return true;
+      }
+    } catch {
+    }
+    return false;
+  }
   function toApplyManually() {
     const rx2 = /\/apply\/(autofillWithResume|useMyLastApplication)\b/i;
     if (!rx2.test(location.pathname)) return false;
@@ -3661,7 +3676,7 @@ OPTIONS: ${JSON.stringify(options.slice(0, 150))}`
     const ASSIST_PAGES2 = ["resumeUpload", "myInformation", "myExperience", "questions", "voluntaryDisclosures", "selfIdentify"];
     const assisted = /* @__PURE__ */ new Set();
     setInterval(() => {
-      if (!assistOn || readMode() || isActive() || !hasWorkdayApp()) return;
+      if (!assistOn || readMode() || isActive() || !hasWorkdayApp() || otherAutomationOnPage()) return;
       const page = detectPage();
       if (page === "review") {
         const rk = `review|${location.pathname}`;

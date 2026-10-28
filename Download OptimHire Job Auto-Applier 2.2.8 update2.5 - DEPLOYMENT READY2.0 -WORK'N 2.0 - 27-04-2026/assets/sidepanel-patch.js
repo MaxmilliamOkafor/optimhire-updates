@@ -804,6 +804,7 @@
     entry.appendChild(span);
     logEl.appendChild(entry);
     logEl.scrollTop = logEl.scrollHeight;
+    try { var nowEl = document.getElementById('oh-qc-now'); if (nowEl && text) nowEl.textContent = String(text); } catch (_) {}
     // Keep last 50 entries
     while (logEl.children.length > 50) logEl.removeChild(logEl.firstChild);
   }
@@ -829,6 +830,20 @@
     if (progressLbl) progressLbl.textContent = 'Filling application form...';
     if (fillStats) fillStats.textContent = filled + ' of ' + total + ' required fields filled';
     if (responsesEl && responses > 0) responsesEl.textContent = responses + ' responses from API';
+    cardForm(true, filled, total);
+  }
+  /* The form progress, on the Job Queue card. */
+  function cardForm(show, filled, total) {
+    try {
+      var box = document.getElementById('oh-qc-form');
+      if (!box) return;
+      box.style.display = show && total > 0 ? '' : 'none';
+      if (!show || !(total > 0)) return;
+      var pct = Math.round((filled / total) * 100);
+      document.getElementById('oh-qc-form-pct').textContent = pct + '%';
+      document.getElementById('oh-qc-form-bar').style.width = pct + '%';
+      document.getElementById('oh-qc-form-stats').textContent = filled + ' of ' + total + ' required fields filled';
+    } catch (_) {}
   }
 
   /* ── Field list ── */
@@ -2035,6 +2050,7 @@
       _isRunning = true;
       clearFieldList();
       if (progressSec) progressSec.style.display = 'none';
+      cardForm(false);
       addLog('Opening job page...', 'active');
       if (title) title.textContent = 'Auto-Apply Mode';
     }
@@ -2053,6 +2069,7 @@
       }
       clearFieldList();
       if (progressSec) progressSec.style.display = 'none';
+      cardForm(false);
     }
 
     /* ── CSV Queue Done ── */
@@ -2550,7 +2567,8 @@
   var QC_CSS = [
     '#oh-queue-card{--qc-bg:#12141c;--qc-raise:#1a1d27;--qc-line:#262a36;--qc-text:#e6e8ef;--qc-muted:#8b91a3;',
     '--qc-accent:#6d5efc;--qc-accent-2:#5a4bea;--qc-ok:#3ecf8e;--qc-warn:#f5b44a;--qc-bad:#f26d6d;',
-    'position:fixed;bottom:44px;left:10px;right:10px;z-index:2147483646;box-sizing:border-box;padding:14px;',
+    'position:fixed;bottom:10px;left:10px;right:10px;z-index:2147483646;box-sizing:border-box;padding:14px;',
+    'max-height:calc(100vh - 20px);overflow-y:auto;overscroll-behavior:contain;scrollbar-width:thin;',
     'background:var(--qc-bg);border:1px solid var(--qc-line);border-radius:14px;box-shadow:0 10px 30px rgba(0,0,0,.45);',
     'font:12px/1.4 Inter,-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;color:var(--qc-text);-webkit-font-smoothing:antialiased}',
     '#oh-queue-card *{box-sizing:border-box}',
@@ -2568,6 +2586,12 @@
     '#oh-queue-card .qc-stat b{display:block;font-size:17px;font-weight:650;font-variant-numeric:tabular-nums;line-height:1.15}',
     '#oh-queue-card .qc-stat span{font-size:10.5px;color:var(--qc-muted)}',
     '#oh-queue-card .qc-ok b{color:var(--qc-ok)} #oh-queue-card .qc-bad b{color:var(--qc-bad)}',
+    '#oh-queue-card .qc-live{margin-bottom:12px;padding:10px;border:1px solid var(--qc-line);border-radius:10px;background:var(--qc-raise)}',
+    '#oh-queue-card .qc-live-top{display:flex;align-items:flex-start;gap:8px}',
+    '#oh-queue-card .qc-now{flex:1;min-width:0;font-size:11.5px;line-height:1.45;color:var(--qc-text);overflow-wrap:anywhere}',
+    '#oh-queue-card .qc-mini{flex:none;padding:4px 10px;border:1px solid rgba(245,180,74,.45);border-radius:8px;background:rgba(245,180,74,.1);color:var(--qc-warn);font-size:11px;font-weight:600;cursor:pointer}',
+    '#oh-queue-card .qc-mini:hover{background:rgba(245,180,74,.18)}',
+    '#oh-queue-card .qc-form{margin-top:8px}',
     '#oh-queue-card .qc-run{margin-bottom:12px;padding:10px;border:1px solid var(--qc-line);border-radius:10px;background:var(--qc-raise)}',
     '#oh-queue-card .qc-run-top{display:flex;justify-content:space-between;align-items:baseline;gap:8px;font-size:11.5px;color:var(--qc-muted)}',
     '#oh-queue-card .qc-run-top b{color:var(--qc-text);font-size:12px;font-variant-numeric:tabular-nums}',
@@ -2622,7 +2646,7 @@
     '#oh-queue-card .qc-acct-check{display:flex;align-items:center;gap:6px;font-size:11px;color:var(--qc-text);cursor:pointer}',
     '#oh-queue-card .qc-acct-check input{accent-color:var(--qc-accent);margin:0}',
     '#oh-queue-card .qc-acct-saved{font-size:10px;color:var(--qc-muted);margin-top:4px;min-height:12px}',
-    '.qc-pill{position:fixed;bottom:44px;right:10px;z-index:2147483646;cursor:pointer;padding:7px 14px;border-radius:999px;',
+    '.qc-pill{position:fixed;bottom:10px;right:10px;z-index:2147483646;cursor:pointer;padding:7px 14px;border-radius:999px;',
     'background:#6d5efc;color:#fff;font:600 11.5px/1 Inter,-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;box-shadow:0 6px 18px rgba(0,0,0,.4)}'
   ].join('');
 
@@ -2785,6 +2809,17 @@
           '<div id="oh-qc-run-tally" class="qc-run-tally">—</div>' +
           '<div id="oh-qc-run-tier" class="qc-run-tier" style="display:none"></div>' +
         '</div>' +
+        /* What the automation is doing right now: the latest step, the form being
+           filled, and Skip (formerly a second panel under this one). */
+        '<div id="oh-qc-live" class="qc-live" style="display:none">' +
+          '<div class="qc-live-top"><span id="oh-qc-now" class="qc-now">Starting…</span>' +
+            '<button id="oh-qc-skip" class="qc-mini" title="Skip the job being applied to now and go to the next one">Skip job</button></div>' +
+          '<div id="oh-qc-form" class="qc-form" style="display:none">' +
+            '<div class="qc-run-top"><span>Filling the form</span><b id="oh-qc-form-pct">0%</b></div>' +
+            '<div class="qc-bar"><div id="oh-qc-form-bar"></div></div>' +
+            '<div id="oh-qc-form-stats" class="qc-run-tally"></div>' +
+          '</div>' +
+        '</div>' +
         '<div class="qc-row">' +
           '<button id="oh-qc-open" class="qc-btn qc-primary">Open Queue Manager</button>' +
           '<button id="oh-qc-debug" class="qc-btn qc-square" title="Debug log" aria-label="Debug log">' + ICON.log + '</button>' +
@@ -2805,6 +2840,9 @@
         '<button id="oh-qc-tailor" class="qc-switch" role="switch" aria-checked="false" ' +
           'title="Off: your own CV, unchanged, on every job (OptimHire\'s Optimize My Resume step is skipped). On: OptimHire\'s runs use Optimize My Resume and CSV jobs a copy of your CV ordered to the job. Workday always keeps your own CV.">' +
           '<span class="qc-switch-text"><b>Tailor CV to each job</b><small id="oh-qc-tailor-sub">Off — your own CV</small></span><span class="qc-toggle"></span></button>' +
+        '<button id="oh-qc-autofill" class="qc-switch" role="switch" aria-checked="true" ' +
+          'title="Fill application forms on ATS pages as you open them. Never on a page another autofill extension is applying on.">' +
+          '<span class="qc-switch-text"><b>Auto-fill on ATS pages</b><small id="oh-qc-autofill-sub">Fills forms on job sites you open</small></span><span class="qc-toggle"></span></button>' +
         '<div class="qc-sep"></div>' +
         /* Applications Account: the e-mail + password new accounts on application
            sites are made with (Workday: one per employer) and signed in with. */
@@ -2865,6 +2903,21 @@
         });
       });
       var tailorLine = document.getElementById('oh-qc-tailor');
+      var autofillLine = document.getElementById('oh-qc-autofill');
+      if (autofillLine) autofillLine.addEventListener('click', function () {
+        chrome.storage.local.get(['ohAutoTrigger'], function (d) {
+          var on = !(d && d.ohAutoTrigger !== false);   // toggle
+          chrome.storage.local.set({ ohAutoTrigger: on }, function () {
+            addLog(on ? 'Auto-fill on ATS pages: on' : 'Auto-fill on ATS pages: off', '');
+            refresh();
+          });
+        });
+      });
+      var skipBtn = document.getElementById('oh-qc-skip');
+      if (skipBtn) skipBtn.addEventListener('click', function () {
+        sendOhSkip('Skip pressed');
+        addLog('Skipping this job…', '');
+      });
       if (tailorLine) tailorLine.addEventListener('click', function () {
         chrome.storage.local.get(['ohTailorCv'], function (d) {
           var on = !(d && d.ohTailorCv === true);   // toggle
@@ -3139,8 +3192,14 @@
         });
         chrome.storage.local.get(['ohHarvestedJobs', RUN_KEY, 'matchingJobCount', 'isAutoProcessStartJob',
                                   'isManuallyStartJob', 'autoApplyState', 'ohAutomationDisabled',
-                                  'ohPreferAts', 'ohQueueTier', 'ohTailorCv'], function (d) {
+                                  'ohPreferAts', 'ohQueueTier', 'ohTailorCv', 'ohAutoTrigger', KEY_ACTIVE], function (d) {
           try {
+            var al = document.getElementById('oh-qc-autofill');
+            if (al) al.setAttribute('aria-checked', d && d.ohAutoTrigger === false ? 'false' : 'true');
+            var lv = document.getElementById('oh-qc-live');
+            var running = !!(d && d.ohAutomationDisabled !== true && ((d.autoApplyState && d.autoApplyState.isActive) ||
+                             d.isAutoProcessStartJob || d.isManuallyStartJob || d[KEY_ACTIVE]));
+            if (lv) lv.style.display = running ? '' : 'none';
             var pl = document.getElementById('oh-qc-prio');
             if (pl) pl.setAttribute('aria-checked', d && d.ohPreferAts === false ? 'false' : 'true');
             paintKo();
@@ -3208,7 +3267,7 @@
           if (changes.ohKnockout || changes.ohKnockoutFixes) paintKo();
           if (changes[KEY_QUEUE] || changes[KEY_ACTIVE] || changes.ohHarvestedJobs ||
               changes.isAutoProcessStartJob || changes.isManuallyStartJob || changes.matchingJobCount ||
-              changes.ohPreferAts || changes.ohQueueTier || changes.ohTailorCv) refresh();
+              changes.ohPreferAts || changes.ohQueueTier || changes.ohTailorCv || changes.ohAutoTrigger) refresh();
           var qt = changes.ohQueueTier && changes.ohQueueTier.newValue;
           if (qt && qt.heldBack) {
             addLog('⇅ Held back a ' + (qt.heldBack === 'reed' ? 'reed.co.uk' : 'job-board') + ' job — applying an ' +

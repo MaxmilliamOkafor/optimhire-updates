@@ -791,6 +791,25 @@ async function startFromOptimHire(msg: Any): Promise<void> {
   await startRun(null);
 }
 
+/** Another job-autofill extension applying on this page (its "Automation In Progress"-style panel
+ *  on screen): assist keeps out of it — two fillers on one form undo each other. */
+const FOREIGN_RUN_RE = /automation in progress|auto-?applying|auto-?filling|autofilling|applying to (this )?job|filling (the |your )?(application|form)/i;
+function otherAutomationOnPage(): boolean {
+  try {
+    if (document.getElementById("ua-ctrl")) return true;
+    const roots = [...Array.from(document.documentElement.children), ...(document.body ? Array.from(document.body.children) : [])];
+    for (const el of roots) {
+      if (el === document.body || el === document.head || /^(oh-|wd-)|optimhire/i.test(el.id || "")) continue;
+      const cs = getComputedStyle(el);
+      if (cs.position !== "fixed" || cs.display === "none" || cs.visibility === "hidden") continue;
+      if (FOREIGN_RUN_RE.test(((el as HTMLElement).innerText || "").slice(0, 400))) return true;
+    }
+  } catch {
+    /* page not ready */
+  }
+  return false;
+}
+
 /** A link straight into "Autofill with Resume" / "Use My Last Application" (a job board's or OptimHire's
  *  apply link): open "Apply Manually" instead — once per tab; the run carries on after the reload. */
 function toApplyManually(): boolean {
@@ -903,7 +922,7 @@ if (TOP && isWorkdayHost()) {
   const ASSIST_PAGES: PageKind[] = ["resumeUpload", "myInformation", "myExperience", "questions", "voluntaryDisclosures", "selfIdentify"];
   const assisted = new Set<string>();
   setInterval(() => {
-    if (!assistOn || readMode() || isActive() || !hasWorkdayApp()) return;
+    if (!assistOn || readMode() || isActive() || !hasWorkdayApp() || otherAutomationOnPage()) return;
     const page = detectPage();
     if (page === "review") {
       const rk = `review|${location.pathname}`;

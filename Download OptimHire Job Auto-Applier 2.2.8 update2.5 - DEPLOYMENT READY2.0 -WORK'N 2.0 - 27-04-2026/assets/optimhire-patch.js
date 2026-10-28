@@ -852,6 +852,28 @@
      everything here that fills fields or presses buttons leaves it alone —
      two fillers on one form undo each other. */
   const wdEngineOwns = () => { try { return !!(window.__ohWdEngine && window.__ohWdEngine.owns()); } catch (_) { return false; } };
+  /* Another job-autofill extension driving this page — its own "Automation In Progress"-style
+     panel on screen (the Jobright / LazyApply-style build's #ua-ctrl, or any fixed panel saying it
+     is applying / filling). Outside our own run, ours keeps out of that page: no auto-fill, no
+     answer corrections — two fillers on one form undo each other, and both slow down. */
+  const FOREIGN_RUN_RE = /automation in progress|auto-?applying|auto-?filling|autofilling|applying to (this )?job|filling (the |your )?(application|form)/i;
+  function otherAutomationOnPage() {
+    try {
+      if (window.top !== window.self) { try { return !!window.top.document && otherAutomationOnPageIn(window.top.document); } catch (_) { return false; } }
+      return otherAutomationOnPageIn(document);
+    } catch (_) { return false; }
+  }
+  function otherAutomationOnPageIn(doc) {
+    if (doc.getElementById('ua-ctrl')) return true;
+    const roots = [...doc.documentElement.children, ...(doc.body ? doc.body.children : [])];
+    for (const el of roots) {
+      if (!el || el === doc.body || el === doc.head || /^(oh-|wd-)|optimhire/i.test(el.id || '')) continue;
+      const cs = getComputedStyle(el);
+      if (cs.position !== 'fixed' || cs.display === 'none' || cs.visibility === 'hidden') continue;
+      if (FOREIGN_RUN_RE.test((el.innerText || '').slice(0, 400))) return true;
+    }
+    return false;
+  }
   const _rawATS = Object.entries(ATS_DOMAINS)
     .find(([domain]) => HOST.includes(domain))?.[1] || null;
   // LinkedIn: only activate on /jobs path — not on feeds, profiles, or messaging
@@ -3588,6 +3610,9 @@
   } catch (_) {}
   function koPageOk() {
     if (_IS_OH_PAGE || _koMasterOff || wdEngineOwns()) return false;
+    /* Only on a job OUR run (or your "Autofill this page") is applying to: another
+       extension's answers and Submit clicks are its own business. */
+    if (!_engagedNow) return false;
     if (CURRENT_ATS) return true;
     return !!document.querySelector('input[type="file"],[data-automation-id^="formField-"]') || /apply|application|career|job|recruit|candidate|vacanc/i.test(location.href);
   }
@@ -8956,6 +8981,7 @@
   let _autoTriggered = false;
   let _autoTriggerRunning = false;
 
+  let _foreignNoted = false;
   async function autoTriggerAutofill() {
     /* Guards */
     if (wdEngineOwns()) return;
@@ -8979,6 +9005,11 @@
     if (ohAutoTrigger === false) return; /* user explicitly disabled */
     const active = await isAutomationActive();
     if (ohAutoTrigger !== true && !active) return;   // unset → only during a run
+    /* Another extension is applying on this page: leave it to it (not our run). */
+    if (!active && otherAutomationOnPage()) {
+      if (!_foreignNoted) { _foreignNoted = true; LOG('Another autofill extension is applying on this page — not auto-filling it'); }
+      return;
+    }
     /* "Auto-fill on supported ATS pages" while browsing: a job board's
        search / listing pages are not application forms (Indeed fired here
        while the user was browsing); its own apply step is. During a run,
