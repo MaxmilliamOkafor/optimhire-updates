@@ -712,7 +712,12 @@
     if (!opts.length) { nativeSet(input, ''); keyDown('ArrowDown'); await sleep(450); opts = comboOptions(); }
     const txt = o => norm(o.textContent);
     let best = null;
-    if (want && opts.length) {
+    /* A location question: the town, never a building in it (and no "first option"). */
+    const isLoc = /location|\bcity\b|\btown\b|residence|where.*(based|live|located)/i.test(getLabel(input) || getLabel(ctl) || '');
+    if (isLoc) {
+      best = want && opts.length ? bestPlaceOption(opts, answer) : null;
+      fallbackFirst = false;
+    } else if (want && opts.length) {
       best = opts.find(o => txt(o) === want) ||
              opts.find(o => txt(o).startsWith(want + ' ') || txt(o).startsWith(want + ',')) ||
              opts.find(o => txt(o).startsWith(want)) ||
@@ -1865,7 +1870,11 @@
         const ps = (o.textContent || '').split(',').map(x => x.trim().toLowerCase()).filter(Boolean);
         return (ps[0] === want ? 2 : 1) + (country && ps.length > 1 && norm(ps[ps.length - 1]) === norm(country) ? 4 : 0);
       };
-      const matching = () => visibleOptions(el).filter(o => (o.textContent || '').toLowerCase().includes(want))
+      /* A place, not a building in it: "National University of Ireland, Galway"
+         was picked for a Galway address. */
+      const NOT_A_PLACE_RE = /\b(universit(y|ies)|college|school|academy|institute|campus|hospital|clinic|airport|station|hotel|stadium|park|centre|center|museum|library|church|ltd|limited|inc|llc|plc|gmbh|corporation|company|bank|office)\b/i;
+      const isPlace = o => !NOT_A_PLACE_RE.test((o.textContent || '').split(',')[0]);
+      const matching = () => visibleOptions(el).filter(o => isPlace(o) && (o.textContent || '').toLowerCase().includes(want))
         .map((o, i) => ({ o, i, s: score(o) })).sort((a, b) => b.s - a.s || a.i - b.i).map(x => x.o);
       let opts = matching();
       if (!opts.length) {                    // retry with a shorter query
@@ -1877,7 +1886,7 @@
           opts = matching();
         }
       }
-      if (!opts.length && ownList(el)) opts = visibleOptions(el);   // the field's own list: its best guess
+      if (!opts.length && ownList(el)) opts = visibleOptions(el).filter(isPlace);   // the field's own list: its best guess (a place)
       if (opts.length) {
         const best = opts[0];
         try { realClick(best); } catch (_) { try { best.click(); } catch (__) {} }
@@ -1914,7 +1923,7 @@
         _tries++;
         const p = await getProfile();
         for (const t of targets) {
-          let val = guessValue(t.lbl, p);
+          let val = placeOnly(guessValue(t.lbl, p));
           if (!val) val = `${(p && p.city) || 'Dublin'}, ${(p && p.country) || 'Ireland'}`;
           await fillOne(t, val);
         }
@@ -4432,9 +4441,13 @@
     const desc = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'files');
     if (!desc || !desc.set) return;
     /* The box's own heading: the nearest ancestor (a few levels up) that
-       holds a label-like element, or the group naming it. */
+       holds a label-like element, or the group naming it — never one that
+       also holds another upload box: that heading is the neighbour's (the
+       "Resume/CV *" above made the cover letter look required, and the CV
+       went into it). */
     function head(inp) {
       for (let n = inp.parentElement, i = 0; n && i < 5; n = n.parentElement, i++) {
+        if (n.querySelectorAll('input[type="file"]').length > 1) break;
         const by = n.getAttribute && n.getAttribute('aria-labelledby');
         const named = by && document.getElementById(by.split(/\s+/)[0]);
         if (named) return named.textContent || '';
@@ -4470,6 +4483,29 @@
       },
     });
   })();
+
+  /* A location as a place: a profile location picked from a suggestion list can be a
+     building in the town ("National University of Ireland, Galway, Ireland") — that
+     part goes ("Galway, Ireland"). */
+  const NOT_A_PLACE_RE = /\b(universit(y|ies)|college|school|academy|institute|campus|hospital|clinic|airport|station|hotel|stadium|museum|library|church|ltd|limited|inc|llc|plc|gmbh|corporation|company|bank|office)\b/i;
+  /* The suggestion to pick for a place: the town itself first ("Galway, County Galway,
+     Ireland"), then another place naming it — never a building in it. null when only
+     buildings match (better left for you than a university as your city). */
+  function bestPlaceOption(opts, val) {
+    const parts = String(val || '').split(',').map(x => x.trim().toLowerCase()).filter(Boolean);
+    const city = parts[0] || '', country = parts.length > 1 ? parts[parts.length - 1] : '';
+    if (!city) return null;
+    const t = o => (o.textContent || '').replace(/\s+/g, ' ').trim().toLowerCase();
+    const places = opts.filter(o => !NOT_A_PLACE_RE.test(t(o).split(',')[0]));
+    return places.find(o => t(o).startsWith(city + ',') && (!country || t(o).endsWith(country))) ||
+           places.find(o => t(o) === city || t(o).startsWith(city + ',') || t(o).startsWith(city + ' ')) ||
+           places.find(o => t(o).includes(city)) || null;
+  }
+  function placeOnly(v) {
+    const parts = String(v || '').split(',').map(x => x.trim()).filter(Boolean);
+    while (parts.length > 1 && NOT_A_PLACE_RE.test(parts[0])) parts.shift();
+    return parts.length === 1 && NOT_A_PLACE_RE.test(parts[0]) ? '' : parts.join(', ');
+  }
 
   /* Which job to apply to first (the CSV queue): quickest company ATS first, then ATS sites
      that need an account, company career sites, job boards, Reed last — lower = sooner.
@@ -4707,7 +4743,7 @@
        matched nothing here and returned '', so the field was skipped and
        the form could never be submitted. */
     if (/^location$|\blocation\b|residence|where.*(based|live|located)|current.*(country|city)|country.*and.*city|city.*and.*country/.test(l)) {
-      if (p.location) return p.location;
+      if (p.location && placeOnly(p.location)) return placeOnly(p.location);
       const _city = p.city || 'Dublin';
       const _ctry = p.country || 'Ireland';
       return `${_city}, ${_ctry}`;
@@ -5539,7 +5575,9 @@
         const opts = $$('[role="option"],[class*="react-select__option"],[class*="Select__option"],[class*="select2-results__option"]', listbox)
           .filter(isVisible);
         const vl = val.toLowerCase();
-        const best = opts.find(o => o.textContent.toLowerCase().includes(vl))
+        const isLoc = /location|\bcity\b|\btown\b|residence|where.*(based|live|located)/i.test(lbl);
+        const best = isLoc ? bestPlaceOption(opts, val)
+          : opts.find(o => o.textContent.toLowerCase().includes(vl))
           || opts.find(o => vl.includes(o.textContent.toLowerCase().trim()))
           || opts[0];
         if (best) { realClick(best); await sleep(300); filledCount++; if (lbl) reportFieldFilled(lbl, 'filled'); }
@@ -5677,7 +5715,7 @@
       ['#last_name,input[id*="last_name"],input[name*="last_name"]',       p.last_name],
       ['#email,input[type="email"],input[id*="email"]',                    p.email],
       ['#phone,input[type="tel"],input[id*="phone"]',                      p.phone],
-      ['input[id*="location"],input[name*="location"]',                    p.city || p.location || ''],
+      ['input[id*="location"],input[name*="location"]',                    p.city || placeOnly(p.location) || ''],
       ['input[id*="linkedin"],input[name*="linkedin"]',                    p.linkedin_profile_url || ''],
       ['input[id*="website"],input[name*="website"],input[id*="portfolio"]', p.website_url || ''],
       ['input[id*="github"],input[name*="github"]',                        p.github_url || ''],
