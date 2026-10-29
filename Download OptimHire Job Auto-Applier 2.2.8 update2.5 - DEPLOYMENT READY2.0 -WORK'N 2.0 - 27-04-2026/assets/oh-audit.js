@@ -62,7 +62,13 @@
       var v = parse(all[k]); var ad = v && (v.applicationDetails || v);
       if (ad && ad.seeker) seekers.push({ from: 'the OptimHire job now (' + k + ')', s: ad.seeker });
     });
-    if (all.ohWdSeeker) seekers.push({ from: 'your details kept from OptimHire jobs (ohWdSeeker)', s: all.ohWdSeeker });
+    if (all.ohWdSeeker) {
+      /* As the fillers do: where you live comes as a whole from the job now when it names any of it. */
+      var kept = Object.assign({}, all.ohWdSeeker), PLACE_RE = /location|city|state|province|region|country|county|zip|postal|post_?code|address|street/i;
+      if (seekers.some(function (x) { return Object.keys(x.s).some(function (k) { return PLACE_RE.test(k) && x.s[k] != null && String(x.s[k]).trim(); }); }))
+        Object.keys(kept).forEach(function (k) { if (PLACE_RE.test(k)) delete kept[k]; });
+      seekers.push({ from: 'your details kept from OptimHire jobs (ohWdSeeker)', s: kept });
+    }
     var cd = parse(all.candidateDetails);
     if (cd) seekers.push({ from: 'your OptimHire profile (candidateDetails)', s: cd });
     var cv = all.ohCvProfile && all.ohCvProfile.profile;

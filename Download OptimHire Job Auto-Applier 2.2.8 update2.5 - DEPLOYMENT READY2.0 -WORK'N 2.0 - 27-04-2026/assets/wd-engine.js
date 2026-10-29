@@ -3169,6 +3169,29 @@ OPTIONS: ${JSON.stringify(options.slice(0, 150))}`
     }
     return v && typeof v === "object" ? v : {};
   }
+  var PLACE_PART = /* @__PURE__ */ new Set([
+    "location",
+    "city",
+    "state",
+    "province",
+    "region",
+    "country",
+    "county",
+    "zip",
+    "zipcode",
+    "postal",
+    "postcode",
+    "address",
+    "street",
+    "lat",
+    "lng",
+    "latitude",
+    "longitude",
+    "timezone"
+  ]);
+  function isPlaceKey(k) {
+    return /post_?code/i.test(k) || k.split(/[_\W]+|(?=[A-Z])/).some((p) => PLACE_PART.has(p.toLowerCase()));
+  }
   async function profileSources(ad) {
     const d = await ST.get([
       "candidateDetails",
@@ -3184,11 +3207,17 @@ OPTIONS: ${JSON.stringify(options.slice(0, 150))}`
       "appAccountEmail"
     ]);
     const merged = Object.assign({}, parse(d[SEEKER_KEY]));
+    const jobs = [];
     for (const k of ["manualApplicationDetail", "autoApplyState", "complexFormData"]) {
       const v = parse(d[k]);
       const s = (v.applicationDetails || v).seeker;
-      if (s && typeof s === "object") Object.assign(merged, s);
+      if (s && typeof s === "object") jobs.push(s);
     }
+    const current = jobs.concat(ad && ad.seeker && typeof ad.seeker === "object" ? [ad.seeker] : []);
+    if (current.some((s) => Object.keys(s).some((k) => isPlaceKey(k) && s[k] != null && s[k] !== "" && typeof s[k] !== "object"))) {
+      for (const k of Object.keys(merged)) if (isPlaceKey(k)) delete merged[k];
+    }
+    for (const s of jobs) Object.assign(merged, s);
     for (const k of ["userDetails", "seekerDetails", "cachedSeekerInfo", "candidateDetails"]) {
       const v = parse(d[k]);
       for (const [kk, vv] of Object.entries({ ...v, ...v.seeker && typeof v.seeker === "object" ? v.seeker : {} }))

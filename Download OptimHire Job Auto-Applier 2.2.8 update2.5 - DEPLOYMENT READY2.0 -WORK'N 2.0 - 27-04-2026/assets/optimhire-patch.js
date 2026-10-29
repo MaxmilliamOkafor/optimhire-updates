@@ -2940,6 +2940,11 @@
   const CONTACT_LABEL_RE = /\b(first|last|middle|full|given|family|preferred|legal|sur)?\s?name\b|e-?mail|phone|mobile|telephone|address|street|city|town|post ?code|postal|zip|county|state|province|country|linkedin|github|website|portfolio|url\b/i;
 
   /* ── Profile helper ─────────────────────────────────────── */
+  const PLACE_PART = { location: 1, city: 1, state: 1, province: 1, region: 1, country: 1, county: 1, zip: 1, zipcode: 1,
+                       postal: 1, postcode: 1, address: 1, street: 1, lat: 1, lng: 1, latitude: 1, longitude: 1, timezone: 1 };
+  function isPlaceKey(k) {
+    return /post_?code/i.test(k) || String(k).split(/[_\W]+|(?=[A-Z])/).some(p => PLACE_PART[p.toLowerCase()]);
+  }
   async function getProfile() {
     const keys = ['candidateDetails', 'cachedSeekerInfo', 'seekerDetails', 'userDetails'];
     const data = await ST.get(keys.concat(['autoApplyState', 'complexFormData', 'manualApplicationDetail', 'ohWdSeeker',
@@ -2962,7 +2967,14 @@
         if (ad && ad.seeker && typeof ad.seeker === 'object') { merged = Object.assign({}, ad.seeker, merged); }
       } catch (_) {}
     }
-    if (data.ohWdSeeker && typeof data.ohWdSeeker === 'object') merged = Object.assign({}, data.ohWdSeeker, merged);   // lowest of all
+    if (data.ohWdSeeker && typeof data.ohWdSeeker === 'object') {   // lowest of all
+      /* Where you live goes as a whole: when the job now names any of it, none
+         of the kept copy's (an old location beside a new city picked the old town). */
+      const kept = Object.assign({}, data.ohWdSeeker);
+      if (Object.keys(merged).some(k => isPlaceKey(k) && merged[k] != null && merged[k] !== '' && typeof merged[k] !== 'object'))
+        Object.keys(kept).forEach(k => { if (isPlaceKey(k)) delete kept[k]; });
+      merged = Object.assign({}, kept, merged);
+    }
 
     // Parse and merge all available profile sources
     for (const key of keys) {

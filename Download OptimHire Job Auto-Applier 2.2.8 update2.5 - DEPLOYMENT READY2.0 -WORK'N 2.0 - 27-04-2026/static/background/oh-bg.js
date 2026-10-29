@@ -955,7 +955,15 @@
      profile is little more than your name — so "Autofill this page", the CSV queue and the
      Greenhouse phone box had no phone to type. Each job's details are kept in ohWdSeeker
      (which the page script and the Workday engine read; oh-persist keeps it): newest wins,
-     an empty value never overwrites one you have. */
+     an empty value never overwrites one you have — except where you live, which is kept
+     as a whole: a job that names any of it (city, location, country, postcode…) replaces
+     all of it, so an old location never sits beside a new city. */
+  var PLACE_PART = { location: 1, city: 1, state: 1, province: 1, region: 1, country: 1, county: 1, zip: 1, zipcode: 1,
+                     postal: 1, postcode: 1, address: 1, street: 1, lat: 1, lng: 1, latitude: 1, longitude: 1, timezone: 1 };
+  function isPlaceKey(k) {
+    return /post_?code/i.test(k) || String(k).split(/[_\W]+|(?=[A-Z])/).some(function (p) { return PLACE_PART[p.toLowerCase()]; });
+  }
+  self.ohIsPlaceKey = isPlaceKey;
   function keepSeeker(v) {
     try {
       if (typeof v === 'string') v = JSON.parse(v);
@@ -965,6 +973,10 @@
       chrome.storage.local.get(['ohWdSeeker'], function (d) {
         var cur = d && d.ohWdSeeker && typeof d.ohWdSeeker === 'object' ? d.ohWdSeeker : {};
         var next = Object.assign({}, cur), changed = false;
+        var newPlace = Object.keys(sk).some(function (k) { return isPlaceKey(k) && sk[k] != null && sk[k] !== '' && typeof sk[k] !== 'object'; });
+        if (newPlace) Object.keys(next).forEach(function (k) {
+          if (isPlaceKey(k) && (sk[k] == null || sk[k] === '') && next[k] != null) { delete next[k]; changed = true; }
+        });
         Object.keys(sk).forEach(function (k) {
           var val = sk[k];
           if (k === 'seeker_response' || val == null || val === '' || typeof val === 'object') return;
