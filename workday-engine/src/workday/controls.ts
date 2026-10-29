@@ -10,6 +10,7 @@ import {
   humanClick,
   isVisible,
   labelOf,
+  norm,
   q,
   qa,
   similarity,
@@ -137,6 +138,41 @@ export function dropdownValue(target: HTMLElement): string {
   return /^select one$|^select$/i.test(t) ? "" : t;
 }
 
+/** A key press on `el` (letters and digits get their KeyX / DigitN code). */
+function key(el: HTMLElement, k: string) {
+  const code = k.length === 1 ? (/\d/.test(k) ? `Digit${k}` : `Key${k.toUpperCase()}`) : k;
+  el.dispatchEvent(new KeyboardEvent("keydown", { key: k, code, bubbles: true, cancelable: true }));
+  el.dispatchEvent(new KeyboardEvent("keyup", { key: k, code, bubbles: true }));
+}
+
+function optionIn(list: HTMLElement, wanted: string, min: number): HTMLElement | null {
+  const opts = qa('[role="option"]', list).filter((o) => text(o) && !/^select one$/i.test(text(o)));
+  return wanted === "decline" ? opts.find((o) => DECLINE_RX.test(text(o))) ?? null : bestMatch(opts, wanted, min);
+}
+
+/**
+ * Long lists (countries, schools) render only the rows in view: type the first letters to
+ * jump, then scroll down until the option appears.
+ */
+async function findInLongList(btn: HTMLElement, wanted: string, min: number): Promise<HTMLElement | null> {
+  let list = openListbox(btn);
+  if (!list || wanted === "decline") return null;
+  const typed = norm(wanted).replace(/[^a-z0-9 ]/g, "").slice(0, 4);
+  for (const ch of typed) key(list, ch);
+  await sleep(250);
+  list = openListbox(btn) ?? list;
+  let m = optionIn(list, wanted, min);
+  for (let i = 0; !m && i < 40 && list.scrollHeight > list.clientHeight; i++) {
+    const before = list.scrollTop;
+    list.scrollTop = before + Math.max(120, list.clientHeight - 20);
+    list.dispatchEvent(new Event("scroll", { bubbles: true }));
+    await sleep(60);
+    m = optionIn(list, wanted, min);
+    if (list.scrollTop === before) break;
+  }
+  return m;
+}
+
 /**
  * Single-select dropdown (a button + listbox). `wanted` may be "decline"
  * to pick the decline-to-answer option.
@@ -147,33 +183,44 @@ export async function selectDropdown(target: HTMLElement, wanted: string, min = 
   const current = dropdownValue(target);
   if (current && (wanted === "decline" ? DECLINE_RX.test(current) : similarity(wanted, current) >= 0.92)) return true;
   if (!openListbox(btn)) await humanClick(btn);
-  const list = await waitFor(() => openListbox(btn), 4000).catch(() => null);
+  let list = await waitFor(() => openListbox(btn), 4000).catch(() => null);
+  if (!list) {
+    btn.focus();
+    key(btn, "ArrowDown");
+    list = await waitFor(() => openListbox(btn), 2000).catch(() => null);
+  }
   if (!list) return false;
-  const opts = qa('[role="option"]', list).filter((o) => text(o) && !/^select one$/i.test(text(o)));
-  const match = wanted === "decline" ? opts.find((o) => DECLINE_RX.test(text(o))) ?? null : bestMatch(opts, wanted, min);
+  const match = optionIn(list, wanted, min) ?? (await findInLongList(btn, wanted, min));
   if (!match) {
     await closeListbox(btn);
     return false;
   }
+  const wantText = text(match);
+  match.scrollIntoView?.({ block: "nearest" });
   await humanClick(match);
   await sleep(120);
   await waitStable(250, 4000);
-  if (dropdownValue(target)) return true;
+  // The value shown must be the option picked, not just any value.
+  if (dropdownValue(target) && similarity(wantText, dropdownValue(target)) >= 0.85) return true;
   // Some tenants ignore the option click: focus the box, Down arrow to the option, Enter.
-  const idx = opts.indexOf(match);
-  btn.focus();
-  if (!openListbox(btn)) btn.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowDown", code: "ArrowDown", keyCode: 40, bubbles: true }));
-  await sleep(150);
-  const list2 = openListbox(btn);
-  if (!list2) return false;
-  for (let i = 0; i <= idx; i++) {
-    (document.activeElement ?? btn).dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowDown", code: "ArrowDown", keyCode: 40, bubbles: true }));
-    await sleep(30);
+  if (!openListbox(btn)) {
+    btn.focus();
+    key(btn, "ArrowDown");
+    await waitFor(() => openListbox(btn), 2000).catch(() => null);
   }
-  (document.activeElement ?? btn).dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", code: "Enter", keyCode: 13, bubbles: true }));
-  await sleep(150);
-  await waitStable(250, 4000);
-  return !!dropdownValue(target);
+  const l2 = openListbox(btn);
+  if (l2) {
+    const opts = qa('[role="option"]', l2);
+    const idx = opts.findIndex((o) => text(o) === wantText);
+    if (idx >= 0) {
+      opts[idx].focus?.();
+      for (let i = 0; i <= idx; i++) key(document.activeElement instanceof HTMLElement ? document.activeElement : l2, "ArrowDown");
+      key(document.activeElement instanceof HTMLElement ? document.activeElement : opts[idx], "Enter");
+      await sleep(150);
+      await waitStable(250, 4000);
+    } else await closeListbox(btn);
+  }
+  return !!dropdownValue(target) && similarity(wantText, dropdownValue(target)) >= 0.85;
 }
 
 export function dropdownOptions(btn?: HTMLElement | null): string[] {
@@ -206,6 +253,19 @@ async function searchSettled(): Promise<void> {
   await sleep(120);
 }
 
+/** Remove chips added since `before` that are not what was asked for (`term`: the search typed). */
+async function dropWrongPicks(target: HTMLElement, before: number, wanted: string, term: string, min: number) {
+  const items = qa(sel("selectedItem"), target);
+  for (const it of items.slice(before).reverse()) {
+    const t = text(it);
+    if (similarity(wanted, t) >= min || (term && similarity(term, t) >= Math.max(min, 0.85))) continue;
+    const del = q('[data-automation-id="DELETE_charm"]', it) ?? q('[aria-label*="remove" i], [aria-label*="delete" i]', it);
+    if (!del) continue;
+    await humanClick(del);
+    await sleep(150);
+  }
+}
+
 /**
  * Multiselect with search (source, skills, phone code, school, field of
  * study, ethnicity). Hierarchical prompts are walked one level at a time.
@@ -217,8 +277,11 @@ export async function multiselectPick(target: HTMLElement, wanted: string, opts:
   if (!input) return false;
   await humanClick(input);
   setNativeValue(input, wanted);
+  const before = multiselectSelected(target).length;
   input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", code: "Enter", keyCode: 13, bubbles: true }));
   await sleep(250);
+  // Enter can select whatever row is highlighted (it picked "Accounting" for Field of Study).
+  if (!opts.fallbackFirst) await dropWrongPicks(target, before, wanted, "", min);
   for (let depth = 0; depth < 3; depth++) {
     await searchSettled();
     const options = await waitFor(() => {
@@ -229,15 +292,19 @@ export async function multiselectPick(target: HTMLElement, wanted: string, opts:
     let match = bestMatch(options, wanted, min);
     if (!match && opts.fallbackFirst) match = options[0];
     if (!match) break;
+    const picked = text(match);
     await humanClick(match);
     await sleep(250);
-    if (multiselectSelected(target).length) {
+    if (!opts.fallbackFirst) await dropWrongPicks(target, before, picked, "", 0.85);
+    if (multiselectSelected(target).length > before || multiselectSelected(target).some((x) => similarity(picked, x) >= 0.85)) {
       blur(input);
       return true;
     }
     // Non-leaf: Workday drilled into a sub-list; loop picks again.
   }
   input.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+  // Leftover search text with no chip made Workday drop the whole entry on save.
+  if (input.value) setNativeValue(input, "");
   blur(input);
   await sleep(80);
   return multiselectSelected(target).some((s) => similarity(wanted, s) >= 0.6);
@@ -260,7 +327,7 @@ function radios(target: HTMLElement): HTMLElement[] {
   return qa('input[type="radio"], [role="radio"]', target);
 }
 
-function optionLabel(input: HTMLElement): string {
+export function optionLabel(input: HTMLElement): string {
   if (input.id) {
     const l = document.querySelector(`label[for="${CSS.escape(input.id)}"]`);
     if (l) return text(l);
@@ -343,6 +410,37 @@ async function setSegment(seg: HTMLInputElement, value: string): Promise<boolean
     seg.focus();
     await chrome.runtime.sendMessage({ type: "wd:trustedType", text: value });
     await sleep(80);
+  }
+  // Workday's date segments ignore synthetic digit keys and can silently revert a
+  // natively-set value, but they do honour ArrowUp/ArrowDown. Nudge once so the
+  // value goes through Workday's own handler, then step to the target if needed.
+  const target = Number(want);
+  if (Number.isFinite(target) && target > 0) {
+    const arrow = (up: boolean) => {
+      const k = up ? "ArrowUp" : "ArrowDown", kc = up ? 38 : 40;
+      for (const t of ["keydown", "keyup"]) {
+        const e = new KeyboardEvent(t, { key: k, code: k, bubbles: true, cancelable: true });
+        Object.defineProperty(e, "keyCode", { get: () => kc });
+        Object.defineProperty(e, "which", { get: () => kc });
+        seg.dispatchEvent(e);
+      }
+    };
+    seg.focus();
+    if (clean() === want) {
+      arrow(true);
+      await sleep(15);
+      arrow(false);
+      await sleep(15);
+    }
+    if (!clean()) {
+      arrow(true);
+      await sleep(20);
+    }
+    for (let i = 0; i < 120 && clean() !== want; i++) {
+      const cur = Number(clean() || 0);
+      arrow(cur < target);
+      await sleep(12);
+    }
   }
   return clean() === want;
 }

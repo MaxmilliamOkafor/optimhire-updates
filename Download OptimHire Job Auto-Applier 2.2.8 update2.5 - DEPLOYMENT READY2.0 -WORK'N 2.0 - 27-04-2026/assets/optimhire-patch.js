@@ -3208,7 +3208,7 @@
       driversLicence: null, clearance: false,
       previouslyEmployed: false, relatives: false, nonCompete: false, convicted: false,
       englishFluent: true,
-      yearsExperience: '7', highestDegree: koDegreeFromCv(_koCv),
+      yearsExperience: '9', highestDegree: koDegreeFromCv(_koCv),
       certifications: ['AWS'],
       salary: String(p.expected_salary || '').trim(),          // as your profile writes it ("£85,000")
       confirmed: false,
@@ -3714,13 +3714,15 @@
     gender:       'Prefer not to say',
     ethnicity:    'Prefer not to say',
     race:         'Prefer not to say',
-    years:        '7',           // every years-of-experience question, unless Knockout answers set another number (koFacts)
-    salary:       '80000',
-    salaryRange:  '80000-110000',
-    hourly:       '45',
-    notice:       '2 weeks',
-    availability: 'Immediately',
-    startDate:    '2 weeks from offer',
+    // Your values (CV + settings profile), not generic ones — these are only used when
+    // the profile itself has no answer.
+    years:        '9',           // every years-of-experience question, unless Knockout answers set another number (koFacts)
+    salary:       '60000',
+    salaryRange:  '60000-80000',
+    hourly:       '',
+    notice:       '1 month',
+    availability: '1 month notice',
+    startDate:    '1 month from offer',
     // Professional canned answers — used ONLY if profile has none
     cover: `I am excited to apply for this role. My background and skills make me a strong fit for the position, and I am eager to contribute to your team's continued success. I bring the technical expertise, drive, and collaborative mindset needed to make an immediate impact.`,
     why: 'I admire the company culture and the opportunity to make a meaningful impact through work that aligns with my skills and long-term career goals.',
@@ -4854,7 +4856,7 @@
                                                           return DEFAULTS.howHeard;
 
     // ── Experience ─────────────────────────────────────────────────────────
-    // Any question asking for a number of years → return 7 (our default)
+    // Any question asking for a number of years → return 9 (our default)
     // This covers text inputs, number inputs, and range dropdowns.
     // The select handler will convert this to the closest range option.
     if (EXP_LABEL_RE.test(l))                             return koFacts().yearsExperience || p.years_experience || DEFAULTS.years;
@@ -5506,7 +5508,7 @@
 
       // 3a) Experience range: pick the bracket closest to our years value
       if (!chosen && EXP_LABEL_RE.test(l)) {
-        const targetYears = parseInt((koFacts().yearsExperience || p.years_experience || DEFAULTS.years).toString()) || 7;
+        const targetYears = parseInt((koFacts().yearsExperience || p.years_experience || DEFAULTS.years).toString()) || 9;
         let bestDist = Infinity;
         for (const o of opts) {
           const nums = (o.text.match(/\d+/g) || []).map(Number).filter(Boolean);
@@ -9791,7 +9793,7 @@
   (function installQueueRunner() {
     const POLL_MS         = 2_000;
     const JOB_TIMEOUT_MS  = 180_000;  // 3 min hard cap per job
-    const WD_JOB_TIMEOUT_MS = 480_000; // Workday: many steps plus the account
+    const WD_JOB_TIMEOUT_MS = 240_000; // Workday: many steps plus the account
     const NO_FORM_GRACE_MS = 18_000;  // if no fillable form by now → unsupported, skip
     const SUBMIT_GRACE_MS = 8_000;    // wait this long after submit before declaring success
     const CONFIRM_WAIT_MS = 30_000;   // keep looking for a REAL confirmation this long after submit

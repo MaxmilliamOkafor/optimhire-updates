@@ -3,6 +3,7 @@
  * that answers whatever the tenant added on top.
  */
 import {
+  DECLINE_RX,
   NeedsHuman,
   buttonByText,
   byAid,
@@ -24,6 +25,7 @@ import {
   kindOf,
   multiselectPick,
   multiselectSelected,
+  optionLabel,
   optionsOf,
   readValue,
   searchVariants,
@@ -152,8 +154,20 @@ async function ensureBlockCount(ctx: Ctx, sectionEl: HTMLElement, anchor: AidKey
     }
     const before = bs.length;
     await humanClick(add);
-    await waitFor(() => blocks(sectionEl, anchor).length > before, 6000).catch(() => null);
-    await waitStable(300, 5000);
+    const grew = () => blocks(sectionEl, anchor).length > before;
+    // Workday can swallow the synthetic click (focus change re-renders the form):
+    // re-find "Add Another" and click it natively until the new entry appears.
+    let ok = await waitFor(grew, 2500).then(() => true, () => false);
+    for (let attempt = 0; !ok && attempt < 3; attempt++) {
+      await waitStable(200, 4000);
+      const fresh = addButton(sectionEl);
+      if (!fresh) break;
+      fresh.scrollIntoView({ block: "center" });
+      await sleep(120);
+      fresh.click();
+      ok = await waitFor(grew, 3500).then(() => true, () => false);
+    }
+    await waitStable(200, 3000);
     bs = blocks(sectionEl, anchor);
   }
   return bs;
@@ -396,6 +410,23 @@ async function uploadDocuments(ctx: Ctx) {
   }
 }
 
+/** Entries Workday emptied again (a re-render after "Add Another"): filled once more, twice at most. */
+async function verifyBlocks<T>(ctx: Ctx, sectionEl: HTMLElement, anchor: AidKey, items: T[], fillFn: (ctx: Ctx, block: HTMLElement, item: T) => Promise<void>) {
+  for (let pass = 0; pass < 2; pass++) {
+    await waitStable(150, 2000);
+    const bs = await ensureBlockCount(ctx, sectionEl, anchor, items.length);
+    let fixed = 0;
+    for (let i = 0; i < Math.min(bs.length, items.length); i++) {
+      const a = field(anchor, bs[i]);
+      if (a && readValue(containerOf(a))) continue;
+      await fillFn(ctx, bs[i], items[i]);
+      fixed++;
+    }
+    if (!fixed) return;
+    ctx.log(`Re-filled ${fixed} ${anchor === "jobTitleF" ? "work" : "education"} entr(ies) that came back empty`, "warn");
+  }
+}
+
 export async function myExperience(ctx: Ctx): Promise<void> {
   await hooks.beforeExperience?.(); // [oh]
   const p = ctx.profile;
@@ -404,6 +435,7 @@ export async function myExperience(ctx: Ctx): Promise<void> {
   if (work && p.work.length) {
     const bs = await ensureBlockCount(ctx, work, "jobTitleF", p.work.length);
     for (let i = 0; i < Math.min(bs.length, p.work.length); i++) await fillWork(ctx, bs[i], p.work[i]);
+    await verifyBlocks(ctx, work, "jobTitleF", p.work, fillWork);
     ctx.log(`Work experience: ${p.work.length} role(s) filled`);
     await markCurrentRole(ctx, work); // [oh]
   } else if (work) {
@@ -416,6 +448,7 @@ export async function myExperience(ctx: Ctx): Promise<void> {
     const anchor: AidKey = q(sel("schoolF"), edu) ? "schoolF" : "degreeF";
     const bs = await ensureBlockCount(ctx, edu, anchor, p.education.length);
     for (let i = 0; i < Math.min(bs.length, p.education.length); i++) await fillEducation(ctx, bs[i], p.education[i]);
+    await verifyBlocks(ctx, edu, anchor, p.education, fillEducation);
     ctx.log(`Education: ${p.education.length} entr(ies) filled`);
   } else if (edu && hooks.autoSubmit?.()) {
     await pruneIncomplete(ctx, edu, q(sel("schoolF"), edu) ? "schoolF" : "degreeF"); // [oh]
@@ -554,20 +587,32 @@ const CONSENT_RX = /i have read|acknowledge|consent|i agree|i accept|privacy (st
 export async function selfIdentify(ctx: Ctx): Promise<void> {
   const name = `${ctx.profile.personal.firstName} ${ctx.profile.personal.lastName}`.trim();
   await fill(ctx, "selfIdName", name);
-  const dateEl = field("selfIdDate");
+  const dateEl = field("selfIdDate") ?? q('[id$="dateSignedOn-dateSectionMonth-input"], [id$="dateSignedOn-dateSectionYear-input"]');
   if (dateEl) {
     const c = containerOf(dateEl);
     handled.add(c);
     const d = new Date();
-    const iso = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
-    if (!readValue(c)) await setDate(c, iso);
+    const mm = String(d.getMonth() + 1).padStart(2, "0"), dd = String(d.getDate()).padStart(2, "0"), yyyy = String(d.getFullYear());
+    const iso = `${yyyy}-${mm}-${dd}`;
+    // Today's date, checked segment by segment (a value Workday reverted counts as not set).
+    const seg = (s: AidKey) => (q<HTMLInputElement>(sel(s), c)?.value || "").replace(/^0+/, "");
+    const isToday = () => seg("dateMonth") === String(+mm) && (!q(sel("dateDay"), c) || seg("dateDay") === String(+dd)) && seg("dateYear") === yyyy;
+    for (let i = 0; i < 2 && !isToday(); i++) await setDate(c, iso);
+    if (!isToday()) ctx.flag("Self-identification date", `Couldn't set today's date (${mm}/${dd}/${yyyy})`);
   }
   const dis = field("disability");
   if (dis) {
     const c = containerOf(dis);
     handled.add(c);
     const pref = ctx.profile.eeo.disability;
-    const wanted = pref === "yes" ? "Yes, I have a disability" : pref === "no" ? "No, I do not have a disability" : "decline";
+    const wanted = pref === "yes" ? "Yes, I have a disability, or have had one in the past" : pref === "no" ? "No, I do not have a disability and have not had one in the past" : "decline";
+    // Untick anything already ticked that isn't the saved choice (only one box may be checked).
+    for (const b of qa('input[type="checkbox"], [role="checkbox"]', c)) {
+      const on = (b as HTMLInputElement).checked || b.getAttribute("aria-checked") === "true";
+      const l = optionLabel(b);
+      const right = wanted === "decline" ? DECLINE_RX.test(l) : similarity(wanted, l) >= 0.85;
+      if (on && !right) await setCheckbox(b, false);
+    }
     const ok = (await checkInGroup(c, wanted)) || (await selectRadio(c, wanted));
     if (!ok) ctx.flag("Disability status", "Couldn't select your saved choice");
   }

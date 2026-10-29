@@ -113,6 +113,17 @@
     "申请已提交",
     "感谢您的申请"
   ]);
+  var SOMETHING_WRONG_RX = rx([
+    "something went wrong\\.? please refresh",
+    "something went wrong\\.? please try again",
+    "etwas ist schiefgelaufen",
+    "une erreur s'est produite\\.? veuillez actualiser",
+    "algo salió mal",
+    "algo deu errado",
+    "qualcosa è andato storto",
+    "er is iets misgegaan",
+    "coś poszło nie tak"
+  ]);
   var ALREADY_APPLIED_RX = rx([
     "(you'?ve|you have) already applied",
     "already applied (for|to) this (job|position|role)",
@@ -557,8 +568,8 @@
     pageSelfId: ["applyFlowSelfIdentifyPage", "selfIdentificationPage"],
     pageReview: ["applyFlowReviewPage", "reviewJobApplicationPage"]
   };
-  function sel(key) {
-    return AID[key].map((id) => `[data-automation-id="${id}"]`).join(",");
+  function sel(key2) {
+    return AID[key2].map((id) => `[data-automation-id="${id}"]`).join(",");
   }
   var LABELS = {
     firstName: Q.firstName,
@@ -628,15 +639,15 @@
   function q(selector, root2 = document) {
     return root2.querySelector(selector);
   }
-  function byAid(key, root2 = document) {
-    for (const id of AID[key]) {
+  function byAid(key2, root2 = document) {
+    for (const id of AID[key2]) {
       const hit = qa(`[data-automation-id="${id}"]`, root2).find(isVisible);
       if (hit) return hit;
     }
     return null;
   }
-  function anyAid(key, root2 = document) {
-    return qa(sel(key), root2).some(isVisible);
+  function anyAid(key2, root2 = document) {
+    return qa(sel(key2), root2).some(isVisible);
   }
   async function waitFor(fn, timeoutMs = 8e3, everyMs = 100) {
     const start = Date.now();
@@ -686,10 +697,10 @@
     if (/\*/.test(text(container.querySelector("legend, label")))) return true;
     return !!container.querySelector('[aria-required="true"], [required]');
   }
-  function field(key, root2 = document) {
-    const hit = byAid(key, root2);
+  function field(key2, root2 = document) {
+    const hit = byAid(key2, root2);
     if (hit) return hit;
-    const rx2 = LABELS[key];
+    const rx2 = LABELS[key2];
     if (!rx2) return null;
     for (const c of qa('[data-automation-id^="formField-"]', root2)) {
       if (!isVisible(c)) continue;
@@ -700,7 +711,7 @@
   async function humanClick(el) {
     checkAbort();
     el.scrollIntoView({ block: "center", inline: "nearest" });
-    await sleep(60);
+    await sleep(25);
     const r = el.getBoundingClientRect();
     const x = r.left + r.width / 2;
     const y = r.top + r.height / 2;
@@ -756,7 +767,7 @@
     let score = 0;
     for (const el of els) {
       const s = similarity(wanted, text(el));
-      if (s > score) {
+      if (s > score || s === score && best && s > 0 && text(el).length < text(best).length) {
         score = s;
         best = el;
       }
@@ -853,38 +864,75 @@
     const t = text(b);
     return /^select one$|^select$/i.test(t) ? "" : t;
   }
+  function key(el, k) {
+    const code = k.length === 1 ? /\d/.test(k) ? `Digit${k}` : `Key${k.toUpperCase()}` : k;
+    el.dispatchEvent(new KeyboardEvent("keydown", { key: k, code, bubbles: true, cancelable: true }));
+    el.dispatchEvent(new KeyboardEvent("keyup", { key: k, code, bubbles: true }));
+  }
+  function optionIn(list, wanted, min) {
+    const opts = qa('[role="option"]', list).filter((o) => text(o) && !/^select one$/i.test(text(o)));
+    return wanted === "decline" ? opts.find((o) => DECLINE_RX2.test(text(o))) ?? null : bestMatch(opts, wanted, min);
+  }
+  async function findInLongList(btn, wanted, min) {
+    let list = openListbox(btn);
+    if (!list || wanted === "decline") return null;
+    const typed = norm(wanted).replace(/[^a-z0-9 ]/g, "").slice(0, 4);
+    for (const ch of typed) key(list, ch);
+    await sleep(250);
+    list = openListbox(btn) ?? list;
+    let m = optionIn(list, wanted, min);
+    for (let i = 0; !m && i < 40 && list.scrollHeight > list.clientHeight; i++) {
+      const before = list.scrollTop;
+      list.scrollTop = before + Math.max(120, list.clientHeight - 20);
+      list.dispatchEvent(new Event("scroll", { bubbles: true }));
+      await sleep(60);
+      m = optionIn(list, wanted, min);
+      if (list.scrollTop === before) break;
+    }
+    return m;
+  }
   async function selectDropdown(target, wanted, min = 0.6) {
     const btn = dropdownButton(target);
     if (!btn) return false;
     const current = dropdownValue(target);
     if (current && (wanted === "decline" ? DECLINE_RX2.test(current) : similarity(wanted, current) >= 0.92)) return true;
     if (!openListbox(btn)) await humanClick(btn);
-    const list = await waitFor(() => openListbox(btn), 4e3).catch(() => null);
+    let list = await waitFor(() => openListbox(btn), 4e3).catch(() => null);
+    if (!list) {
+      btn.focus();
+      key(btn, "ArrowDown");
+      list = await waitFor(() => openListbox(btn), 2e3).catch(() => null);
+    }
     if (!list) return false;
-    const opts = qa('[role="option"]', list).filter((o) => text(o) && !/^select one$/i.test(text(o)));
-    const match = wanted === "decline" ? opts.find((o) => DECLINE_RX2.test(text(o))) ?? null : bestMatch(opts, wanted, min);
+    const match = optionIn(list, wanted, min) ?? await findInLongList(btn, wanted, min);
     if (!match) {
       await closeListbox(btn);
       return false;
     }
+    const wantText = text(match);
+    match.scrollIntoView?.({ block: "nearest" });
     await humanClick(match);
     await sleep(120);
     await waitStable(250, 4e3);
-    if (dropdownValue(target)) return true;
-    const idx = opts.indexOf(match);
-    btn.focus();
-    if (!openListbox(btn)) btn.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowDown", code: "ArrowDown", keyCode: 40, bubbles: true }));
-    await sleep(150);
-    const list2 = openListbox(btn);
-    if (!list2) return false;
-    for (let i = 0; i <= idx; i++) {
-      (document.activeElement ?? btn).dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowDown", code: "ArrowDown", keyCode: 40, bubbles: true }));
-      await sleep(30);
+    if (dropdownValue(target) && similarity(wantText, dropdownValue(target)) >= 0.85) return true;
+    if (!openListbox(btn)) {
+      btn.focus();
+      key(btn, "ArrowDown");
+      await waitFor(() => openListbox(btn), 2e3).catch(() => null);
     }
-    (document.activeElement ?? btn).dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", code: "Enter", keyCode: 13, bubbles: true }));
-    await sleep(150);
-    await waitStable(250, 4e3);
-    return !!dropdownValue(target);
+    const l2 = openListbox(btn);
+    if (l2) {
+      const opts = qa('[role="option"]', l2);
+      const idx = opts.findIndex((o) => text(o) === wantText);
+      if (idx >= 0) {
+        opts[idx].focus?.();
+        for (let i = 0; i <= idx; i++) key(document.activeElement instanceof HTMLElement ? document.activeElement : l2, "ArrowDown");
+        key(document.activeElement instanceof HTMLElement ? document.activeElement : opts[idx], "Enter");
+        await sleep(150);
+        await waitStable(250, 4e3);
+      } else await closeListbox(btn);
+    }
+    return !!dropdownValue(target) && similarity(wantText, dropdownValue(target)) >= 0.85;
   }
   function dropdownOptions(btn) {
     const list = openListbox(btn);
@@ -909,6 +957,17 @@
     await waitFor(() => !qa(sel("spinner")).some(isVisible), 6e3, 100).catch(() => null);
     await sleep(120);
   }
+  async function dropWrongPicks(target, before, wanted, term, min) {
+    const items = qa(sel("selectedItem"), target);
+    for (const it of items.slice(before).reverse()) {
+      const t = text(it);
+      if (similarity(wanted, t) >= min || term && similarity(term, t) >= Math.max(min, 0.85)) continue;
+      const del = q('[data-automation-id="DELETE_charm"]', it) ?? q('[aria-label*="remove" i], [aria-label*="delete" i]', it);
+      if (!del) continue;
+      await humanClick(del);
+      await sleep(150);
+    }
+  }
   async function multiselectPick(target, wanted, opts = {}) {
     const min = opts.min ?? 0.6;
     if (multiselectSelected(target).some((s) => similarity(wanted, s) >= 0.85)) return true;
@@ -916,8 +975,10 @@
     if (!input) return false;
     await humanClick(input);
     setNativeValue(input, wanted);
+    const before = multiselectSelected(target).length;
     input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", code: "Enter", keyCode: 13, bubbles: true }));
     await sleep(250);
+    if (!opts.fallbackFirst) await dropWrongPicks(target, before, wanted, "", min);
     for (let depth = 0; depth < 3; depth++) {
       await searchSettled();
       const options = await waitFor(() => {
@@ -928,14 +989,17 @@
       let match = bestMatch(options, wanted, min);
       if (!match && opts.fallbackFirst) match = options[0];
       if (!match) break;
+      const picked = text(match);
       await humanClick(match);
       await sleep(250);
-      if (multiselectSelected(target).length) {
+      if (!opts.fallbackFirst) await dropWrongPicks(target, before, picked, "", 0.85);
+      if (multiselectSelected(target).length > before || multiselectSelected(target).some((x) => similarity(picked, x) >= 0.85)) {
         blur(input);
         return true;
       }
     }
     input.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+    if (input.value) setNativeValue(input, "");
     blur(input);
     await sleep(80);
     return multiselectSelected(target).some((s) => similarity(wanted, s) >= 0.6);
@@ -1021,6 +1085,34 @@
       seg.focus();
       await chrome.runtime.sendMessage({ type: "wd:trustedType", text: value });
       await sleep(80);
+    }
+    const target = Number(want);
+    if (Number.isFinite(target) && target > 0) {
+      const arrow = (up) => {
+        const k = up ? "ArrowUp" : "ArrowDown", kc = up ? 38 : 40;
+        for (const t of ["keydown", "keyup"]) {
+          const e = new KeyboardEvent(t, { key: k, code: k, bubbles: true, cancelable: true });
+          Object.defineProperty(e, "keyCode", { get: () => kc });
+          Object.defineProperty(e, "which", { get: () => kc });
+          seg.dispatchEvent(e);
+        }
+      };
+      seg.focus();
+      if (clean() === want) {
+        arrow(true);
+        await sleep(15);
+        arrow(false);
+        await sleep(15);
+      }
+      if (!clean()) {
+        arrow(true);
+        await sleep(20);
+      }
+      for (let i = 0; i < 120 && clean() !== want; i++) {
+        const cur = Number(clean() || 0);
+        arrow(cur < target);
+        await sleep(12);
+      }
     }
     return clean() === want;
   }
@@ -1174,6 +1266,7 @@
   function detectPage() {
     const body = text(document.body).slice(0, 5e3);
     const next = nextButton();
+    if (SOMETHING_WRONG_RX.test(body) && !qa('[data-automation-id^="formField-"]').some(isVisible)) return "somethingWrong";
     if (SUBMITTED_RX.test(body) && !next)
       return "submitted";
     if (anyAid("verifyPassword") || anyAid("createAccountSubmit")) return "createAccount";
@@ -1191,7 +1284,7 @@
       ["pageMyInfo", "myInformation"],
       ["pageAutofill", "resumeUpload"]
     ];
-    for (const [key, kind] of PAGES) if (anyAid(key)) return kind;
+    for (const [key2, kind] of PAGES) if (anyAid(key2)) return kind;
     const step = activeStepName();
     if (step) {
       if (isSubmitButton(next)) return "review";
@@ -1281,17 +1374,17 @@
     masterCoverLetter: "wd:masterCoverLetter",
     answers: "wd:answerBank",
     apps: "wd:applications",
-    job: (key) => `wd:job:${key}`,
+    job: (key2) => `wd:job:${key2}`,
     lastJob: (host2) => `wd:lastJob:${host2}`,
-    docs: (key) => `wd:docs:${key}`,
+    docs: (key2) => `wd:docs:${key2}`,
     run: (host2) => `wd:run:${host2}`
   };
-  async function get(key) {
-    const out = await chrome.storage.local.get(key);
-    return out?.[key];
+  async function get(key2) {
+    const out = await chrome.storage.local.get(key2);
+    return out?.[key2];
   }
-  async function set(key, value) {
-    await chrome.storage.local.set({ [key]: value });
+  async function set(key2, value) {
+    await chrome.storage.local.set({ [key2]: value });
   }
   function emptyProfile() {
     return {
@@ -1367,8 +1460,8 @@
     await set(K.job(job.key), job);
     await set(K.lastJob(job.tenantHost), job.key);
   }
-  async function getJob(key) {
-    return get(K.job(key));
+  async function getJob(key2) {
+    return get(K.job(key2));
   }
   async function getLastJobKey(host2) {
     return get(K.lastJob(host2));
@@ -1416,7 +1509,7 @@
 
   // src/workday/context.ts
   async function pace(ctx) {
-    await sleep(ctx.settings.fieldDelayMs + Math.floor(Math.random() * 60));
+    await sleep(ctx.settings.fieldDelayMs + Math.floor(Math.random() * 15));
   }
   function addFlag(run, f) {
     if (!run.flags.some((x) => x.label === f.label && x.page === f.page)) run.flags.push(f);
@@ -1500,8 +1593,8 @@
     }
     return false;
   }
-  async function submit(key, label) {
-    const btn = byAid(key) ?? buttonByText(label);
+  async function submit(key2, label) {
+    const btn = byAid(key2) ?? buttonByText(label);
     if (!btn) throw new NeedsHuman("Couldn't find the submit button on the sign-in form.");
     await humanClick(btn);
     await sleep(400);
@@ -1857,8 +1950,8 @@ OPTIONS: ${JSON.stringify(options.slice(0, 150))}`
       return false;
     }
   }
-  async function fill(ctx, key, value, root2 = document) {
-    const el = field(key, root2);
+  async function fill(ctx, key2, value, root2 = document) {
+    const el = field(key2, root2);
     if (!el) return false;
     const c = containerOf(el);
     handled.add(c);
@@ -1871,7 +1964,7 @@ OPTIONS: ${JSON.stringify(options.slice(0, 150))}`
     });
     if (!ok && ["dropdown", "radio", "checkboxGroup"].includes(kindOf(c))) ok = await translateChoice(ctx, c, value);
     if (!ok) {
-      const label = labelOf(c) || key;
+      const label = labelOf(c) || key2;
       if (isRequired(c)) ctx.flag(label, `Couldn't set "${value}"`);
       else ctx.log(`Skipped optional "${label}" (couldn't set "${value}")`, "warn");
     }
@@ -1880,8 +1973,8 @@ OPTIONS: ${JSON.stringify(options.slice(0, 150))}`
   function bulletsText(bullets) {
     return bullets.map((b) => `• ${b.replace(/^[•\-*]\s*/, "")}`).join("\n");
   }
-  function section(key, heading2) {
-    const byId = byAid(key);
+  function section(key2, heading2) {
+    const byId = byAid(key2);
     if (byId) return byId;
     const h = qa("h2, h3, h4, legend, [role='heading']").find((e) => isVisible(e) && heading2.test(text(e)));
     return h ? h.closest("section, fieldset, [role='group'], div[data-automation-id]") ?? h.parentElement : null;
@@ -1920,8 +2013,18 @@ OPTIONS: ${JSON.stringify(options.slice(0, 150))}`
       }
       const before = bs.length;
       await humanClick(add);
-      await waitFor(() => blocks(sectionEl, anchor).length > before, 6e3).catch(() => null);
-      await waitStable(300, 5e3);
+      const grew = () => blocks(sectionEl, anchor).length > before;
+      let ok = await waitFor(grew, 2500).then(() => true, () => false);
+      for (let attempt = 0; !ok && attempt < 3; attempt++) {
+        await waitStable(200, 4e3);
+        const fresh = addButton(sectionEl);
+        if (!fresh) break;
+        fresh.scrollIntoView({ block: "center" });
+        await sleep(120);
+        fresh.click();
+        ok = await waitFor(grew, 3500).then(() => true, () => false);
+      }
+      await waitStable(200, 3e3);
       bs = blocks(sectionEl, anchor);
     }
     return bs;
@@ -2127,6 +2230,21 @@ OPTIONS: ${JSON.stringify(options.slice(0, 150))}`
       }
     }
   }
+  async function verifyBlocks(ctx, sectionEl, anchor, items, fillFn) {
+    for (let pass = 0; pass < 2; pass++) {
+      await waitStable(150, 2e3);
+      const bs = await ensureBlockCount(ctx, sectionEl, anchor, items.length);
+      let fixed = 0;
+      for (let i = 0; i < Math.min(bs.length, items.length); i++) {
+        const a = field(anchor, bs[i]);
+        if (a && readValue(containerOf(a))) continue;
+        await fillFn(ctx, bs[i], items[i]);
+        fixed++;
+      }
+      if (!fixed) return;
+      ctx.log(`Re-filled ${fixed} ${anchor === "jobTitleF" ? "work" : "education"} entr(ies) that came back empty`, "warn");
+    }
+  }
   async function myExperience(ctx) {
     await hooks.beforeExperience?.();
     const p = ctx.profile;
@@ -2134,6 +2252,7 @@ OPTIONS: ${JSON.stringify(options.slice(0, 150))}`
     if (work && p.work.length) {
       const bs = await ensureBlockCount(ctx, work, "jobTitleF", p.work.length);
       for (let i = 0; i < Math.min(bs.length, p.work.length); i++) await fillWork(ctx, bs[i], p.work[i]);
+      await verifyBlocks(ctx, work, "jobTitleF", p.work, fillWork);
       ctx.log(`Work experience: ${p.work.length} role(s) filled`);
       await markCurrentRole(ctx, work);
     } else if (work) {
@@ -2145,6 +2264,7 @@ OPTIONS: ${JSON.stringify(options.slice(0, 150))}`
       const anchor = q(sel("schoolF"), edu) ? "schoolF" : "degreeF";
       const bs = await ensureBlockCount(ctx, edu, anchor, p.education.length);
       for (let i = 0; i < Math.min(bs.length, p.education.length); i++) await fillEducation(ctx, bs[i], p.education[i]);
+      await verifyBlocks(ctx, edu, anchor, p.education, fillEducation);
       ctx.log(`Education: ${p.education.length} entr(ies) filled`);
     } else if (edu && hooks.autoSubmit?.()) {
       await pruneIncomplete(ctx, edu, q(sel("schoolF"), edu) ? "schoolF" : "degreeF");
@@ -2213,8 +2333,8 @@ OPTIONS: ${JSON.stringify(options.slice(0, 150))}`
     }
     await waitStable(1200, 3e4);
   }
-  async function eeo(ctx, key, pref, label) {
-    const el = field(key);
+  async function eeo(ctx, key2, pref, label) {
+    const el = field(key2);
     if (!el) return;
     const c = containerOf(el);
     handled.add(c);
@@ -2262,20 +2382,30 @@ OPTIONS: ${JSON.stringify(options.slice(0, 150))}`
   async function selfIdentify(ctx) {
     const name = `${ctx.profile.personal.firstName} ${ctx.profile.personal.lastName}`.trim();
     await fill(ctx, "selfIdName", name);
-    const dateEl = field("selfIdDate");
+    const dateEl = field("selfIdDate") ?? q('[id$="dateSignedOn-dateSectionMonth-input"], [id$="dateSignedOn-dateSectionYear-input"]');
     if (dateEl) {
       const c = containerOf(dateEl);
       handled.add(c);
       const d = /* @__PURE__ */ new Date();
-      const iso = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
-      if (!readValue(c)) await setDate(c, iso);
+      const mm = String(d.getMonth() + 1).padStart(2, "0"), dd = String(d.getDate()).padStart(2, "0"), yyyy = String(d.getFullYear());
+      const iso = `${yyyy}-${mm}-${dd}`;
+      const seg = (s) => (q(sel(s), c)?.value || "").replace(/^0+/, "");
+      const isToday = () => seg("dateMonth") === String(+mm) && (!q(sel("dateDay"), c) || seg("dateDay") === String(+dd)) && seg("dateYear") === yyyy;
+      for (let i = 0; i < 2 && !isToday(); i++) await setDate(c, iso);
+      if (!isToday()) ctx.flag("Self-identification date", `Couldn't set today's date (${mm}/${dd}/${yyyy})`);
     }
     const dis = field("disability");
     if (dis) {
       const c = containerOf(dis);
       handled.add(c);
       const pref = ctx.profile.eeo.disability;
-      const wanted = pref === "yes" ? "Yes, I have a disability" : pref === "no" ? "No, I do not have a disability" : "decline";
+      const wanted = pref === "yes" ? "Yes, I have a disability, or have had one in the past" : pref === "no" ? "No, I do not have a disability and have not had one in the past" : "decline";
+      for (const b of qa('input[type="checkbox"], [role="checkbox"]', c)) {
+        const on = b.checked || b.getAttribute("aria-checked") === "true";
+        const l = optionLabel(b);
+        const right = wanted === "decline" ? DECLINE_RX2.test(l) : similarity(wanted, l) >= 0.85;
+        if (on && !right) await setCheckbox(b, false);
+      }
       const ok = await checkInGroup(c, wanted) || await selectRadio(c, wanted);
       if (!ok) ctx.flag("Disability status", "Couldn't select your saved choice");
     }
@@ -2663,6 +2793,23 @@ OPTIONS: ${JSON.stringify(options.slice(0, 150))}`
         return "stop";
       case "candidateHome":
         throw new NeedsHuman("You're on your candidate home page. Open the job (or the draft under My Applications), then click Resume.");
+      case "somethingWrong": {
+        const k = `ua-wd-refresh|${location.pathname}`;
+        const n = Number(sessionStorage.getItem(k) || 0);
+        if (n >= 2) throw new Error('Workday kept saying "Something went wrong" — skipping this job');
+        sessionStorage.setItem(k, String(n + 1));
+        await ctx.save();
+        const posting = location.href.replace(/\/apply(\/.*)?(\?.*)?$/, "");
+        if (n === 1 && posting !== location.href) {
+          ctx.log('Workday still says "Something went wrong" — reopening the job posting', "warn");
+          location.href = posting;
+        } else {
+          ctx.log('Workday said "Something went wrong" — refreshing the page', "warn");
+          location.reload();
+        }
+        await sleep(1e4);
+        return "stop";
+      }
       default:
         ctx.run.attempts++;
         if (ctx.run.attempts > 5) throw new NeedsHuman("Unrecognised page. Move to the next step yourself, then click Resume.");
@@ -2720,6 +2867,15 @@ OPTIONS: ${JSON.stringify(options.slice(0, 150))}`
     ctx.log("Submitting the application");
     await humanClick(btn);
     await sleep(500);
+    const moved = () => detectPage() !== "review" || errorMessages().length > 0;
+    if (!await waitFor(moved, 3e3, 200).then(() => true, () => false)) {
+      const again = nextButton();
+      if (again && isSubmitButton(again)) {
+        ctx.log("Submit click didn't register — retrying with a native click", "warn");
+        again.click();
+        await sleep(500);
+      }
+    }
     const outcome = await waitFor(() => detectPage() === "submitted" ? "done" : errorMessages().length ? "error" : null, 3e4, 250).catch(
       () => "timeout"
     );
@@ -3274,7 +3430,7 @@ OPTIONS: ${JSON.stringify(options.slice(0, 150))}`
         current: !!(w.is_current ?? w.current ?? w.currently_working ?? w.currently_work_here) || !end && /present|current|now/i.test(String(endRaw)),
         bullets: String(w.description ?? w.summary ?? w.responsibilities ?? "").split(/\n+|•/).map((x) => x.replace(/^[\s\-*]+/, "").trim()).filter(Boolean).slice(0, 6)
       };
-    }).filter((w) => w.title && w.company && w.start);
+    }).filter((w) => w.title && w.company);
     const education = listOf(s, ["education", "educations", "education_history", "academics", "qualifications"]).map((e, i) => ({
       id: `e${i + 1}`,
       school: pick(e, "school", "school_name", "institution", "institute", "university", "college"),
@@ -3361,6 +3517,27 @@ OPTIONS: ${JSON.stringify(options.slice(0, 150))}`
         previouslyWorkedHere: false
       }
     });
+    {
+      const pk = (...k) => pick(s, ...k);
+      const yn = (v) => {
+        const t = String(v || "").trim().toLowerCase();
+        if (!t || /prefer not|decline|wish/.test(t)) return "decline";
+        if (/^(no|i do not|i don'?t|not a|none)/.test(t)) return "no";
+        if (/^(yes|i have|i am)/.test(t)) return "yes";
+        return "decline";
+      };
+      const dc = (v) => {
+        const t = String(v || "").trim();
+        return !t || /prefer not|decline|do not wish|don'?t wish|not to say/i.test(t) ? "decline" : t;
+      };
+      base.eeo = {
+        gender: dc(pk("gender", "sex")),
+        hispanicOrLatino: yn(pk("hispanic_latino", "hispanicOrLatino", "hispanic", "latino")),
+        ethnicity: dc(pk("ethnicity", "race", "race_ethnicity")),
+        veteran: dc(pk("veteran", "veteran_status", "veteranStatus")),
+        disability: yn(pk("disability", "disability_status", "disabilityStatus", "has_disability"))
+      };
+    }
     const withCv = async (prof) => {
       if (prof.work.length || !cvUrl) {
         cvReady = Promise.resolve();
@@ -3381,13 +3558,13 @@ OPTIONS: ${JSON.stringify(options.slice(0, 150))}`
     const fillIn = (a, b) => {
       for (const k of Object.keys(b)) {
         if (b[k] && typeof b[k] === "object" && !Array.isArray(b[k])) fillIn(a[k] ??= {}, b[k]);
-        else if (a[k] === "" || a[k] == null || Array.isArray(a[k]) && !a[k].length) a[k] = b[k];
+        else if (a[k] === "" || a[k] == null || Array.isArray(a[k]) && !a[k].length || a[k] === "decline" && b[k] && b[k] !== "decline") a[k] = b[k];
       }
     };
     fillIn(p, base);
     return withCv(p);
   }
-  var ASSIST_SETTINGS = () => ({ ...SETTINGS, fieldDelayMs: 10 });
+  var ASSIST_SETTINGS = () => ({ ...SETTINGS, fieldDelayMs: 5 });
   var SETTINGS = {
     ...DEFAULT_WD_SETTINGS,
     consentCreateAccountTerms: true,
@@ -3399,7 +3576,7 @@ OPTIONS: ${JSON.stringify(options.slice(0, 150))}`
     llmAnswers: false,
     // answers come from OptimHire (hooks.answer) instead
     trustedInputFallback: false,
-    fieldDelayMs: 40,
+    fieldDelayMs: 15,
     fallbackToMasterCv: true,
     externalAutoRequest: false
   };
@@ -3740,9 +3917,9 @@ OPTIONS: ${JSON.stringify(options.slice(0, 150))}`
         return;
       }
       if (!ASSIST_PAGES2.includes(page)) return;
-      const key = `${page}|${activeStepName()}|${location.pathname}`;
-      if (assisted.has(key)) return;
-      assisted.add(key);
+      const key2 = `${page}|${activeStepName()}|${location.pathname}`;
+      if (assisted.has(key2)) return;
+      assisted.add(key2);
       const mode = { auto: false, submit: false, assist: true, startedAt: Date.now(), jobId: "" };
       void installHooks(mode).then(() => startRun(null));
     }, 900);

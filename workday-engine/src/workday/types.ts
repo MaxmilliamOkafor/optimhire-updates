@@ -201,6 +201,7 @@ export type PageKind =
   | "review"
   | "submitted"
   | "candidateHome"
+  | "somethingWrong"
   | "unknown";
 
 export type RunStatus = "idle" | "running" | "paused" | "review" | "done" | "error" | "filled"; // [oh] filled: assist mode

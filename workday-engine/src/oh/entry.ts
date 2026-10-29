@@ -450,7 +450,7 @@ function historyFrom(s: Any): Pick<Profile, "work" | "education"> {
           .slice(0, 6),
       };
     })
-    .filter((w) => w.title && w.company && w.start);
+    .filter((w) => w.title && w.company);   // a role without a start date is still a role
   const education = listOf(s, ["education", "educations", "education_history", "academics", "qualifications"])
     .map((e, i) => ({
       id: `e${i + 1}`,
@@ -553,6 +553,26 @@ async function buildProfile(ad?: Any, cvUrl = ""): Promise<Profile> {
       previouslyWorkedHere: false,
     },
   } as any);
+  // EEO answers from your saved profile; without this every Self Identify / disclosure
+  // question fell back to "decline" (e.g. "I don't wish to answer" instead of your "No").
+  {
+    const pk = (...k: string[]) => pick(s, ...k);
+    const yn = (v: string) => {
+      const t = String(v || "").trim().toLowerCase();
+      if (!t || /prefer not|decline|wish/.test(t)) return "decline";
+      if (/^(no|i do not|i don'?t|not a|none)/.test(t)) return "no";
+      if (/^(yes|i have|i am)/.test(t)) return "yes";
+      return "decline";
+    };
+    const dc = (v: string) => { const t = String(v || "").trim(); return !t || /prefer not|decline|do not wish|don'?t wish|not to say/i.test(t) ? "decline" : t; };
+    (base as Any).eeo = {
+      gender: dc(pk("gender", "sex")),
+      hispanicOrLatino: yn(pk("hispanic_latino", "hispanicOrLatino", "hispanic", "latino")),
+      ethnicity: dc(pk("ethnicity", "race", "race_ethnicity")),
+      veteran: dc(pk("veteran", "veteran_status", "veteranStatus")),
+      disability: yn(pk("disability", "disability_status", "disabilityStatus", "has_disability")),
+    };
+  }
   /* Returned at once; your CV is read alongside and its history put into this
      same profile object when ready (My Experience waits for it: cvReady). */
   const withCv = async (prof: Profile): Promise<Profile> => {
@@ -574,7 +594,7 @@ async function buildProfile(ad?: Any, cvUrl = ""): Promise<Profile> {
   const fillIn = (a: Any, b: Any) => {
     for (const k of Object.keys(b)) {
       if (b[k] && typeof b[k] === "object" && !Array.isArray(b[k])) fillIn((a[k] ??= {}), b[k]);
-      else if (a[k] === "" || a[k] == null || (Array.isArray(a[k]) && !a[k].length)) a[k] = b[k];
+      else if (a[k] === "" || a[k] == null || (Array.isArray(a[k]) && !a[k].length) || (a[k] === "decline" && b[k] && b[k] !== "decline")) a[k] = b[k];
     }
   };
   fillIn(p, base);
@@ -582,7 +602,7 @@ async function buildProfile(ad?: Any, cvUrl = ""): Promise<Profile> {
 }
 
 /* Assist: as fast as Workday takes it. */
-const ASSIST_SETTINGS = (): WorkdaySettings => ({ ...SETTINGS, fieldDelayMs: 10 });
+const ASSIST_SETTINGS = (): WorkdaySettings => ({ ...SETTINGS, fieldDelayMs: 5 });
 
 const SETTINGS: WorkdaySettings = {
   ...DEFAULT_WD_SETTINGS,
@@ -592,7 +612,7 @@ const SETTINGS: WorkdaySettings = {
   requireDocApproval: false,
   llmAnswers: false,                // answers come from OptimHire (hooks.answer) instead
   trustedInputFallback: false,
-  fieldDelayMs: 40,
+  fieldDelayMs: 15,
   fallbackToMasterCv: true,
   externalAutoRequest: false,
 };
