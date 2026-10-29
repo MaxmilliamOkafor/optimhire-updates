@@ -897,6 +897,92 @@
     });
   } catch (_) {}
 
+  /* 16. The service worker's own log, for the audit (Debug Log / the card's Audit): every
+     console line here — ours and OptimHire's own background — and uncaught errors, while
+     recording is on (the same switch and time limit as the pages', ohDebugEnabled /
+     ohDebugUntil). Kept in ohBgLog, the last 800 lines. Lines that carry a login token or
+     password are not kept. */
+  (function backgroundLog() {
+    var on = false, until = 0, buf = [], timer = null, MAX = 800;
+    var SECRET_RE = /(token|password|passwd|secret|cookie|authorization)\s*[:=]|eyJ[\w-]{8,}\.[\w-]{8,}\./i;
+    function live() { return on && Date.now() < until; }
+    try {
+      chrome.storage.local.get(['ohDebugEnabled', 'ohDebugUntil'], function (d) { on = !!(d && d.ohDebugEnabled === true); until = +(d && d.ohDebugUntil) || 0; });
+      chrome.storage.onChanged.addListener(function (c, area) {
+        if (area !== 'local') return;
+        if (c.ohDebugEnabled) on = c.ohDebugEnabled.newValue === true;
+        if (c.ohDebugUntil) until = +c.ohDebugUntil.newValue || 0;
+      });
+    } catch (_) {}
+    function flush() {
+      timer = null;
+      var add = buf; buf = [];
+      try {
+        chrome.storage.local.get(['ohBgLog'], function (d) {
+          var arr = Array.isArray(d && d.ohBgLog) ? d.ohBgLog : [];
+          chrome.storage.local.set({ ohBgLog: arr.concat(add).slice(-MAX) });
+        });
+      } catch (_) {}
+    }
+    function keep(lvl, args) {
+      if (!live()) return;
+      var msg = '';
+      try {
+        msg = Array.prototype.map.call(args, function (a) {
+          if (typeof a === 'string') return a;
+          if (a && a.message) return a.message;
+          try { return JSON.stringify(a); } catch (_) { return String(a); }
+        }).join(' ').slice(0, 1500);
+      } catch (_) { return; }
+      if (!msg || SECRET_RE.test(msg)) return;
+      buf.push({ ts: Date.now(), lvl: lvl, msg: msg });
+      if (buf.length > 200) flush();
+      else if (!timer) timer = setTimeout(flush, 2000);
+    }
+    ['log', 'info', 'warn', 'error'].forEach(function (k) {
+      var orig = console[k] && console[k].bind(console);
+      if (!orig) return;
+      console[k] = function () { try { keep(k === 'log' ? 'info' : k, arguments); } catch (_) {} return orig.apply(null, arguments); };
+    });
+    try {
+      self.addEventListener('error', function (e) { keep('error', ['Uncaught: ' + ((e && e.message) || e)]); });
+      self.addEventListener('unhandledrejection', function (e) { keep('error', ['Unhandled rejection: ' + ((e && e.reason && (e.reason.message || e.reason)) || '')]); });
+    } catch (_) {}
+  })();
+
+  /* 15. Your details from every OptimHire job. OptimHire keeps your phone, e-mail, address…
+     only on the job it is working on (applicationDetails.seeker); outside a run its saved
+     profile is little more than your name — so "Autofill this page", the CSV queue and the
+     Greenhouse phone box had no phone to type. Each job's details are kept in ohWdSeeker
+     (which the page script and the Workday engine read; oh-persist keeps it): newest wins,
+     an empty value never overwrites one you have. */
+  function keepSeeker(v) {
+    try {
+      if (typeof v === 'string') v = JSON.parse(v);
+      var ad = v && (v.applicationDetails || v);
+      var sk = ad && ad.seeker;
+      if (!sk || typeof sk !== 'object') return;
+      chrome.storage.local.get(['ohWdSeeker'], function (d) {
+        var cur = d && d.ohWdSeeker && typeof d.ohWdSeeker === 'object' ? d.ohWdSeeker : {};
+        var next = Object.assign({}, cur), changed = false;
+        Object.keys(sk).forEach(function (k) {
+          var val = sk[k];
+          if (k === 'seeker_response' || val == null || val === '' || typeof val === 'object') return;
+          if (next[k] !== val) { next[k] = val; changed = true; }
+        });
+        if (changed) chrome.storage.local.set({ ohWdSeeker: next });
+      });
+    } catch (_) {}
+  }
+  var SEEKER_SOURCES = ['autoApplyState', 'complexFormData', 'manualApplicationDetail'];
+  try {
+    chrome.storage.onChanged.addListener(function (c, area) {
+      if (area !== 'local') return;
+      SEEKER_SOURCES.forEach(function (k) { if (c[k] && c[k].newValue) keepSeeker(c[k].newValue); });
+    });
+    chrome.storage.local.get(SEEKER_SOURCES, function (d) { SEEKER_SOURCES.forEach(function (k) { if (d && d[k]) keepSeeker(d[k]); }); });
+  } catch (_) {}
+
   /* The removed "pause other extensions" setting and its list: gone from storage. */
   try { chrome.storage.local.remove(['ohPauseOthers', 'ohPausedExts']); } catch (_) {}
   try { chrome.storage.sync.remove(['ohPausedExts'], function () { void chrome.runtime.lastError; }); } catch (_) {}

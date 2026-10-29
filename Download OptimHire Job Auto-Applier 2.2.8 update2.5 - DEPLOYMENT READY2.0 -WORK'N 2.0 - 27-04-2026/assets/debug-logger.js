@@ -198,7 +198,7 @@
   /* ── Auto-capture: console output, filtered to our extension's tags
      so we don't store every web page's console.log noise. Patches'
      LOG() already prefixes with [OH-Patch], [OH-Sidepanel], etc. ─── */
-  var TAG_RE = /^\[(OH[\w-]*|Queue\s?Runner|Queue|MD|Sidepanel|Autofill|Skip|Stuck|CSV|T18|T39|T40|Auto-Apply)/i;
+  var TAG_RE = /^\[(OH[\w-]*|WD-Engine|Queue\s?Runner|Queue|MD|Sidepanel|Autofill|Skip|Stuck|CSV|T18|T39|T40|Auto-Apply)/i;
   ['log', 'warn', 'error'].forEach(function (lvl) {
     try {
       var orig = console[lvl];
@@ -223,7 +223,9 @@
      Extension pages only. Every open tab used to record every change, so
      each change was logged once PER TAB and every tab rewrote the log —
      the recorder's cost grew with the square of the number of tabs. */
-  var SELF_KEYS = { ohDebugLog: 1, ohDebugEnabled: 1, ohDebugPaused: 1, ohTabOwner: 1 };
+  var SELF_KEYS = { ohDebugLog: 1, ohDebugEnabled: 1, ohDebugPaused: 1, ohDebugUntil: 1, ohBgLog: 1, ohAuditSince: 1, ohTabOwner: 1 };
+  /* Never into the log: login tokens, passwords and the like (the log is exported for audits). */
+  var SECRET_KEY_RE = /token|password|passwd|secret|auth|cookie|session|credential|api.?key|passcode/i;
   /* High-frequency keys change every second during automation; logging
      each change made the logger itself a CPU/storage hog. Record at most
      one entry per key per THROTTLE_MS. */
@@ -244,6 +246,7 @@
           _lastKeyLog[k] = nowTs;
         }
         var c = changes[k];
+        if (SECRET_KEY_RE.test(k)) { log('storage', k, '[redacted]'); continue; }
         log('storage', k, { from: safe(c.oldValue), to: safe(c.newValue) });
       }
     });

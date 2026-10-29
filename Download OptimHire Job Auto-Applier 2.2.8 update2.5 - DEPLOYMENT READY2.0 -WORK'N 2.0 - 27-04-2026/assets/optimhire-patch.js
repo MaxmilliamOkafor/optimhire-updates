@@ -2942,7 +2942,8 @@
   /* ── Profile helper ─────────────────────────────────────── */
   async function getProfile() {
     const keys = ['candidateDetails', 'cachedSeekerInfo', 'seekerDetails', 'userDetails'];
-    const data = await ST.get(keys.concat(['autoApplyState', 'complexFormData', 'manualApplicationDetail', 'ohWdSeeker']));
+    const data = await ST.get(keys.concat(['autoApplyState', 'complexFormData', 'manualApplicationDetail', 'ohWdSeeker',
+                                           'ohMyPhone', 'ohCvProfile', 'appAccountEmail']));
     /* Outside a run OptimHire keeps little more than your name: your details
        from the last OptimHire job (kept by the Workday engine) are the base. */
     let merged = {};
@@ -2989,9 +2990,27 @@
       if (code && !merged.phone_country_code) merged.phone_country_code = '+' + code;
       if (code) _profileDialCode = code;
     }
+    /* The phone you typed on the side panel's card (Applications Account) wins;
+       else your details from OptimHire's jobs; else your CV's own header. The
+       Applications Account e-mail stands in when OptimHire gives none. */
+    {
+      const mine = String(data.ohMyPhone || '').trim();
+      if (mine) {
+        merged.phone = mine;
+        const m = mine.match(/^\+\s*(\d{1,3})/);
+        if (m) { merged.phone_country_code = '+' + m[1]; _profileDialCode = m[1]; }
+      }
+      const cvc = data.ohCvProfile && data.ohCvProfile.profile && data.ohCvProfile.profile.contact;
+      if (cvc && typeof cvc === 'object') {
+        if (!merged.phone && cvc.phone) merged.phone = cvc.phone;
+        if (!merged.email && cvc.email) merged.email = cvc.email;
+      }
+      if (!merged.email && data.appAccountEmail) merged.email = String(data.appAccountEmail).trim();
+    }
     merged.first_name = pick('first_name', 'firstName', 'given_name', 'givenName');
     merged.last_name  = pick('last_name',  'lastName',  'family_name','familyName', 'surname');
-    merged.linkedin_profile_url = pick('linkedin_profile_url','linkedin_url','linkedinUrl','linkedin','LinkedIn');
+    merged.linkedin_profile_url = pick('linkedin_profile_url','linkedin_url','linkedinUrl','linkedin','LinkedIn') ||
+      String((data.ohCvProfile && data.ohCvProfile.profile && data.ohCvProfile.profile.contact && data.ohCvProfile.profile.contact.linkedin) || '');
     merged.github_url    = pick('github_url', 'github', 'githubUrl', 'GitHub');
     merged.website_url   = pick('website_url', 'website', 'websiteUrl', 'portfolio', 'portfolioUrl', 'personal_website');
     merged.twitter_url   = pick('twitter_url', 'twitter', 'twitterUrl', 'x_url', 'x_handle');

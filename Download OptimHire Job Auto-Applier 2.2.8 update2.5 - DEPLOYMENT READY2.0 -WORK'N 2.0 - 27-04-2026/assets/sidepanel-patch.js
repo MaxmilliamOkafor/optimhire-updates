@@ -2610,6 +2610,7 @@
     '#oh-queue-card .qc-sep{height:1px;background:var(--qc-line);margin:4px 0 6px}',
     '#oh-queue-card .qc-ko{display:flex;width:100%;align-items:center;gap:10px;margin:0 0 6px;padding:8px 10px;border:1px solid var(--qc-line);border-radius:10px;background:transparent;color:var(--qc-text);text-align:left;cursor:pointer;font:inherit}',
     '#oh-queue-card .qc-ko:hover{background:var(--qc-raise)}',
+    '#oh-queue-card .qc-ko.qc-audit-on{border-color:rgba(62,207,142,.5);background:rgba(62,207,142,.07)}',
     '#oh-queue-card .qc-ko.qc-ko-warn{border-color:rgba(245,180,74,.5);background:rgba(245,180,74,.08)}',
     '#oh-queue-card .qc-ko span{flex:1;display:flex;flex-direction:column;gap:1px;min-width:0}',
     '#oh-queue-card .qc-ko b{font-size:12px;font-weight:600}',
@@ -2686,7 +2687,8 @@
     if (!em || !use || !pw || em.dataset.wired) return;
     em.dataset.wired = '1';
     var KEYS = ['appAccountEmail', 'appAccountPassword', 'ohAppAccountUseProfile', 'ohWorkdayLogin', 'ohGmailCodes',
-                'candidateDetails', 'userDetails', 'seekerDetails', 'cachedSeekerInfo', 'ohWdSeeker'];
+                'candidateDetails', 'userDetails', 'seekerDetails', 'cachedSeekerInfo', 'ohWdSeeker', 'ohMyPhone', 'ohCvProfile'];
+    var ph = document.getElementById('oh-qc-acct-phone'), phNote = document.getElementById('oh-qc-acct-phone-note');
     var profileEmail = '';
     function say(t) { if (note) note.textContent = t; }
     function load() {
@@ -2701,7 +2703,25 @@
         em.value = useProfile ? (profileEmail || login.email || d.appAccountEmail || '') : (d.appAccountEmail || login.email || '');
         if (document.activeElement !== pw) pw.value = d.appAccountPassword || login.password || '';
         if (useProfile && !profileEmail && !em.value) say('No e-mail on your OptimHire profile yet: untick and type one.');
+        if (ph) {
+          var found = detectedPhone(d);
+          if (document.activeElement !== ph) ph.value = d.ohMyPhone || '';
+          ph.placeholder = found ? found.phone : '+353 87 123 4567';
+          if (phNote) phNote.textContent = d.ohMyPhone ? 'Used on every application form.'
+            : found ? 'Using ' + found.phone + ' from ' + found.from + '. Type another to use that instead.'
+            : 'No phone found in your OptimHire details or CV yet — type it here (forms like Greenhouse require one).';
+        }
       });
+    }
+    /* The phone forms get when none is typed here: your details from OptimHire's jobs, else your CV. */
+    function detectedPhone(d) {
+      var sk = (d && d.ohWdSeeker) || {};
+      var code = String(sk.mobile_code || '').replace(/\D/g, ''), num = String(sk.mobile_num || '').replace(/\D/g, '');
+      if (num) return { phone: (code ? '+' + code + ' ' : '') + num, from: 'your OptimHire details' };
+      if (sk.phone) return { phone: String(sk.phone), from: 'your OptimHire details' };
+      var c = d && d.ohCvProfile && d.ohCvProfile.profile && d.ohCvProfile.profile.contact;
+      if (c && c.phone) return { phone: String(c.phone), from: 'your CV' };
+      return null;
     }
     function save(why) {
       var email = (use.checked ? (profileEmail || em.value) : em.value).trim();
@@ -2737,6 +2757,11 @@
       if (!use.checked) em.focus();
     });
     em.addEventListener('change', function () { save('Saved'); });
+    if (ph) ph.addEventListener('change', function () {
+      var v = ph.value.trim();
+      if (v && v.replace(/\D/g, '').length < 7) { say('That phone number looks too short.'); return; }
+      chrome.storage.local.set({ ohMyPhone: v }, function () { say(v ? 'Phone saved — ' + v : 'Phone cleared: your OptimHire details / CV are used'); load(); });
+    });
     pw.addEventListener('change', function () { save('Saved'); });
     /* The opt-in the Gmail code / link reader (oh-bg.js 10, 10b) already checks; it was only
        reachable in Queue Manager → Workday & sign-in. */
@@ -2758,7 +2783,7 @@
     });
     try {
       chrome.storage.onChanged.addListener(function (c, area) {
-        if (area === 'local' && (c.candidateDetails || c.ohWorkdayLogin || c.appAccountEmail || c.ohGmailCodes)) load();
+        if (area === 'local' && (c.candidateDetails || c.ohWorkdayLogin || c.appAccountEmail || c.ohGmailCodes || c.ohWdSeeker || c.ohMyPhone || c.ohCvProfile)) load();
       });
     } catch (_) {}
   }
@@ -2831,6 +2856,9 @@
         '<div class="qc-sep"></div>' +
         '<button id="oh-qc-ko" class="qc-ko" title="Work rights, sponsorship, relocation, years of experience… are always answered with your true answers, per job country. Wrong answers get applications rejected or ranked last.">' +
           '<span><b id="oh-qc-ko-title">Knockout answers</b><small id="oh-qc-ko-sub">—</small></span>' + ICON.arrow + '</button>' +
+        /* One click: record everything (every tab, this panel, the service worker) and see it live. */
+        '<button id="oh-qc-audit" class="qc-ko" title="Records everything the automation does — every page, this panel and the background — for 8 hours, and opens the live log. Export it all as one file with ‘Export audit file’ below (passwords and login tokens are never included).">' +
+          '<span><b id="oh-qc-audit-title">Audit</b><small id="oh-qc-audit-sub">Record everything, see every log, export one file</small></span>' + ICON.arrow + '</button>' +
         '<button id="oh-qc-master" class="qc-switch" role="switch" aria-checked="true" ' +
           'title="Hard stop: makes the extension completely inert — no auto-clicking, no auto-submitting, no background loops — until you turn it back on">' +
           '<span class="qc-switch-text"><b>Automation</b><small id="oh-qc-master-sub">Applies and submits for you</small></span><span class="qc-toggle"></span></button>' +
@@ -2855,6 +2883,12 @@
                 '<div class="qc-acct-in"><input type="email" id="oh-qc-acct-email" autocomplete="off" spellcheck="false" placeholder="you@example.com"></div>' +
                 '<label class="qc-acct-check"><input type="checkbox" id="oh-qc-acct-useprofile">Use profile email</label>' +
               '</div></div>' +
+            /* The phone every application form gets (Greenhouse requires one): yours if typed here. */
+            '<div class="qc-acct-row"><label for="oh-qc-acct-phone">Phone</label>' +
+              '<div class="qc-acct-field">' +
+                '<div class="qc-acct-in"><input type="tel" id="oh-qc-acct-phone" autocomplete="off" spellcheck="false" placeholder="+353 87 123 4567"></div>' +
+                '<div id="oh-qc-acct-phone-note" class="qc-acct-sub" style="margin:0"></div>' +
+              '</div></div>' +
             '<div class="qc-acct-row"><label for="oh-qc-acct-pw">Password</label>' +
               '<div class="qc-acct-field"><div class="qc-acct-in">' +
                 '<input type="password" id="oh-qc-acct-pw" autocomplete="new-password" spellcheck="false" placeholder="8+ chars, upper, lower, number, symbol">' +
@@ -2873,6 +2907,7 @@
         '<div id="oh-qc-truth" class="qc-foot" title="OptimHire’s ‘X applied’ counter also counts skips. This counts real submission confirmations.">Results: — submitted · — skipped</div>' +
         '<div class="qc-links">' +
           '<button id="oh-qc-qamem" class="qc-link" title="Answers learned from applications confirmed as submitted. Review or forget them.">Remembered answers ' + ICON.arrow + '</button>' +
+          '<button id="oh-qc-auditx" class="qc-link" title="Download ONE file with everything: every log, each job and what happened, your settings, the details forms get, open tabs — for a full audit (passwords and login tokens removed)">' + ICON.down + 'Export audit file</button>' +
           '<button id="oh-qc-export" class="qc-link" title="Download every job OptimHire\'s queue has handed out so far as one CSV — title, company, full job link, status, dates (opens in Excel / Sheets; re-importable into the Queue Manager)">' + ICON.down + 'Export CSV</button>' +
         '</div>';
       /* Always append to <body> as a fixed overlay — never insert as a
@@ -2903,6 +2938,22 @@
         });
       });
       var tailorLine = document.getElementById('oh-qc-tailor');
+      var auditLine = document.getElementById('oh-qc-audit');
+      if (auditLine) auditLine.addEventListener('click', function () {
+        if (!window.OH_AUDIT) return;
+        window.OH_AUDIT.status(function (st) {
+          var open = function () { try { chrome.tabs.create({ url: chrome.runtime.getURL('tabs/debug.html'), active: true }); } catch (_) {} };
+          if (st.on) { open(); return; }
+          window.OH_AUDIT.record(8, function () { addLog('Audit: recording everything for 8 hours', 'success'); paintAudit(); open(); });
+        });
+      });
+      var auditX = document.getElementById('oh-qc-auditx');
+      if (auditX) auditX.addEventListener('click', function () {
+        if (!window.OH_AUDIT) return;
+        window.OH_AUDIT.exportFile(function (a, name) {
+          addLog('Audit file saved: ' + name + ' (' + a.summary.logEntries + ' log entries, ' + a.summary.errors + ' errors)', 'success');
+        });
+      });
       var autofillLine = document.getElementById('oh-qc-autofill');
       if (autofillLine) autofillLine.addEventListener('click', function () {
         chrome.storage.local.get(['ohAutoTrigger'], function (d) {
@@ -3156,6 +3207,18 @@
       paintQaCount();
     }
 
+    /* Audit: recording or not, and for how long. */
+    function paintAudit() {
+      var row = document.getElementById('oh-qc-audit'), sub = document.getElementById('oh-qc-audit-sub');
+      if (!row || !sub || !window.OH_AUDIT) return;
+      window.OH_AUDIT.status(function (st) {
+        row.classList.toggle('qc-audit-on', st.on);
+        if (!st.on) { sub.textContent = 'Record everything, see every log, export one file'; return; }
+        var mins = Math.ceil(Math.max(0, st.until - Date.now()) / 60e3), h = Math.floor(mins / 60), m = mins % 60;
+        sub.textContent = 'Recording — ' + (h ? h + 'h ' : '') + m + 'm left · ' + (st.entries + st.bgEntries) + ' entries · tap to see them';
+      });
+    }
+
     /* Knockout answers: a prompt until you have checked them, then where you can work. */
     function paintKo() {
       var row = document.getElementById('oh-qc-ko'), t = document.getElementById('oh-qc-ko-title'), sub = document.getElementById('oh-qc-ko-sub');
@@ -3203,6 +3266,7 @@
             var pl = document.getElementById('oh-qc-prio');
             if (pl) pl.setAttribute('aria-checked', d && d.ohPreferAts === false ? 'false' : 'true');
             paintKo();
+            paintAudit();
             var tl = document.getElementById('oh-qc-tailor'), ts = document.getElementById('oh-qc-tailor-sub');
             if (tl) tl.setAttribute('aria-checked', d && d.ohTailorCv === true ? 'true' : 'false');
             if (ts) ts.textContent = d && d.ohTailorCv === true ? 'On — Workday keeps your own CV' : 'Off — your own CV';
@@ -3265,6 +3329,7 @@
           if (area !== 'local') return;
           if (changes.ohQaMemory) setQaCount(changes.ohQaMemory.newValue);
           if (changes.ohKnockout || changes.ohKnockoutFixes) paintKo();
+          if (changes.ohDebugEnabled || changes.ohDebugUntil) paintAudit();
           if (changes[KEY_QUEUE] || changes[KEY_ACTIVE] || changes.ohHarvestedJobs ||
               changes.isAutoProcessStartJob || changes.isManuallyStartJob || changes.matchingJobCount ||
               changes.ohPreferAts || changes.ohQueueTier || changes.ohTailorCv || changes.ohAutoTrigger) refresh();

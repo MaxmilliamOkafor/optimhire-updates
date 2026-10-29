@@ -359,7 +359,8 @@ function parse(v: unknown): Any {
 
 /** OptimHire's details for you, flattened: the job's seeker record first, then the stored profile. */
 async function profileSources(ad?: Any): Promise<Any> {
-  const d = await ST.get(["candidateDetails", "cachedSeekerInfo", "seekerDetails", "userDetails", "complexFormData", "autoApplyState", "manualApplicationDetail", SEEKER_KEY]);
+  const d = await ST.get(["candidateDetails", "cachedSeekerInfo", "seekerDetails", "userDetails", "complexFormData", "autoApplyState", "manualApplicationDetail", SEEKER_KEY,
+    "ohMyPhone", "ohCvProfile", "appAccountEmail"]);
   // Outside a run OptimHire keeps little more than your name; the last job's details fill the gap.
   const merged: Any = Object.assign({}, parse(d[SEEKER_KEY]));
   // OptimHire keeps the full details (phone, address, CV…) on the job it is working on.
@@ -374,6 +375,20 @@ async function profileSources(ad?: Any): Promise<Any> {
       if (vv !== "" && vv != null) merged[kk] = vv;
   }
   for (const [k, v] of Object.entries((ad && ad.seeker) || {})) if (v !== "" && v != null) merged[k] = v;
+  // The phone you typed on the side panel's card wins; your CV's header fills what is still
+  // missing; the Applications Account e-mail stands in when OptimHire gives none.
+  const mine = String(d.ohMyPhone || "").trim();
+  if (mine) {
+    const m = mine.match(/^\+\s*(\d{1,3})\s*(.*)$/);
+    if (m) merged.mobile_code = m[1];
+    merged.mobile_num = (m ? m[2] : mine).replace(/\D/g, "");
+    merged.phone = mine;
+  }
+  const cvc: Any = (parse(d.ohCvProfile).profile || {}).contact || {};
+  if (!merged.mobile_num && !merged.phone && cvc.phone) merged.phone = cvc.phone;
+  if (!merged.email && cvc.email) merged.email = cvc.email;
+  if (!merged.linkedin_profile_url && cvc.linkedin) merged.linkedin_profile_url = cvc.linkedin;
+  if (!merged.email && d.appAccountEmail) merged.email = String(d.appAccountEmail);
   return merged;
 }
 

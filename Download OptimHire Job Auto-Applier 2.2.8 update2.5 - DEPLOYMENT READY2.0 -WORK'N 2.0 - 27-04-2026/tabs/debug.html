@@ -92,6 +92,11 @@
     padding: 8px 18px; font-size: 11px; color: var(--muted);
     display: flex; justify-content: space-between; align-items: center;
   }
+  .audit-bar { display: flex; align-items: center; gap: 10px; margin: 8px 0 4px; padding: 8px 12px; border-radius: 8px;
+               border: 1px solid var(--border, #2a2f3a); font-size: 12.5px; }
+  .audit-bar.on { border-color: rgba(62,207,142,.5); background: rgba(62,207,142,.08); }
+  .audit-bar.off { border-color: rgba(245,180,74,.45); background: rgba(245,180,74,.07); }
+  .audit-bar span { flex: 1; }
   .toast {
     position: fixed; bottom: 50px; right: 18px;
     background: var(--bg3); border-left: 3px solid var(--success); color: var(--text);
@@ -103,18 +108,20 @@
 <body>
   <header>
     <div class="title-row">
-      <h1>OptimHire Debug Log <small>Every event from every tab, ring-buffered.</small></h1>
+      <h1>OptimHire Debug Log <small>Every event from every tab, the side panel and the background.</small></h1>
       <div class="actions">
         <label><input type="checkbox" id="toggleEnabled"> Capture</label>
         <label><input type="checkbox" id="togglePaused"> Pause</label>
         <label><input type="checkbox" id="tail" checked> Live tail</label>
         <button id="btnCopy">Copy visible</button>
-        <button id="btnExport" class="btn-primary">Export JSON</button>
+        <button id="btnAudit" class="btn-primary" title="One file with everything: every log, each job and its outcome, settings, the details forms get, open tabs (passwords and login tokens removed)">Export full audit</button>
+        <button id="btnExport">Export JSON</button>
         <button id="btnExportText">Export text</button>
         <button id="btnSnapshot" class="btn-warn">Diagnostic snapshot</button>
         <button id="btnClear" class="btn-danger">Clear all</button>
       </div>
     </div>
+    <div id="auditBar" class="audit-bar"></div>
     <div class="filters">
       <input type="text" id="search" placeholder="Search messages, URLs, data…">
       <select id="srcFilter"><option value="all">All sources</option></select>
@@ -152,6 +159,7 @@
     <span id="storeInfo">Ring buffer: max 1500 entries</span>
   </div>
   <script src="../assets/oh-persist.js"></script>
+  <script src="../assets/oh-audit.js"></script>
   <script src="../assets/debug.js"></script>
 </body>
 </html>

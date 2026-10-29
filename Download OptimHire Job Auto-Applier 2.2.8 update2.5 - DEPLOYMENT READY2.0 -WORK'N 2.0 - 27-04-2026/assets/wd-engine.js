@@ -3170,7 +3170,19 @@ OPTIONS: ${JSON.stringify(options.slice(0, 150))}`
     return v && typeof v === "object" ? v : {};
   }
   async function profileSources(ad) {
-    const d = await ST.get(["candidateDetails", "cachedSeekerInfo", "seekerDetails", "userDetails", "complexFormData", "autoApplyState", "manualApplicationDetail", SEEKER_KEY]);
+    const d = await ST.get([
+      "candidateDetails",
+      "cachedSeekerInfo",
+      "seekerDetails",
+      "userDetails",
+      "complexFormData",
+      "autoApplyState",
+      "manualApplicationDetail",
+      SEEKER_KEY,
+      "ohMyPhone",
+      "ohCvProfile",
+      "appAccountEmail"
+    ]);
     const merged = Object.assign({}, parse(d[SEEKER_KEY]));
     for (const k of ["manualApplicationDetail", "autoApplyState", "complexFormData"]) {
       const v = parse(d[k]);
@@ -3183,6 +3195,18 @@ OPTIONS: ${JSON.stringify(options.slice(0, 150))}`
         if (vv !== "" && vv != null) merged[kk] = vv;
     }
     for (const [k, v] of Object.entries(ad && ad.seeker || {})) if (v !== "" && v != null) merged[k] = v;
+    const mine = String(d.ohMyPhone || "").trim();
+    if (mine) {
+      const m = mine.match(/^\+\s*(\d{1,3})\s*(.*)$/);
+      if (m) merged.mobile_code = m[1];
+      merged.mobile_num = (m ? m[2] : mine).replace(/\D/g, "");
+      merged.phone = mine;
+    }
+    const cvc = (parse(d.ohCvProfile).profile || {}).contact || {};
+    if (!merged.mobile_num && !merged.phone && cvc.phone) merged.phone = cvc.phone;
+    if (!merged.email && cvc.email) merged.email = cvc.email;
+    if (!merged.linkedin_profile_url && cvc.linkedin) merged.linkedin_profile_url = cvc.linkedin;
+    if (!merged.email && d.appAccountEmail) merged.email = String(d.appAccountEmail);
     return merged;
   }
   function ym(v) {
