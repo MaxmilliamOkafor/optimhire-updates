@@ -4498,16 +4498,45 @@
       if (inp.required || inp.getAttribute('aria-required') === 'true') return true;
       return /\*/.test(head(inp));
     }
+    /* OptimHire writes a cover letter per job and attaches it as plain text, named after its
+       link: "cover-letter.txt". It goes in as a PDF with your name — "Maxmilliam-Okafor-
+       <role>-Cover-Letter.pdf" — when the box takes PDFs; as it came when that fails. */
+    const isText = f => /^text\/plain/i.test(f.type || '') || /\.txt$/i.test(f.name || '');
+    const takesPdf = inp => { const a = (inp.getAttribute('accept') || '').toLowerCase(); return !a || /pdf|\*/.test(a); };
+    function attachAsPdf(inp, f) {
+      (async () => {
+        let out = f;
+        try {
+          const text = await f.text();
+          const lib = await cvLib();
+          const role = String(($('h1') || {}).textContent || document.title || '').replace(/\s+/g, ' ').trim().slice(0, 80);
+          const doc = lib && lib.coverLetter && lib.coverLetter({ text, person: await getProfile(), title: role });
+          if (doc) {
+            const bin = atob(doc.base64), bytes = new Uint8Array(bin.length);
+            for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+            out = new File([bytes], doc.fileName, { type: doc.mime });
+          }
+        } catch (_) {}
+        const dt = new DataTransfer();
+        dt.items.add(out);
+        desc.set.call(inp, dt.files);
+        inp.dispatchEvent(new Event('input', { bubbles: true }));
+        inp.dispatchEvent(new Event('change', { bubbles: true }));
+        LOG(out === f ? `Cover letter box: "${f.name}" attached as it came` : `Cover letter box: "${f.name}" attached as ${out.name}`);
+      })();
+    }
     Object.defineProperty(HTMLInputElement.prototype, 'files', {
       configurable: true,
       enumerable: desc.enumerable,
       get() { return desc.get.call(this); },
       set(list) {
         try {
-          if (this.type === 'file' && list && list.length && COVER_BOX_RE.test(boxText(this)) &&
-              !Array.prototype.some.call(list, f => COVER_FILE_RE.test(f.name || '')) && !required(this)) {
-            LOG(`Cover letter box: not attaching "${list[0].name}" — that's the CV, not a cover letter`);
-            return;
+          if (this.type === 'file' && list && list.length && COVER_BOX_RE.test(boxText(this))) {
+            if (!Array.prototype.some.call(list, f => COVER_FILE_RE.test(f.name || '')) && !required(this)) {
+              LOG(`Cover letter box: not attaching "${list[0].name}" — that's the CV, not a cover letter`);
+              return;
+            }
+            if (list.length === 1 && isText(list[0]) && takesPdf(this)) { attachAsPdf(this, list[0]); return; }
           }
         } catch (_) {}
         desc.set.call(this, list);
@@ -7740,6 +7769,88 @@
       }
     }
     await autoFillPage();
+    /* OptimHire's own pass fills after this one and can leave Country at the default: checked again. */
+    for (const wait of [0, 4000, 9000]) {
+      await sleep(wait);
+      if (CURRENT_ATS !== 'BambooHR' || !(await bambooAddress(p))) break;
+    }
+  }
+
+  /* BambooHR's address. Country and State are its own dropdowns (a button, a menu with a
+     Search box and options, a hidden <select>): typing never reached them, so Country stayed
+     on the default "United States" and the State list was the US one; both menus were left
+     open. ZIP got a place ("Dublin, D…") rather than the postcode. Returns true when it
+     changed something (checked again a little later). */
+  async function bambooAddress(p) {
+    const sq = v => String(v || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+    const label = l => (l.textContent || '').replace(/[*:]/g, ' ').replace(/\s+/g, ' ').trim();
+    const shown = b => (b.textContent || '').replace(/[×✕]/g, '').replace(/\s+/g, ' ').trim();
+    function field(re) {
+      for (const l of $$('label')) {
+        if (!re.test(label(l))) continue;
+        for (let n = l.parentElement, i = 0; n && i < 4; n = n.parentElement, i++) {
+          const toggles = n.querySelectorAll('.fab-Select button, button[aria-haspopup="listbox"]');
+          if (toggles.length > 1) break;
+          if (toggles.length) return { label: l, button: toggles[0], select: n.querySelector('select') };
+          const inp = n.querySelector('input[type="text"], input:not([type])');
+          if (inp && !inp.closest('[data-helium-id]')) return { label: l, input: inp };
+        }
+      }
+      return null;
+    }
+    function menuOf(btn) {
+      const id = btn.getAttribute('data-menu-id') || btn.getAttribute('aria-controls');
+      const m = id && (document.querySelector(`[data-helium-id="${CSS.escape(id)}"]`) || document.getElementById(id));
+      return m && isVisible(m) ? m : null;
+    }
+    function closeMenus() {
+      const t = document.activeElement || document.body;
+      for (const type of ['keydown', 'keyup']) t.dispatchEvent(new KeyboardEvent(type, { key: 'Escape', code: 'Escape', keyCode: 27, bubbles: true }));
+    }
+    /* The option for `want` (exact, then the country's longer name), or null. */
+    function optionFor(opts, want) {
+      const w = sq(want);
+      return opts.find(o => sq(o.textContent) === w) ||
+             opts.find(o => sq(o.textContent).startsWith(w) || sq(o.textContent).includes('republicof' + w)) || null;
+    }
+    async function choose(f, want) {
+      if (!f || !f.button || !want || sq(shown(f.button)) === sq(want)) return false;
+      realClick(f.button);
+      let menu = null;
+      for (let i = 0; i < 10 && !(menu = menuOf(f.button)); i++) await sleep(100);
+      if (!menu) return false;
+      const search = menu.querySelector('input[type="text"], input[type="search"], input:not([type])');
+      if (search) { search.focus(); nativeSet(search, String(want)); await sleep(300); }
+      const opt = optionFor([...menu.querySelectorAll('.fab-MenuOption, [role="option"], [role="menuitem"]')].filter(isVisible), want);
+      if (!opt) { closeMenus(); await sleep(150); if (menuOf(f.button)) realClick(f.button); return false; }
+      realClick(opt);
+      await sleep(300);
+      if (menuOf(f.button)) closeMenus();
+      LOG(`BambooHR: ${label(f.label).slice(0, 30)} → ${shown(f.button)}`);
+      return true;
+    }
+    let changed = false;
+    const country = String(p.country || '').trim();
+    if (await choose(field(/^country\b/i), country)) { changed = true; await sleep(500); }
+    /* State: only what you live in, and only when the list (now this country's) has it. */
+    const st = field(/^(state|province|county|region)\b/i);
+    if (st && st.button) {
+      const want = [p.state, p.county, p.city].map(v => String(v || '').trim()).find(Boolean);
+      if (want && sq(shown(st.button)) !== sq(want) && !sq(shown(st.button)).includes(sq(want))) {
+        if (await choose(st, want)) changed = true;
+        else if (await choose(st, 'County ' + want) || await choose(st, 'Co. ' + want)) changed = true;
+      }
+    }
+    /* ZIP: your postcode; a place typed there loses the place. */
+    const zip = field(/^(zip|postal code|post code|postcode|eircode|zip\s*\/\s*postal code)\b/i);
+    if (zip && zip.input) {
+      const cur = (zip.input.value || '').trim(), mine = String(p.postal_code || '').trim();
+      const want = mine || (/^[^\d,]+,\s*(?=.*\d)/.test(cur) ? cur.replace(/^[^\d,]+,\s*/, '') : '');
+      if (want && sq(cur) !== sq(want)) { nativeSet(zip.input, want); changed = true; LOG(`BambooHR: ZIP → ${want}`); }
+    }
+    /* Never leave a menu open (two were left open over the form). */
+    if ($$('.fab-Select button, button[aria-haspopup="listbox"]').some(b => menuOf(b))) closeMenus();
+    return changed;
   }
 
   /* ── Jobvite autofill ────────────────────────────────────── */

@@ -1133,7 +1133,121 @@
   };
 })();
 
+/* 17. "Loading your Job" that never ends. A run's start — and each next job opened from
+   optimhire.com's job page — shows "Loading your Job", tells the panel, fetches your profile
+   from optimhire.com, then the job. None of those waits had a time limit or a second try: a
+   slow or failed answer and the start just stopped, the panel spinning for good (seen live,
+   at random). Now: those two requests get a time limit and two more tries (no answer, network
+   error, or a 5xx from the server); the panel notices never hold the start up more than 4 s;
+   and a start that still stopped (nothing in flight, the panel never told to move on) is
+   started again with the same request — twice at most. After that the panel is reset instead
+   of left spinning, and the card says why (ohLoadRescue). */
+(function loadingRescue() {
+  var rt = chrome.runtime, ev = rt && rt.onMessage;
+  if (!ev || typeof ev.addListener !== 'function' || typeof rt.sendMessage !== 'function') return;
+  var PROFILE_TIMEOUT_MS = 15000, JOB_TIMEOUT_MS = 30000, API_RETRIES = 2, NOTE_CAP_MS = 4000;
+  var STALL_MS = 15000, QUIET_MS = 5000, TRIES = 2;
+  var OH_API_GET_RE = /^https:\/\/(www\.)?optimhire\.com\/api\/v1\/candidate\/[^/?#]+(\/application)?(?:[?#]|$)/i;
+  var START_ACTIONS = { START_JOB_APPLICATION_VIA_WEB: 1, START_PAGE_AUTOFILL: 1 };
+  var NOTES = { STARTED_LOADING_SCREEN: 1, SIDE_PANEL_RELOAD: 1, SIDE_PANEL_MANUAL_RELOAD: 1 };
+  var MOVED_ON = { SIDE_PANEL_RELOAD: 1, SIDE_PANEL_MANUAL_RELOAD: 1, RELOAD_SIDE: 1, PILOT_STOP: 1, AUTO_APPLY_COMPLETE: 1,
+                   AUTO_APPLY_STATE_UPDATE: 1, MANUALLY_APPLY_STATE_UPDATE: 1 };
+  var ohListeners = [], capturing = true;
+  var lastStart = null, watch = null, tries = 0, triedTs = 0;
+  var inflight = 0, lastApiTs = 0;
+
+  /* The start request as it came (only what reaches OptimHire — a Workday page press doesn't, 15). */
+  ev.addListener(function (msg, sender) {
+    if (msg && START_ACTIONS[msg.action]) lastStart = { msg: msg, sender: sender, ts: Date.now() };
+  });
+  /* OptimHire's own handlers (added while index.js loads), to hand that request to again. */
+  var prevAdd = ev.addListener;
+  ev.addListener = function (fn) {
+    if (capturing && typeof fn === 'function') ohListeners.push(fn);
+    return prevAdd.apply(ev, arguments);
+  };
+  self.__ohEndListenerCapture = function () { capturing = false; };
+
+  var realSend = rt.sendMessage;
+  rt.sendMessage = function (msg) {
+    var type = msg && msg.type;
+    if (type === 'STARTED_LOADING_SCREEN') {
+      if (Date.now() - triedTs > 120000) tries = 0;      // a new start, not one we restarted
+      watch = { since: Date.now() };
+    } else if (type && MOVED_ON[type]) { watch = null; tries = 0; }
+    var p = realSend.apply(rt, arguments);
+    if (type && NOTES[type] && p && typeof p.then === 'function') {
+      return Promise.race([p, new Promise(function (r) { setTimeout(r, NOTE_CAP_MS); })]);
+    }
+    return p;
+  };
+
+  /* optimhire.com's answer for your profile / the next job: a time limit and two more tries. */
+  var prevFetch = self.fetch;
+  self.fetch = function (input, init) {
+    var method = String((init && init.method) || 'GET').toUpperCase();
+    if (typeof input !== 'string' || method !== 'GET' || (init && init.signal) || !OH_API_GET_RE.test(input)) {
+      return prevFetch.apply(self, arguments);
+    }
+    var url = input, job = /\/application(?:[?#]|$)/.test(url), n = 0;
+    function again(why) {
+      try { console.info('[OH-BG] optimhire.com ' + (job ? 'next-job' : 'profile') + ' request: ' + why + ' — trying again (' + n + '/' + API_RETRIES + ')'); } catch (_) {}
+      return new Promise(function (r) { setTimeout(r, n === 1 ? 1000 : 3000); }).then(once);
+    }
+    function once() {
+      n++;
+      var ctl = new AbortController();
+      var timer = setTimeout(function () { ctl.abort(); }, job ? JOB_TIMEOUT_MS : PROFILE_TIMEOUT_MS);
+      return prevFetch.call(self, url, Object.assign({}, init, { signal: ctl.signal })).then(function (res) {
+        clearTimeout(timer);
+        if (res.status >= 500 && n <= API_RETRIES) return again('answered ' + res.status);
+        return res;
+      }, function (err) {
+        clearTimeout(timer);
+        if (n <= API_RETRIES) return again(ctl.signal.aborted ? 'no answer in ' + (job ? JOB_TIMEOUT_MS : PROFILE_TIMEOUT_MS) / 1000 + ' s' : 'network error');
+        throw err;
+      });
+    }
+    inflight++;
+    function settle() { inflight = Math.max(0, inflight - 1); lastApiTs = Date.now(); }
+    return once().then(function (r) { settle(); return r; }, function (e) { settle(); throw e; });
+  };
+
+  function tell(msg, final) {
+    try { console.info('[OH-BG] ' + msg); } catch (_) {}
+    try { chrome.storage.local.set({ ohLoadRescue: { ts: Date.now(), msg: msg, final: !!final } }); } catch (_) {}
+  }
+  setInterval(function () {
+    var w = watch, now = Date.now();
+    if (!w || now - w.since < STALL_MS || inflight > 0 || now - lastApiTs < QUIET_MS) return;
+    watch = null;
+    chrome.storage.local.get(['autoApplyState', 'isManuallyStartJob'], function (d) {
+      d = d || {};
+      if ((d.autoApplyState && d.autoApplyState.isActive) || d.isManuallyStartJob) return;   // it got going after all
+      chrome.cookies.get({ url: 'https://optimhire.com', name: 'at' }, function (c) {
+        void chrome.runtime.lastError;
+        var s = Math.round((Date.now() - w.since) / 1000);
+        if (!(c && c.value)) {
+          tries = 0;
+          tell('"Loading your Job" for ' + s + ' s: you are signed out of optimhire.com — sign in there, then press Start again', true);
+        } else if (lastStart && Date.now() - lastStart.ts < 600000 && tries < TRIES && ohListeners.length) {
+          tries++; triedTs = Date.now();
+          tell('"Loading your Job" for ' + s + ' s: optimhire.com did not hand out the job — starting it again (' + tries + '/' + TRIES + ')', false);
+          var st = lastStart;
+          ohListeners.forEach(function (fn) { try { fn.call(null, st.msg, st.sender, function () {}); } catch (_) {} });
+          return;
+        } else {
+          tries = 0;
+          tell('"Loading your Job": optimhire.com did not hand out the job after ' + (TRIES + 1) + ' tries — panel reset; it carries on with the next start', true);
+        }
+        try { Promise.resolve(realSend.call(rt, { type: 'RELOAD_SIDE' })).catch(function () {}); } catch (_) {}
+      });
+    });
+  }, 2000);
+})();
+
 importScripts('index.js');
+try { self.__ohEndListenerCapture(); } catch (_) {}
 /* 12. The CSV Job Queue runs here, not in the Queue Manager tab (queue-runner.js). */
 importScripts('queue-runner.js');
 

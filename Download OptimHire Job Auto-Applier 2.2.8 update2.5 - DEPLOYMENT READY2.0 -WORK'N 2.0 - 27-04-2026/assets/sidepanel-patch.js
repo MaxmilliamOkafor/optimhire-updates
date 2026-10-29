@@ -3324,6 +3324,13 @@
          the master ON/OFF switch, so it must keep working while idle. */
       _spNativeSetInterval(refresh, 5000);
       try { chrome.storage.local.get(['ohQaMemory'], function (d) { setQaCount(d && d.ohQaMemory); }); } catch (_) {}
+      /* The panel was just reset after a start that never loaded its job (oh-bg.js 17): say why. */
+      try {
+        chrome.storage.local.get(['ohLoadRescue'], function (d) {
+          var lr = d && d.ohLoadRescue;
+          if (lr && lr.final && lr.msg && Date.now() - (+lr.ts || 0) < 60000) addLog(lr.msg, 'error');
+        });
+      } catch (_) {}
       try {
         chrome.storage.onChanged.addListener(function (changes, area) {
           if (area !== 'local') return;
@@ -3333,6 +3340,8 @@
           if (changes[KEY_QUEUE] || changes[KEY_ACTIVE] || changes.ohHarvestedJobs ||
               changes.isAutoProcessStartJob || changes.isManuallyStartJob || changes.matchingJobCount ||
               changes.ohPreferAts || changes.ohQueueTier || changes.ohTailorCv || changes.ohAutoTrigger) refresh();
+          var lr = changes.ohLoadRescue && changes.ohLoadRescue.newValue;
+          if (lr && lr.msg) addLog(lr.msg, lr.final ? 'error' : '');
           var qt = changes.ohQueueTier && changes.ohQueueTier.newValue;
           if (qt && qt.heldBack) {
             addLog('⇅ Held back a ' + (qt.heldBack === 'reed' ? 'reed.co.uk' : 'job-board') + ' job — applying an ' +
