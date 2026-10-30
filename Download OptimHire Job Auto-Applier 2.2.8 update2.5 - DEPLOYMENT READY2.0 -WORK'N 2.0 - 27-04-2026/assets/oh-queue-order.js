@@ -6,8 +6,8 @@
  * eFinancialCareers and other boards' jobs came before jobs on the employer's own ATS
  * (the quickest to apply to and the ones that reach the hiring team). Every list of jobs
  * in optimhire.com's replies (/api/…) is put in this order before the page sees it:
- *   quick ATS (Greenhouse, Lever, Ashby, Workable…) → ATS with an account (Workday,
- *   iCIMS, SuccessFactors…) → company career sites → job boards / recruiters → Reed.
+ *   ATS in your order (Greenhouse, Workable, SmartRecruiters, Workday, Oracle, iCIMS, Lever,
+ *   Ashby, BambooHR…) → company career sites → job boards / recruiters → Reed.
  * Order within each group is kept; nothing is added or removed. The service worker
  * (oh-bg.js, "ATS jobs first, Reed last") does the same for the next job it asks for.
  *
@@ -20,11 +20,13 @@
   if (window.__ohQueueOrder) return;
   window.__ohQueueOrder = true;
 
-  var QUICK_ATS = [/greenhouse\.io|grnh\.se/, /lever\.co/, /ashbyhq/, /workable/, /smartrecruiters/, /recruitee/, /teamtailor/, /bamboohr/,
-    /breezy\.hr/, /jazzhr|resumatorapi|applytojob/, /pinpointhq/, /rippling/, /comeet/, /personio/, /jobvite/,
-    /freshteam|manatal|recooty|gohire|forhyre|homerun|dover\.com|jobs\.gem\.com|join\.com|factorialhr|careerpuck|trakstar/];
-  var ACCOUNT_ATS = [/myworkdayjobs|myworkdaysite|workdayjobs|\.workday\.com/, /icims/, /successfactors|sapsf/, /oraclecloud/, /taleo/,
-    /paylocity|ultipro|ukg\.com|adp\.com|avature|bullhorn|dayforcehcm|brassring|csod\.com|paycom|paycor|zohorecruit/];
+  /* Your order: Greenhouse, Workable, SmartRecruiters, Workday, Oracle, iCIMS, Lever, Ashby, BambooHR,
+     Jobvite, Teamtailor, Recruitee, Breezy, JazzHR, SuccessFactors, then the other ATS (as oh-bg.js). */
+  var ATS_ORDER = [/greenhouse\.io|grnh\.se/, /workable/, /smartrecruiters/, /myworkdayjobs|myworkdaysite|myworkday\.com|workdayjobs|\.workday\.com/,
+    /oraclecloud/, /icims/, /lever\.co/, /ashbyhq/, /bamboohr/, /jobvite/, /teamtailor/, /recruitee/, /breezy\.hr/, /jazzhr|resumatorapi|applytojob/,
+    /successfactors|sapsf/, /pinpointhq/, /rippling/, /comeet/, /personio/,
+    /freshteam|manatal|recooty|gohire|forhyre|homerun|dover\.com|jobs\.gem\.com|join\.com|factorialhr|careerpuck|trakstar/,
+    /taleo/, /paylocity|ultipro|ukg\.com|adp\.com|avature|bullhorn|dayforcehcm|brassring|csod\.com|paycom|paycor|zohorecruit/];
   var BOARD_HOST_RE = new RegExp('(^|\\.)(' + [
     'linkedin', 'indeed', 'glassdoor', 'ziprecruiter', 'adzuna', 'dice', 'monster', 'totaljobs', 'cwjobs', 'jobsite', 'cv-library',
     'caterer', 'milkround', 'efinancialcareers', 'efinancial', 'irishjobs', 'jobs\\.ie', 'nijobs', 'recruitireland', 'jobs\\.ac\\.uk',
@@ -66,13 +68,12 @@
     if (host) {
       if (/(^|\.)reed\.co\.uk$/.test(host)) return 99;
       if (BOARD_HOST_RE.test(host + '.')) return /(^|\.)linkedin\./.test(host) ? 40 : /(^|\.)indeed\./.test(host) ? 41 : 45;
-      for (i = 0; i < QUICK_ATS.length; i++) if (QUICK_ATS[i].test(lu)) return i;
-      for (i = 0; i < ACCOUNT_ATS.length; i++) if (ACCOUNT_ATS[i].test(lu)) return 20 + i;
+      for (i = 0; i < ATS_ORDER.length; i++) if (ATS_ORDER[i].test(lu)) return i;
     }
     var n = names(o);
     if (/\breed\b/i.test(n)) return 99;
     if (BOARD_NAME_RE.test(n)) return 45;
-    if (ATS_NAME_RE.test(n)) return 10;
+    if (ATS_NAME_RE.test(n)) return 22;               // an ATS by name only: after the known ones
     return 30;                                     // a company's own career site
   }
   /* A copy of `v` with every list of jobs in order, or null when nothing moved. */

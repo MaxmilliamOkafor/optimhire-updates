@@ -219,23 +219,22 @@
   }
 
   /* ── ATS jobs first, Reed last ── */
-  /* Ranked by what gets an application to an employer fastest: one-page company ATS forms
-     first (no account, quickest, straight to the hiring team), then ATS sites that need an
-     account or several steps, then job boards; OptimHire's mixed queue — where Reed comes
-     from — last. Same order as self.ohJobRank (the CSV queue). */
-  var FAST_ATS_SITES = ['greenhouse', 'lever', 'ashby', 'workable', 'smartrecruiters', 'recruitee', 'bamboohr',
-                        'breezyhr', 'jazzhr', 'rippling', 'comeet', 'jobvite', 'freshteam', 'manatal', 'recooty', 'gohire'];
-  var SLOW_ATS_SITES = ['workday', 'paylocity'];
-  var ATS_SITES = FAST_ATS_SITES.concat(SLOW_ATS_SITES);
+  /* Your order (asked for 30-10): Greenhouse, Workable, SmartRecruiters, Workday, Oracle, iCIMS,
+     then Lever, Ashby, BambooHR, Jobvite, Teamtailor, Recruitee, Breezy, JazzHR, SuccessFactors,
+     the other ATS; then company career sites; then job boards; Reed last. The jobsite keys are
+     the ones OptimHire's server knows, in that order. Same order as self.ohJobRank (CSV queue). */
+  var ATS_SITES = ['greenhouse', 'workable', 'smartrecruiters', 'workday', 'lever', 'ashby', 'bamboohr', 'jobvite',
+                   'recruitee', 'breezyhr', 'jazzhr', 'rippling', 'comeet', 'freshteam', 'manatal', 'recooty', 'gohire', 'paylocity'];
   var BOARD_SITES = ['linkedin', 'indeed', 'dice', 'ziprecruiter', 'adzuna', 'ziprecruiterpaid', 'adzunapaid'];
-  var JOB_TIERS = [['quick-apply ATS', FAST_ATS_SITES], ['ATS (account sites)', SLOW_ATS_SITES], ['job boards', BOARD_SITES]];
+  var JOB_TIERS = [['ATS', ATS_SITES], ['job boards', BOARD_SITES]];
+  var ATS_TIERS = JOB_TIERS.slice(0, 1);
   /* The same order for any job link (the CSV queue, queue-runner.js): lower = sooner. */
   var RANK_RES = [
-    [/greenhouse\.io|grnh\.se/, 0], [/lever\.co/, 1], [/ashbyhq/, 2], [/workable/, 3], [/smartrecruiters/, 4], [/recruitee/, 5],
-    [/teamtailor/, 6], [/bamboohr/, 7], [/breezy\.hr/, 8], [/jazzhr|resumatorapi|applytojob/, 9], [/pinpointhq/, 10], [/rippling/, 11],
-    [/comeet/, 12], [/personio/, 13], [/jobvite/, 14], [/freshteam|manatal|recooty|gohire|forhyre|homerun|dover|wellfound/, 15],
-    [/myworkdayjobs|myworkdaysite|workdayjobs|\.workday\.com/, 20], [/icims/, 21], [/successfactors|sapsf/, 22], [/oraclecloud/, 23],
-    [/taleo/, 24], [/paylocity|ultipro|ukg\.com|adp\.com|avature|bullhorn/, 25]];
+    [/greenhouse\.io|grnh\.se/, 0], [/workable/, 1], [/smartrecruiters/, 2], [/myworkdayjobs|myworkdaysite|myworkday\.com|workdayjobs|\.workday\.com/, 3],
+    [/oraclecloud/, 4], [/icims/, 5], [/lever\.co/, 6], [/ashbyhq/, 7], [/bamboohr/, 8], [/jobvite/, 9], [/teamtailor/, 10], [/recruitee/, 11],
+    [/breezy\.hr/, 12], [/jazzhr|resumatorapi|applytojob/, 13], [/successfactors|sapsf/, 14], [/pinpointhq/, 15], [/rippling/, 16],
+    [/comeet/, 17], [/personio/, 18], [/freshteam|manatal|recooty|gohire|forhyre|homerun|dover|jobs\.gem\.com|join\.com|factorialhr/, 19],
+    [/taleo/, 20], [/paylocity|ultipro|ukg\.com|adp\.com|avature|bullhorn|dayforcehcm|brassring/, 21]];
   /* Job boards and recruitment sites: where OptimHire found a job, not the employer's own form.
      After every ATS and company career site; Reed after all of them. Matched on the host + '.'. */
   var BOARD_HOST_RE = new RegExp('(^|\\.)(' + [
@@ -378,7 +377,10 @@
       if (!r) return 'timeout';
       if (r.auth) return { auth: true };
       if (r.cancelled) return null;
-      if (r.res && !(excludeId && String((r.job && r.job.copilot_job_id) || '') === excludeId)) {
+      /* An ATS jobsite's answer counts only when the job really is on an ATS or company site — a
+         server that ignored the jobsite and sent its default (a Reed / board job) is no hit. */
+      var wrongKind = tier === 'ATS' && r.job && /^(reed|board)$/.test(jobKind(r.job));
+      if (r.res && !wrongKind && !(excludeId && String((r.job && r.job.copilot_job_id) || '') === excludeId)) {
         return { res: r.res, tier: tier, site: r.site };
       }
       _emptyUntil[r.site] = Date.now() + (r.failed ? FAIL_TTL_MS : EMPTY_TTL_MS);
@@ -457,7 +459,7 @@
     var kind = jobKind(j);
     if (kind !== 'reed' && kind !== 'board') return res;
     var base = url.replace(/[?#].*$/, '');
-    var tiers = kind === 'reed' ? JOB_TIERS : JOB_TIERS.slice(0, 2);
+    var tiers = kind === 'reed' ? JOB_TIERS : ATS_TIERS;
     var hit = await firstJobFrom(tiers, base, init, String(j.copilot_job_id || ''));
     if (hit && hit.res) {
       noteTier(hit.tier, hit.site, kind);

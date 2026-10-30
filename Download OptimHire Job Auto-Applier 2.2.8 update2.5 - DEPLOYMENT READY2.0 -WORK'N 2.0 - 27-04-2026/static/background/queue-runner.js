@@ -54,7 +54,7 @@
   }
 
   /* ── order: quickest company ATS first, then account ATS, career sites, job boards, Reed last ──
-     self.ohJobRank (oh-bg.js): Greenhouse 0, Lever 1 … Workday 20 … career sites 30, boards 40+, Reed 99. */
+     self.ohJobRank (oh-bg.js): Greenhouse 0, Workable 1, SmartRecruiters 2, Workday 3 … other ATS up to 21, career sites 30, boards 40+, Reed 99. */
   function tier(url) { return typeof self.ohJobRank === 'function' ? self.ohJobRank(url) : 30; }
   function pickNext(q, ok, preferAts) {
     if (!preferAts) { for (var i = 0; i < q.length; i++) if (ok(q[i])) return q[i]; return null; }
