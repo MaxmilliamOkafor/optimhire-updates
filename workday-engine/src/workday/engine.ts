@@ -295,6 +295,24 @@ async function handlePage(ctx: Ctx, page: PageKind): Promise<StepResult> {
       return "stop";
     case "candidateHome":
       throw new NeedsHuman("You're on your candidate home page. Open the job (or the draft under My Applications), then click Resume.");
+    case "somethingWrong": {
+      // Workday's "Something went wrong — please refresh": reload, then reopen the posting; a third time, give up.
+      const k = `ua-wd-refresh|${location.pathname}`;
+      const n = Number(sessionStorage.getItem(k) || 0);
+      if (n >= 2) throw new Error('Workday kept saying "Something went wrong" — skipping this job');
+      sessionStorage.setItem(k, String(n + 1));
+      await ctx.save();
+      const posting = location.href.replace(/\/apply(\/.*)?(\?.*)?$/, "");
+      if (n === 1 && posting !== location.href) {
+        ctx.log('Workday still says "Something went wrong" — reopening the job posting', "warn");
+        location.href = posting;
+      } else {
+        ctx.log('Workday said "Something went wrong" — refreshing the page', "warn");
+        location.reload();
+      }
+      await sleep(10000);
+      return "stop";
+    }
     default:
       ctx.run.attempts++;
       if (ctx.run.attempts > 5) throw new NeedsHuman("Unrecognised page. Move to the next step yourself, then click Resume.");
@@ -355,6 +373,17 @@ async function submitApplication(ctx: Ctx, btn: HTMLElement): Promise<StepResult
   ctx.log("Submitting the application");
   await humanClick(btn);
   await sleep(500);
+  // Same failure as "Add Another": Workday can swallow the synthetic click. If the
+  // page hasn't moved and shows no errors, re-find Submit and click it natively.
+  const moved = () => detectPage() !== "review" || errorMessages().length > 0;
+  if (!(await waitFor(moved, 3000, 200).then(() => true, () => false))) {
+    const again = nextButton();
+    if (again && isSubmitButton(again)) {
+      ctx.log("Submit click didn't register — retrying with a native click", "warn");
+      again.click();
+      await sleep(500);
+    }
+  }
   const outcome = await waitFor(() => (detectPage() === "submitted" ? "done" : errorMessages().length ? "error" : null), 30000, 250).catch(
     () => "timeout" as const
   );

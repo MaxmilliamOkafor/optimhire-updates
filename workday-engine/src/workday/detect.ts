@@ -5,7 +5,7 @@
 import { anyAid, byAid, isVisible, q, qa, text } from "./dom.js";
 import { sel, type AidKey } from "./selectors.js";
 import type { JobPosting, PageKind } from "./types.js";
-import { NEXT_TEXT_RX, STEP_PATTERNS, SUBMIT_RX, SUBMITTED_RX, VERIFY_EMAIL_RX, detectLanguage, urlLanguage } from "./i18n.js";
+import { NEXT_TEXT_RX, SOMETHING_WRONG_RX, STEP_PATTERNS, SUBMIT_RX, SUBMITTED_RX, VERIFY_EMAIL_RX, detectLanguage, urlLanguage } from "./i18n.js";
 
 const WORKDAY_HOST_RX = /(^|\.)(myworkdayjobs|myworkdaysite|myworkday|workdayjobs)\.com$/i;
 
@@ -76,6 +76,8 @@ function classifyStep(name: string): PageKind | null {
 export function detectPage(): PageKind {
   const body = text(document.body).slice(0, 5000);
   const next = nextButton();
+  // Workday's error page, with no form on it: a reload usually brings the step back.
+  if (SOMETHING_WRONG_RX.test(body) && !qa('[data-automation-id^="formField-"]').some(isVisible)) return "somethingWrong";
 
   if (SUBMITTED_RX.test(body) && !next)
     return "submitted";

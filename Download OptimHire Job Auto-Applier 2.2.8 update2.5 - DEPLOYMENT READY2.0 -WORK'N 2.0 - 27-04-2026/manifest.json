@@ -63,7 +63,21 @@
             "all_frames": true,
             "match_about_blank": true,
             "run_at": "document_start",
-            "css": []
+            "css": [],
+            "world": "MAIN"
+        },
+        {
+            "matches": [
+                "https://optimhire.com/*",
+                "https://*.optimhire.com/*"
+            ],
+            "js": [
+                "assets/oh-queue-order.js"
+            ],
+            "all_frames": false,
+            "run_at": "document_start",
+            "css": [],
+            "world": "MAIN"
         },
         {
             "matches": [

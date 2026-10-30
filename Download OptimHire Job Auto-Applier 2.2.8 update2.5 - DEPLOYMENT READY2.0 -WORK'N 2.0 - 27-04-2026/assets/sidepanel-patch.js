@@ -804,6 +804,7 @@
     entry.appendChild(span);
     logEl.appendChild(entry);
     logEl.scrollTop = logEl.scrollHeight;
+    try { var nowEl = document.getElementById('oh-qc-now'); if (nowEl && text) nowEl.textContent = String(text); } catch (_) {}
     // Keep last 50 entries
     while (logEl.children.length > 50) logEl.removeChild(logEl.firstChild);
   }
@@ -829,6 +830,20 @@
     if (progressLbl) progressLbl.textContent = 'Filling application form...';
     if (fillStats) fillStats.textContent = filled + ' of ' + total + ' required fields filled';
     if (responsesEl && responses > 0) responsesEl.textContent = responses + ' responses from API';
+    cardForm(true, filled, total);
+  }
+  /* The form progress, on the Job Queue card. */
+  function cardForm(show, filled, total) {
+    try {
+      var box = document.getElementById('oh-qc-form');
+      if (!box) return;
+      box.style.display = show && total > 0 ? '' : 'none';
+      if (!show || !(total > 0)) return;
+      var pct = Math.round((filled / total) * 100);
+      document.getElementById('oh-qc-form-pct').textContent = pct + '%';
+      document.getElementById('oh-qc-form-bar').style.width = pct + '%';
+      document.getElementById('oh-qc-form-stats').textContent = filled + ' of ' + total + ' required fields filled';
+    } catch (_) {}
   }
 
   /* ── Field list ── */
@@ -2035,6 +2050,7 @@
       _isRunning = true;
       clearFieldList();
       if (progressSec) progressSec.style.display = 'none';
+      cardForm(false);
       addLog('Opening job page...', 'active');
       if (title) title.textContent = 'Auto-Apply Mode';
     }
@@ -2053,6 +2069,7 @@
       }
       clearFieldList();
       if (progressSec) progressSec.style.display = 'none';
+      cardForm(false);
     }
 
     /* ── CSV Queue Done ── */
@@ -2550,7 +2567,8 @@
   var QC_CSS = [
     '#oh-queue-card{--qc-bg:#12141c;--qc-raise:#1a1d27;--qc-line:#262a36;--qc-text:#e6e8ef;--qc-muted:#8b91a3;',
     '--qc-accent:#6d5efc;--qc-accent-2:#5a4bea;--qc-ok:#3ecf8e;--qc-warn:#f5b44a;--qc-bad:#f26d6d;',
-    'position:fixed;bottom:44px;left:10px;right:10px;z-index:2147483646;box-sizing:border-box;padding:14px;',
+    'position:fixed;bottom:10px;left:10px;right:10px;z-index:2147483646;box-sizing:border-box;padding:14px;',
+    'max-height:calc(100vh - 20px);overflow-y:auto;overscroll-behavior:contain;scrollbar-width:thin;',
     'background:var(--qc-bg);border:1px solid var(--qc-line);border-radius:14px;box-shadow:0 10px 30px rgba(0,0,0,.45);',
     'font:12px/1.4 Inter,-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;color:var(--qc-text);-webkit-font-smoothing:antialiased}',
     '#oh-queue-card *{box-sizing:border-box}',
@@ -2568,6 +2586,12 @@
     '#oh-queue-card .qc-stat b{display:block;font-size:17px;font-weight:650;font-variant-numeric:tabular-nums;line-height:1.15}',
     '#oh-queue-card .qc-stat span{font-size:10.5px;color:var(--qc-muted)}',
     '#oh-queue-card .qc-ok b{color:var(--qc-ok)} #oh-queue-card .qc-bad b{color:var(--qc-bad)}',
+    '#oh-queue-card .qc-live{margin-bottom:12px;padding:10px;border:1px solid var(--qc-line);border-radius:10px;background:var(--qc-raise)}',
+    '#oh-queue-card .qc-live-top{display:flex;align-items:flex-start;gap:8px}',
+    '#oh-queue-card .qc-now{flex:1;min-width:0;font-size:11.5px;line-height:1.45;color:var(--qc-text);overflow-wrap:anywhere}',
+    '#oh-queue-card .qc-mini{flex:none;padding:4px 10px;border:1px solid rgba(245,180,74,.45);border-radius:8px;background:rgba(245,180,74,.1);color:var(--qc-warn);font-size:11px;font-weight:600;cursor:pointer}',
+    '#oh-queue-card .qc-mini:hover{background:rgba(245,180,74,.18)}',
+    '#oh-queue-card .qc-form{margin-top:8px}',
     '#oh-queue-card .qc-run{margin-bottom:12px;padding:10px;border:1px solid var(--qc-line);border-radius:10px;background:var(--qc-raise)}',
     '#oh-queue-card .qc-run-top{display:flex;justify-content:space-between;align-items:baseline;gap:8px;font-size:11.5px;color:var(--qc-muted)}',
     '#oh-queue-card .qc-run-top b{color:var(--qc-text);font-size:12px;font-variant-numeric:tabular-nums}',
@@ -2586,6 +2610,7 @@
     '#oh-queue-card .qc-sep{height:1px;background:var(--qc-line);margin:4px 0 6px}',
     '#oh-queue-card .qc-ko{display:flex;width:100%;align-items:center;gap:10px;margin:0 0 6px;padding:8px 10px;border:1px solid var(--qc-line);border-radius:10px;background:transparent;color:var(--qc-text);text-align:left;cursor:pointer;font:inherit}',
     '#oh-queue-card .qc-ko:hover{background:var(--qc-raise)}',
+    '#oh-queue-card .qc-ko.qc-audit-on{border-color:rgba(62,207,142,.5);background:rgba(62,207,142,.07)}',
     '#oh-queue-card .qc-ko.qc-ko-warn{border-color:rgba(245,180,74,.5);background:rgba(245,180,74,.08)}',
     '#oh-queue-card .qc-ko span{flex:1;display:flex;flex-direction:column;gap:1px;min-width:0}',
     '#oh-queue-card .qc-ko b{font-size:12px;font-weight:600}',
@@ -2606,9 +2631,162 @@
     '#oh-queue-card .qc-link:hover{color:var(--qc-text)}',
     '#oh-queue-card .qc-link svg{width:12px;height:12px}',
     '#oh-queue-card button:focus-visible{outline:2px solid var(--qc-accent);outline-offset:2px}',
-    '.qc-pill{position:fixed;bottom:44px;right:10px;z-index:2147483646;cursor:pointer;padding:7px 14px;border-radius:999px;',
+    '#oh-queue-card .qc-acct{margin:2px 0 6px}',
+    '#oh-queue-card .qc-acct-title{font-size:12px;font-weight:600;color:var(--qc-text);margin:0 0 2px}',
+    '#oh-queue-card .qc-acct-sub{font-size:10.5px;color:var(--qc-muted);margin:0 0 6px;line-height:1.35}',
+    '#oh-queue-card .qc-acct-box{border:1px solid rgba(255,255,255,.08);border-radius:10px;padding:8px 10px;background:rgba(255,255,255,.03)}',
+    '#oh-queue-card .qc-acct-row{display:flex;align-items:center;gap:8px}',
+    '#oh-queue-card .qc-acct-row+.qc-acct-row{margin-top:8px;padding-top:8px;border-top:1px solid rgba(255,255,255,.08)}',
+    '#oh-queue-card .qc-acct-row>label{flex:0 0 62px;font-size:11.5px;font-weight:600;color:var(--qc-text)}',
+    '#oh-queue-card .qc-acct-field{flex:1;min-width:0;display:flex;flex-direction:column;gap:5px}',
+    '#oh-queue-card .qc-acct-in{position:relative;display:flex}',
+    '#oh-queue-card .qc-acct input[type=email],#oh-queue-card .qc-acct input[type=password],#oh-queue-card .qc-acct input[type=text]{width:100%;box-sizing:border-box;padding:6px 28px 6px 8px;border-radius:8px;border:1px solid rgba(255,255,255,.14);background:rgba(0,0,0,.25);color:var(--qc-text);font-size:11.5px}',
+    '#oh-queue-card .qc-acct input:disabled{opacity:.6}',
+    '#oh-queue-card .qc-acct-eye{position:absolute;right:4px;top:50%;transform:translateY(-50%);border:0;background:transparent;color:var(--qc-muted);cursor:pointer;padding:2px}',
+    '#oh-queue-card .qc-acct-eye svg{width:14px;height:14px;display:block}',
+    '#oh-queue-card .qc-acct-check{display:flex;align-items:center;gap:6px;font-size:11px;color:var(--qc-text);cursor:pointer}',
+    '#oh-queue-card .qc-acct-check input{accent-color:var(--qc-accent);margin:0}',
+    '#oh-queue-card .qc-acct-saved{font-size:10px;color:var(--qc-muted);margin-top:4px;min-height:12px}',
+    '.qc-pill{position:fixed;bottom:10px;right:10px;z-index:2147483646;cursor:pointer;padding:7px 14px;border-radius:999px;',
     'background:#6d5efc;color:#fff;font:600 11.5px/1 Inter,-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;box-shadow:0 6px 18px rgba(0,0,0,.4)}'
   ].join('');
+
+  /* ── Applications Account (Job Queue card) ──────────────────────────
+     appAccountEmail / appAccountPassword (kept by oh-persist.js) plus the
+     Workday login the engine signs in with (ohWorkdayLogin: e-mail,
+     password). "Use profile email" = your OptimHire profile's e-mail.
+     A replaced password moves to the login's otherPasswords, so the
+     accounts already made with it still sign in. */
+  function profileEmailFrom(d) {
+    var RX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    var found = '';
+    function walk(o, depth) {
+      if (found || !o || typeof o !== 'object' || depth > 3) return;
+      var keys = Object.keys(o);
+      keys.sort(function (a, b) { return (/email/i.test(b) ? 1 : 0) - (/email/i.test(a) ? 1 : 0); });
+      for (var i = 0; i < keys.length && !found; i++) {
+        var v = o[keys[i]];
+        if (typeof v === 'string' && /email/i.test(keys[i]) && RX.test(v.trim())) found = v.trim();
+        else if (v && typeof v === 'object') walk(v, depth + 1);
+      }
+    }
+    ['candidateDetails', 'userDetails', 'seekerDetails', 'cachedSeekerInfo', 'ohWdSeeker'].forEach(function (k) {
+      var v = d && d[k];
+      if (typeof v === 'string') { try { v = JSON.parse(v); } catch (_) { v = null; } }
+      walk(v, 0);
+    });
+    return found;
+  }
+  function wireAppAccount() {
+    var em = document.getElementById('oh-qc-acct-email');
+    var use = document.getElementById('oh-qc-acct-useprofile');
+    var pw = document.getElementById('oh-qc-acct-pw');
+    var eye = document.getElementById('oh-qc-acct-eye');
+    var mail = document.getElementById('oh-qc-acct-mail');
+    var note = document.getElementById('oh-qc-acct-saved');
+    if (!em || !use || !pw || em.dataset.wired) return;
+    em.dataset.wired = '1';
+    var KEYS = ['appAccountEmail', 'appAccountPassword', 'ohAppAccountUseProfile', 'ohWorkdayLogin', 'ohGmailCodes',
+                'candidateDetails', 'userDetails', 'seekerDetails', 'cachedSeekerInfo', 'ohWdSeeker', 'ohMyPhone', 'ohCvProfile'];
+    var ph = document.getElementById('oh-qc-acct-phone'), phNote = document.getElementById('oh-qc-acct-phone-note');
+    var profileEmail = '';
+    function say(t) { if (note) note.textContent = t; }
+    function load() {
+      chrome.storage.local.get(KEYS, function (d) {
+        d = d || {};
+        profileEmail = profileEmailFrom(d);
+        var login = d.ohWorkdayLogin || {};
+        var useProfile = d.ohAppAccountUseProfile !== false;
+        use.checked = useProfile;
+        em.disabled = useProfile;
+        if (mail) mail.checked = d.ohGmailCodes === true;
+        em.value = useProfile ? (profileEmail || login.email || d.appAccountEmail || '') : (d.appAccountEmail || login.email || '');
+        if (document.activeElement !== pw) pw.value = d.appAccountPassword || login.password || '';
+        if (useProfile && !profileEmail && !em.value) say('No e-mail on your OptimHire profile yet: untick and type one.');
+        if (ph) {
+          var found = detectedPhone(d);
+          if (document.activeElement !== ph) ph.value = d.ohMyPhone || '';
+          ph.placeholder = found ? found.phone : '+353 87 123 4567';
+          if (phNote) phNote.textContent = d.ohMyPhone ? 'Used on every application form.'
+            : found ? 'Using ' + found.phone + ' from ' + found.from + '. Type another to use that instead.'
+            : 'No phone found in your OptimHire details or CV yet — type it here (forms like Greenhouse require one).';
+        }
+      });
+    }
+    /* The phone forms get when none is typed here: your details from OptimHire's jobs, else your CV. */
+    function detectedPhone(d) {
+      var sk = (d && d.ohWdSeeker) || {};
+      var code = String(sk.mobile_code || '').replace(/\D/g, ''), num = String(sk.mobile_num || '').replace(/\D/g, '');
+      if (num) return { phone: (code ? '+' + code + ' ' : '') + num, from: 'your OptimHire details' };
+      if (sk.phone) return { phone: String(sk.phone), from: 'your OptimHire details' };
+      var c = d && d.ohCvProfile && d.ohCvProfile.profile && d.ohCvProfile.profile.contact;
+      if (c && c.phone) return { phone: String(c.phone), from: 'your CV' };
+      return null;
+    }
+    function save(why) {
+      var email = (use.checked ? (profileEmail || em.value) : em.value).trim();
+      var password = pw.value;
+      if (email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) { say('That e-mail doesn’t look right.'); return; }
+      /* A password Workday would refuse is not saved — but the e-mail still is (a refused
+         password used to stop the e-mail being saved too, and every account page then said
+         "Add your email"). */
+      var weak = password && (password.length < 8 || !/[a-z]/.test(password) || !/[A-Z]/.test(password) || !/\d/.test(password) || !/[^A-Za-z0-9]/.test(password));
+      if (weak) password = '';
+      chrome.storage.local.get(['ohWorkdayLogin'], function (d) {
+        var login = Object.assign({ sites: {} }, (d && d.ohWorkdayLogin) || {});
+        if (password && login.password && login.password !== password) {
+          var others = Array.isArray(login.otherPasswords) ? login.otherPasswords.slice() : [];
+          if (others.indexOf(login.password) < 0) others.unshift(login.password);
+          login.otherPasswords = others.slice(0, 5);
+        }
+        if (email) login.email = email;
+        if (password) login.password = password;
+        var patch = { ohWorkdayLogin: login, ohAppAccountUseProfile: use.checked };
+        if (email) patch.appAccountEmail = email;
+        if (password) patch.appAccountPassword = password;
+        chrome.storage.local.set(patch, function () {
+          say(weak ? 'E-mail saved. Password NOT saved: Workday needs 8+ characters with upper, lower, a number and a symbol.'
+                   : (why || 'Saved') + (email ? ' — ' + email : ''));
+        });
+      });
+    }
+    use.addEventListener('change', function () {
+      em.disabled = use.checked;
+      if (use.checked && profileEmail) em.value = profileEmail;
+      save(use.checked ? 'Using your profile e-mail' : 'Type the e-mail to use');
+      if (!use.checked) em.focus();
+    });
+    em.addEventListener('change', function () { save('Saved'); });
+    if (ph) ph.addEventListener('change', function () {
+      var v = ph.value.trim();
+      if (v && v.replace(/\D/g, '').length < 7) { say('That phone number looks too short.'); return; }
+      chrome.storage.local.set({ ohMyPhone: v }, function () { say(v ? 'Phone saved — ' + v : 'Phone cleared: your OptimHire details / CV are used'); load(); });
+    });
+    pw.addEventListener('change', function () { save('Saved'); });
+    /* The opt-in the Gmail code / link reader (oh-bg.js 10, 10b) already checks; it was only
+       reachable in Queue Manager → Workday & sign-in. */
+    if (mail) mail.addEventListener('change', function () {
+      chrome.storage.local.set({ ohGmailCodes: mail.checked }, function () {
+        say(mail.checked ? 'Verification emails: on (Gmail in this Chrome must be signed in)' : 'Verification emails: off');
+      });
+    });
+    eye.addEventListener('click', function () {
+      var show = pw.type === 'password';
+      pw.type = show ? 'text' : 'password';
+      eye.setAttribute('aria-label', show ? 'Hide password' : 'Show password');
+    });
+    load();
+    /* The first save also fills in a login that has none yet. */
+    chrome.storage.local.get(['ohWorkdayLogin', 'appAccountEmail'], function (d) {
+      var login = (d && d.ohWorkdayLogin) || {};
+      setTimeout(function () { if (!login.email && !(d && d.appAccountEmail) && em.value) save('Saved'); }, 300);
+    });
+    try {
+      chrome.storage.onChanged.addListener(function (c, area) {
+        if (area === 'local' && (c.candidateDetails || c.ohWorkdayLogin || c.appAccountEmail || c.ohGmailCodes || c.ohWdSeeker || c.ohMyPhone || c.ohCvProfile)) load();
+      });
+    } catch (_) {}
+  }
 
   (function installJobQueueCard() {
     var KEY_QUEUE = 'ohJobQueue';
@@ -2656,6 +2834,17 @@
           '<div id="oh-qc-run-tally" class="qc-run-tally">—</div>' +
           '<div id="oh-qc-run-tier" class="qc-run-tier" style="display:none"></div>' +
         '</div>' +
+        /* What the automation is doing right now: the latest step, the form being
+           filled, and Skip (formerly a second panel under this one). */
+        '<div id="oh-qc-live" class="qc-live" style="display:none">' +
+          '<div class="qc-live-top"><span id="oh-qc-now" class="qc-now">Starting…</span>' +
+            '<button id="oh-qc-skip" class="qc-mini" title="Skip the job being applied to now and go to the next one">Skip job</button></div>' +
+          '<div id="oh-qc-form" class="qc-form" style="display:none">' +
+            '<div class="qc-run-top"><span>Filling the form</span><b id="oh-qc-form-pct">0%</b></div>' +
+            '<div class="qc-bar"><div id="oh-qc-form-bar"></div></div>' +
+            '<div id="oh-qc-form-stats" class="qc-run-tally"></div>' +
+          '</div>' +
+        '</div>' +
         '<div class="qc-row">' +
           '<button id="oh-qc-open" class="qc-btn qc-primary">Open Queue Manager</button>' +
           '<button id="oh-qc-debug" class="qc-btn qc-square" title="Debug log" aria-label="Debug log">' + ICON.log + '</button>' +
@@ -2667,6 +2856,9 @@
         '<div class="qc-sep"></div>' +
         '<button id="oh-qc-ko" class="qc-ko" title="Work rights, sponsorship, relocation, years of experience… are always answered with your true answers, per job country. Wrong answers get applications rejected or ranked last.">' +
           '<span><b id="oh-qc-ko-title">Knockout answers</b><small id="oh-qc-ko-sub">—</small></span>' + ICON.arrow + '</button>' +
+        /* One click: record everything (every tab, this panel, the service worker) and see it live. */
+        '<button id="oh-qc-audit" class="qc-ko" title="Records everything the automation does — every page, this panel and the background — for 8 hours, and opens the live log. Export it all as one file with ‘Export audit file’ below (passwords and login tokens are never included).">' +
+          '<span><b id="oh-qc-audit-title">Audit</b><small id="oh-qc-audit-sub">Record everything, see every log, export one file</small></span>' + ICON.arrow + '</button>' +
         '<button id="oh-qc-master" class="qc-switch" role="switch" aria-checked="true" ' +
           'title="Hard stop: makes the extension completely inert — no auto-clicking, no auto-submitting, no background loops — until you turn it back on">' +
           '<span class="qc-switch-text"><b>Automation</b><small id="oh-qc-master-sub">Applies and submits for you</small></span><span class="qc-toggle"></span></button>' +
@@ -2676,15 +2868,52 @@
         '<button id="oh-qc-tailor" class="qc-switch" role="switch" aria-checked="false" ' +
           'title="Off: your own CV, unchanged, on every job (OptimHire\'s Optimize My Resume step is skipped). On: OptimHire\'s runs use Optimize My Resume and CSV jobs a copy of your CV ordered to the job. Workday always keeps your own CV.">' +
           '<span class="qc-switch-text"><b>Tailor CV to each job</b><small id="oh-qc-tailor-sub">Off — your own CV</small></span><span class="qc-toggle"></span></button>' +
+        '<button id="oh-qc-autofill" class="qc-switch" role="switch" aria-checked="true" ' +
+          'title="Fill application forms on ATS pages as you open them. Never on a page another autofill extension is applying on.">' +
+          '<span class="qc-switch-text"><b>Auto-fill on ATS pages</b><small id="oh-qc-autofill-sub">Fills forms on job sites you open</small></span><span class="qc-toggle"></span></button>' +
+        '<div class="qc-sep"></div>' +
+        /* Applications Account: the e-mail + password new accounts on application
+           sites are made with (Workday: one per employer) and signed in with. */
+        '<div class="qc-acct">' +
+          '<div class="qc-acct-title">Applications Account</div>' +
+          '<div class="qc-acct-sub">Used to create and sign in to accounts on application sites (each Workday employer needs one).</div>' +
+          '<div class="qc-acct-box">' +
+            '<div class="qc-acct-row"><label for="oh-qc-acct-email">Email</label>' +
+              '<div class="qc-acct-field">' +
+                '<div class="qc-acct-in"><input type="email" id="oh-qc-acct-email" autocomplete="off" spellcheck="false" placeholder="you@example.com"></div>' +
+                '<label class="qc-acct-check"><input type="checkbox" id="oh-qc-acct-useprofile">Use profile email</label>' +
+              '</div></div>' +
+            /* The phone every application form gets (Greenhouse requires one): yours if typed here. */
+            '<div class="qc-acct-row"><label for="oh-qc-acct-phone">Phone</label>' +
+              '<div class="qc-acct-field">' +
+                '<div class="qc-acct-in"><input type="tel" id="oh-qc-acct-phone" autocomplete="off" spellcheck="false" placeholder="+353 87 123 4567"></div>' +
+                '<div id="oh-qc-acct-phone-note" class="qc-acct-sub" style="margin:0"></div>' +
+              '</div></div>' +
+            '<div class="qc-acct-row"><label for="oh-qc-acct-pw">Password</label>' +
+              '<div class="qc-acct-field"><div class="qc-acct-in">' +
+                '<input type="password" id="oh-qc-acct-pw" autocomplete="new-password" spellcheck="false" placeholder="8+ chars, upper, lower, number, symbol">' +
+                '<button id="oh-qc-acct-eye" class="qc-acct-eye" type="button" title="Show / hide" aria-label="Show password">' +
+                  '<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M1.5 8S4 3.5 8 3.5 14.5 8 14.5 8 12 12.5 8 12.5 1.5 8 1.5 8z" stroke="currentColor" stroke-width="1.3" fill="none"/><circle cx="8" cy="8" r="2" stroke="currentColor" stroke-width="1.3" fill="none"/></svg>' +
+                '</button></div></div></div>' +
+            '<div class="qc-acct-row"><label for="oh-qc-acct-mail">Emails</label>' +
+              '<div class="qc-acct-field">' +
+                '<label class="qc-acct-check"><input type="checkbox" id="oh-qc-acct-mail">Read verification emails</label>' +
+                '<div class="qc-acct-sub" style="margin:0">Only emails from the site you are applying to, from the last few minutes: its one-time code, or its verify / password-reset link. Uses the Gmail signed in to this Chrome; nothing is sent anywhere or kept.</div>' +
+              '</div></div>' +
+          '</div>' +
+          '<div id="oh-qc-acct-saved" class="qc-acct-saved"></div>' +
+        '</div>' +
         '<div class="qc-sep"></div>' +
         '<div id="oh-qc-truth" class="qc-foot" title="OptimHire’s ‘X applied’ counter also counts skips. This counts real submission confirmations.">Results: — submitted · — skipped</div>' +
         '<div class="qc-links">' +
           '<button id="oh-qc-qamem" class="qc-link" title="Answers learned from applications confirmed as submitted. Review or forget them.">Remembered answers ' + ICON.arrow + '</button>' +
+          '<button id="oh-qc-auditx" class="qc-link" title="Download ONE file with everything: every log, each job and what happened, your settings, the details forms get, open tabs — for a full audit (passwords and login tokens removed)">' + ICON.down + 'Export audit file</button>' +
           '<button id="oh-qc-export" class="qc-link" title="Download every job OptimHire\'s queue has handed out so far as one CSV — title, company, full job link, status, dates (opens in Excel / Sheets; re-importable into the Queue Manager)">' + ICON.down + 'Export CSV</button>' +
         '</div>';
       /* Always append to <body> as a fixed overlay — never insert as a
          sibling of #__plasmo (that risked disturbing React). */
       document.body.appendChild(card);
+      wireAppAccount();
       document.getElementById('oh-qc-open').addEventListener('click', function () {
         try { chrome.tabs.create({ url: chrome.runtime.getURL('tabs/jobQueue.html'), active: true }); }
         catch (_) {}
@@ -2709,6 +2938,37 @@
         });
       });
       var tailorLine = document.getElementById('oh-qc-tailor');
+      var auditLine = document.getElementById('oh-qc-audit');
+      if (auditLine) auditLine.addEventListener('click', function () {
+        if (!window.OH_AUDIT) return;
+        window.OH_AUDIT.status(function (st) {
+          var open = function () { try { chrome.tabs.create({ url: chrome.runtime.getURL('tabs/debug.html'), active: true }); } catch (_) {} };
+          if (st.on) { open(); return; }
+          window.OH_AUDIT.record(8, function () { addLog('Audit: recording everything for 8 hours', 'success'); paintAudit(); open(); });
+        });
+      });
+      var auditX = document.getElementById('oh-qc-auditx');
+      if (auditX) auditX.addEventListener('click', function () {
+        if (!window.OH_AUDIT) return;
+        window.OH_AUDIT.exportFile(function (a, name) {
+          addLog('Audit file saved: ' + name + ' (' + a.summary.logEntries + ' log entries, ' + a.summary.errors + ' errors)', 'success');
+        });
+      });
+      var autofillLine = document.getElementById('oh-qc-autofill');
+      if (autofillLine) autofillLine.addEventListener('click', function () {
+        chrome.storage.local.get(['ohAutoTrigger'], function (d) {
+          var on = !(d && d.ohAutoTrigger !== false);   // toggle
+          chrome.storage.local.set({ ohAutoTrigger: on }, function () {
+            addLog(on ? 'Auto-fill on ATS pages: on' : 'Auto-fill on ATS pages: off', '');
+            refresh();
+          });
+        });
+      });
+      var skipBtn = document.getElementById('oh-qc-skip');
+      if (skipBtn) skipBtn.addEventListener('click', function () {
+        sendOhSkip('Skip pressed');
+        addLog('Skipping this job…', '');
+      });
       if (tailorLine) tailorLine.addEventListener('click', function () {
         chrome.storage.local.get(['ohTailorCv'], function (d) {
           var on = !(d && d.ohTailorCv === true);   // toggle
@@ -2947,6 +3207,18 @@
       paintQaCount();
     }
 
+    /* Audit: recording or not, and for how long. */
+    function paintAudit() {
+      var row = document.getElementById('oh-qc-audit'), sub = document.getElementById('oh-qc-audit-sub');
+      if (!row || !sub || !window.OH_AUDIT) return;
+      window.OH_AUDIT.status(function (st) {
+        row.classList.toggle('qc-audit-on', st.on);
+        if (!st.on) { sub.textContent = 'Record everything, see every log, export one file'; return; }
+        var mins = Math.ceil(Math.max(0, st.until - Date.now()) / 60e3), h = Math.floor(mins / 60), m = mins % 60;
+        sub.textContent = 'Recording — ' + (h ? h + 'h ' : '') + m + 'm left · ' + (st.entries + st.bgEntries) + ' entries · tap to see them';
+      });
+    }
+
     /* Knockout answers: a prompt until you have checked them, then where you can work. */
     function paintKo() {
       var row = document.getElementById('oh-qc-ko'), t = document.getElementById('oh-qc-ko-title'), sub = document.getElementById('oh-qc-ko-sub');
@@ -2983,11 +3255,18 @@
         });
         chrome.storage.local.get(['ohHarvestedJobs', RUN_KEY, 'matchingJobCount', 'isAutoProcessStartJob',
                                   'isManuallyStartJob', 'autoApplyState', 'ohAutomationDisabled',
-                                  'ohPreferAts', 'ohQueueTier', 'ohTailorCv'], function (d) {
+                                  'ohPreferAts', 'ohQueueTier', 'ohTailorCv', 'ohAutoTrigger', KEY_ACTIVE], function (d) {
           try {
+            var al = document.getElementById('oh-qc-autofill');
+            if (al) al.setAttribute('aria-checked', d && d.ohAutoTrigger === false ? 'false' : 'true');
+            var lv = document.getElementById('oh-qc-live');
+            var running = !!(d && d.ohAutomationDisabled !== true && ((d.autoApplyState && d.autoApplyState.isActive) ||
+                             d.isAutoProcessStartJob || d.isManuallyStartJob || d[KEY_ACTIVE]));
+            if (lv) lv.style.display = running ? '' : 'none';
             var pl = document.getElementById('oh-qc-prio');
             if (pl) pl.setAttribute('aria-checked', d && d.ohPreferAts === false ? 'false' : 'true');
             paintKo();
+            paintAudit();
             var tl = document.getElementById('oh-qc-tailor'), ts = document.getElementById('oh-qc-tailor-sub');
             if (tl) tl.setAttribute('aria-checked', d && d.ohTailorCv === true ? 'true' : 'false');
             if (ts) ts.textContent = d && d.ohTailorCv === true ? 'On — Workday keeps your own CV' : 'Off — your own CV';
@@ -3045,14 +3324,24 @@
          the master ON/OFF switch, so it must keep working while idle. */
       _spNativeSetInterval(refresh, 5000);
       try { chrome.storage.local.get(['ohQaMemory'], function (d) { setQaCount(d && d.ohQaMemory); }); } catch (_) {}
+      /* The panel was just reset after a start that never loaded its job (oh-bg.js 17): say why. */
+      try {
+        chrome.storage.local.get(['ohLoadRescue'], function (d) {
+          var lr = d && d.ohLoadRescue;
+          if (lr && lr.final && lr.msg && Date.now() - (+lr.ts || 0) < 60000) addLog(lr.msg, 'error');
+        });
+      } catch (_) {}
       try {
         chrome.storage.onChanged.addListener(function (changes, area) {
           if (area !== 'local') return;
           if (changes.ohQaMemory) setQaCount(changes.ohQaMemory.newValue);
           if (changes.ohKnockout || changes.ohKnockoutFixes) paintKo();
+          if (changes.ohDebugEnabled || changes.ohDebugUntil) paintAudit();
           if (changes[KEY_QUEUE] || changes[KEY_ACTIVE] || changes.ohHarvestedJobs ||
               changes.isAutoProcessStartJob || changes.isManuallyStartJob || changes.matchingJobCount ||
-              changes.ohPreferAts || changes.ohQueueTier || changes.ohTailorCv) refresh();
+              changes.ohPreferAts || changes.ohQueueTier || changes.ohTailorCv || changes.ohAutoTrigger) refresh();
+          var lr = changes.ohLoadRescue && changes.ohLoadRescue.newValue;
+          if (lr && lr.msg) addLog(lr.msg, lr.final ? 'error' : '');
           var qt = changes.ohQueueTier && changes.ohQueueTier.newValue;
           if (qt && qt.heldBack) {
             addLog('⇅ Held back a ' + (qt.heldBack === 'reed' ? 'reed.co.uk' : 'job-board') + ' job — applying an ' +

@@ -140,6 +140,21 @@ function makePassword(): string {
   return "Oh" + Array.from(r, (n) => abc[n % abc.length]).join("") + "!7q";
 }
 
+/** Your e-mail wherever OptimHire keeps it: any field named "…email…" holding an address. */
+function anyEmail(o: Any, depth = 0): string {
+  if (!o || typeof o !== "object" || depth > 3) return "";
+  const keys = Object.keys(o).sort((a, b) => Number(/email/i.test(b)) - Number(/email/i.test(a)));
+  for (const k of keys) {
+    const v = o[k];
+    if (typeof v === "string" && /email/i.test(k) && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(v.trim())) return v.trim();
+    if (v && typeof v === "object") {
+      const f = anyEmail(v, depth + 1);
+      if (f) return f;
+    }
+  }
+  return "";
+}
+
 /** One e-mail + password for every Workday site (ohWorkdayLogin), made once and kept. */
 async function workdayLogin(): Promise<{ email: string; password: string; login: Any; d: Any }> {
   const d = await ST.get([LOGIN_KEY, "appAccountEmail", "appAccountPassword", "ohGmailCodes"]);
@@ -148,7 +163,20 @@ async function workdayLogin(): Promise<{ email: string; password: string; login:
     login.password = d.appAccountPassword || makePassword();
     await ST.set({ [LOGIN_KEY]: login });
   }
-  const email = login.email || d.appAccountEmail || (await profileSources()).email || "";
+  const src = await profileSources();
+  let email = login.email || d.appAccountEmail || src.email || anyEmail(src) || "";
+  // A fresh install has no saved login e-mail yet: the address in the form's email box becomes it,
+  // and is SAVED, so every later job and employer signs in with it.
+  if (!email) {
+    const box = document.querySelector<HTMLInputElement>('[data-automation-id="email"], input[type="email"]');
+    const typed = (box?.value || "").trim();
+    if (/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(typed)) email = typed;
+  }
+  if (email && !login.email) {
+    login.email = email;
+    await ST.set({ [LOGIN_KEY]: login });
+    say(`Workday sign-in e-mail saved: ${email}`);
+  }
   return { email, password: login.password, login, d };
 }
 
@@ -329,23 +357,50 @@ function parse(v: unknown): Any {
   return v && typeof v === "object" ? (v as Any) : {};
 }
 
+const PLACE_PART = new Set(["location", "city", "state", "province", "region", "country", "county", "zip", "zipcode",
+  "postal", "postcode", "address", "street", "lat", "lng", "latitude", "longitude", "timezone"]);
+function isPlaceKey(k: string): boolean {
+  return /post_?code/i.test(k) || k.split(/[_\W]+|(?=[A-Z])/).some((p) => PLACE_PART.has(p.toLowerCase()));
+}
+
 /** OptimHire's details for you, flattened: the job's seeker record first, then the stored profile. */
 async function profileSources(ad?: Any): Promise<Any> {
-  const d = await ST.get(["candidateDetails", "cachedSeekerInfo", "seekerDetails", "userDetails", "complexFormData", "autoApplyState", "manualApplicationDetail", SEEKER_KEY]);
+  const d = await ST.get(["candidateDetails", "cachedSeekerInfo", "seekerDetails", "userDetails", "complexFormData", "autoApplyState", "manualApplicationDetail", SEEKER_KEY,
+    "ohMyPhone", "ohCvProfile", "appAccountEmail"]);
   // Outside a run OptimHire keeps little more than your name; the last job's details fill the gap.
   const merged: Any = Object.assign({}, parse(d[SEEKER_KEY]));
   // OptimHire keeps the full details (phone, address, CV…) on the job it is working on.
+  const jobs: Any[] = [];
   for (const k of ["manualApplicationDetail", "autoApplyState", "complexFormData"]) {
     const v = parse(d[k]);
     const s = (v.applicationDetails || v).seeker;
-    if (s && typeof s === "object") Object.assign(merged, s);
+    if (s && typeof s === "object") jobs.push(s);
   }
+  // Where you live goes as a whole: when the job names any of it, none of the kept copy's.
+  const current = jobs.concat(ad && ad.seeker && typeof ad.seeker === "object" ? [ad.seeker] : []);
+  if (current.some((s) => Object.keys(s).some((k) => isPlaceKey(k) && s[k] != null && s[k] !== "" && typeof s[k] !== "object")))
+    for (const k of Object.keys(merged)) if (isPlaceKey(k)) delete merged[k];
+  for (const s of jobs) Object.assign(merged, s);
   for (const k of ["userDetails", "seekerDetails", "cachedSeekerInfo", "candidateDetails"]) {
     const v = parse(d[k]);
     for (const [kk, vv] of Object.entries({ ...v, ...(v.seeker && typeof v.seeker === "object" ? v.seeker : {}) }))
       if (vv !== "" && vv != null) merged[kk] = vv;
   }
   for (const [k, v] of Object.entries((ad && ad.seeker) || {})) if (v !== "" && v != null) merged[k] = v;
+  // The phone you typed on the side panel's card wins; your CV's header fills what is still
+  // missing; the Applications Account e-mail stands in when OptimHire gives none.
+  const mine = String(d.ohMyPhone || "").trim();
+  if (mine) {
+    const m = mine.match(/^\+\s*(\d{1,3})\s*(.*)$/);
+    if (m) merged.mobile_code = m[1];
+    merged.mobile_num = (m ? m[2] : mine).replace(/\D/g, "");
+    merged.phone = mine;
+  }
+  const cvc: Any = (parse(d.ohCvProfile).profile || {}).contact || {};
+  if (!merged.mobile_num && !merged.phone && cvc.phone) merged.phone = cvc.phone;
+  if (!merged.email && cvc.email) merged.email = cvc.email;
+  if (!merged.linkedin_profile_url && cvc.linkedin) merged.linkedin_profile_url = cvc.linkedin;
+  if (!merged.email && d.appAccountEmail) merged.email = String(d.appAccountEmail);
   return merged;
 }
 
@@ -395,7 +450,7 @@ function historyFrom(s: Any): Pick<Profile, "work" | "education"> {
           .slice(0, 6),
       };
     })
-    .filter((w) => w.title && w.company && w.start);
+    .filter((w) => w.title && w.company);   // a role without a start date is still a role
   const education = listOf(s, ["education", "educations", "education_history", "academics", "qualifications"])
     .map((e, i) => ({
       id: `e${i + 1}`,
@@ -465,7 +520,7 @@ async function buildProfile(ad?: Any, cvUrl = ""): Promise<Profile> {
       firstName: pick(s, "first_name", "firstName", "given_name"),
       lastName: pick(s, "last_name", "lastName", "family_name", "surname"),
       preferredName: "",
-      email: pick(s, "email", "email_address", "emailAddress"),
+      email: pick(s, "email", "email_address", "emailAddress") || anyEmail(s),
       phone: { countryName: DIAL[code] || country, countryCode: code ? `+${code}` : "", number: num, deviceType: "Mobile" },
       address: {
         line1: pick(s, "street", "address_line1", "address1", "street_address") || pick(s, "address").split(",")[0] || "",
@@ -498,6 +553,26 @@ async function buildProfile(ad?: Any, cvUrl = ""): Promise<Profile> {
       previouslyWorkedHere: false,
     },
   } as any);
+  // EEO answers from your saved profile; without this every Self Identify / disclosure
+  // question fell back to "decline" (e.g. "I don't wish to answer" instead of your "No").
+  {
+    const pk = (...k: string[]) => pick(s, ...k);
+    const yn = (v: string) => {
+      const t = String(v || "").trim().toLowerCase();
+      if (!t || /prefer not|decline|wish/.test(t)) return "decline";
+      if (/^(no|i do not|i don'?t|not a|none)/.test(t)) return "no";
+      if (/^(yes|i have|i am)/.test(t)) return "yes";
+      return "decline";
+    };
+    const dc = (v: string) => { const t = String(v || "").trim(); return !t || /prefer not|decline|do not wish|don'?t wish|not to say/i.test(t) ? "decline" : t; };
+    (base as Any).eeo = {
+      gender: dc(pk("gender", "sex")),
+      hispanicOrLatino: yn(pk("hispanic_latino", "hispanicOrLatino", "hispanic", "latino")),
+      ethnicity: dc(pk("ethnicity", "race", "race_ethnicity")),
+      veteran: dc(pk("veteran", "veteran_status", "veteranStatus")),
+      disability: yn(pk("disability", "disability_status", "disabilityStatus", "has_disability")),
+    };
+  }
   /* Returned at once; your CV is read alongside and its history put into this
      same profile object when ready (My Experience waits for it: cvReady). */
   const withCv = async (prof: Profile): Promise<Profile> => {
@@ -519,7 +594,7 @@ async function buildProfile(ad?: Any, cvUrl = ""): Promise<Profile> {
   const fillIn = (a: Any, b: Any) => {
     for (const k of Object.keys(b)) {
       if (b[k] && typeof b[k] === "object" && !Array.isArray(b[k])) fillIn((a[k] ??= {}), b[k]);
-      else if (a[k] === "" || a[k] == null || (Array.isArray(a[k]) && !a[k].length)) a[k] = b[k];
+      else if (a[k] === "" || a[k] == null || (Array.isArray(a[k]) && !a[k].length) || (a[k] === "decline" && b[k] && b[k] !== "decline")) a[k] = b[k];
     }
   };
   fillIn(p, base);
@@ -527,7 +602,7 @@ async function buildProfile(ad?: Any, cvUrl = ""): Promise<Profile> {
 }
 
 /* Assist: as fast as Workday takes it. */
-const ASSIST_SETTINGS = (): WorkdaySettings => ({ ...SETTINGS, fieldDelayMs: 10 });
+const ASSIST_SETTINGS = (): WorkdaySettings => ({ ...SETTINGS, fieldDelayMs: 5 });
 
 const SETTINGS: WorkdaySettings = {
   ...DEFAULT_WD_SETTINGS,
@@ -537,7 +612,7 @@ const SETTINGS: WorkdaySettings = {
   requireDocApproval: false,
   llmAnswers: false,                // answers come from OptimHire (hooks.answer) instead
   trustedInputFallback: false,
-  fieldDelayMs: 40,
+  fieldDelayMs: 15,
   fallbackToMasterCv: true,
   externalAutoRequest: false,
 };
@@ -738,7 +813,12 @@ async function startFromOptimHire(msg: Any): Promise<void> {
   const ad: Any = msg.applicationDetails || {};
   let ci: Any = msg.complexInstructions;
   if (typeof ci === "string") ci = parse(ci);
-  const mode: Mode = { auto: true, submit: true, startedAt: Date.now(), jobId: String(ad.copilot_job_id || ad.application_id || "") };
+  // OptimHire 2.10.0's "Autofill Application" button on a job page (pageAutofillApplicationId):
+  // a job you picked to fill and check yourself — filled, then left on Review, never submitted.
+  const { pageAutofillApplicationId: pageFill } = await ST.get("pageAutofillApplicationId");
+  const pageOnly = !!pageFill && String(pageFill) === String(ad.application_id ?? "");
+  if (pageOnly) say("page autofill: filling this job and stopping on Review for you");
+  const mode: Mode = { auto: true, submit: !pageOnly, startedAt: Date.now(), jobId: String(ad.copilot_job_id || ad.application_id || "") };
   writeMode(mode);
   answerCache.clear();
   for (let i = 0; i < 40 && !hasWorkdayApp(); i++) await new Promise((r) => setTimeout(r, 500));   // the app may still be rendering
@@ -756,6 +836,25 @@ async function startFromOptimHire(msg: Any): Promise<void> {
   if (toApplyManually()) return;
   await installHooks(mode);
   await startRun(null);
+}
+
+/** Another job-autofill extension applying on this page (its "Automation In Progress"-style panel
+ *  on screen): assist keeps out of it — two fillers on one form undo each other. */
+const FOREIGN_RUN_RE = /automation in progress|auto-?applying|auto-?filling|autofilling|applying to (this )?job|filling (the |your )?(application|form)/i;
+function otherAutomationOnPage(): boolean {
+  try {
+    if (document.getElementById("ua-ctrl")) return true;
+    const roots = [...Array.from(document.documentElement.children), ...(document.body ? Array.from(document.body.children) : [])];
+    for (const el of roots) {
+      if (el === document.body || el === document.head || /^(oh-|wd-)|optimhire/i.test(el.id || "")) continue;
+      const cs = getComputedStyle(el);
+      if (cs.position !== "fixed" || cs.display === "none" || cs.visibility === "hidden") continue;
+      if (FOREIGN_RUN_RE.test(((el as HTMLElement).innerText || "").slice(0, 400))) return true;
+    }
+  } catch {
+    /* page not ready */
+  }
+  return false;
 }
 
 /** A link straight into "Autofill with Resume" / "Use My Last Application" (a job board's or OptimHire's
@@ -870,7 +969,7 @@ if (TOP && isWorkdayHost()) {
   const ASSIST_PAGES: PageKind[] = ["resumeUpload", "myInformation", "myExperience", "questions", "voluntaryDisclosures", "selfIdentify"];
   const assisted = new Set<string>();
   setInterval(() => {
-    if (!assistOn || readMode() || isActive() || !hasWorkdayApp()) return;
+    if (!assistOn || readMode() || isActive() || !hasWorkdayApp() || otherAutomationOnPage()) return;
     const page = detectPage();
     if (page === "review") {
       const rk = `review|${location.pathname}`;

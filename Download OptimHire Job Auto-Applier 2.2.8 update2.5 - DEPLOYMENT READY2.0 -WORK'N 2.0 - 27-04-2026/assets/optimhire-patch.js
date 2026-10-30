@@ -236,10 +236,30 @@
 
   /* May we take ACTION (click Apply, submit a form, skip a job)?
      `d` is a storage snapshot containing the keys below. */
+  /* OptimHire 2.10.0's "Autofill Application" button on a job page: it
+     fills that one job for you to check (it says "please review and
+     submit"), and marks it with pageAutofillApplicationId. Its run looks
+     like any other, so our flow pressed "SUBMIT APPLICATION" by itself
+     (seen live on Lever). That job is filled, never submitted or skipped. */
+  function isPageAutofillJob(d) {
+    const want = d && d.pageAutofillApplicationId;
+    if (!want) return false;
+    for (const k of ['complexFormData', 'manualApplicationDetail']) {
+      try {
+        let v = d[k];
+        if (typeof v === 'string') v = JSON.parse(v);
+        const ad = v && (v.applicationDetails || v);
+        if (ad && ad.application_id != null && String(ad.application_id) === String(want)) return true;
+      } catch (_) {}
+    }
+    return false;
+  }
+
   function mayAutomate(d) {
     if (!d) return false;
     if (d.ohAutomationDisabled === true) return false;          // master OFF
     if (notTheJobTab(d)) return false;                          // another tab is the job tab
+    if (isPageAutofillJob(d)) return false;                     // you review and submit this one
     const st = d.autoApplyState;
     if (st && st.isActive === true) return true;                // live session
     if (d.isAutoProcessStartJob) return true;                   // live session
@@ -253,7 +273,8 @@
     return false;
   }
   const AUTOMATION_KEYS = ['autoApplyState', 'isAutoProcessStartJob', 'isManuallyStartJob', 'ohJobQueueActive',
-                           'ohAutoApplyEngaged', 'ohAutoApplyEngagedTs', 'ohAutomationDisabled', 'ohJobTab'];
+                           'ohAutoApplyEngaged', 'ohAutoApplyEngagedTs', 'ohAutomationDisabled', 'ohJobTab',
+                           'pageAutofillApplicationId', 'complexFormData', 'manualApplicationDetail'];
 
   /* ── Idle governor (CRITICAL for CPU) ────────────────────────────────
    * This file installs ~22 polling loops and ~14 subtree
@@ -691,7 +712,12 @@
     if (!opts.length) { nativeSet(input, ''); keyDown('ArrowDown'); await sleep(450); opts = comboOptions(); }
     const txt = o => norm(o.textContent);
     let best = null;
-    if (want && opts.length) {
+    /* A location question: the town, never a building in it (and no "first option"). */
+    const isLoc = /location|\bcity\b|\btown\b|residence|where.*(based|live|located)/i.test(getLabel(input) || getLabel(ctl) || '');
+    if (isLoc) {
+      best = want && opts.length ? bestPlaceOption(opts, answer) : null;
+      fallbackFirst = false;
+    } else if (want && opts.length) {
       best = opts.find(o => txt(o) === want) ||
              opts.find(o => txt(o).startsWith(want + ' ') || txt(o).startsWith(want + ',')) ||
              opts.find(o => txt(o).startsWith(want)) ||
@@ -831,6 +857,28 @@
      everything here that fills fields or presses buttons leaves it alone —
      two fillers on one form undo each other. */
   const wdEngineOwns = () => { try { return !!(window.__ohWdEngine && window.__ohWdEngine.owns()); } catch (_) { return false; } };
+  /* Another job-autofill extension driving this page — its own "Automation In Progress"-style
+     panel on screen (the Jobright / LazyApply-style build's #ua-ctrl, or any fixed panel saying it
+     is applying / filling). Outside our own run, ours keeps out of that page: no auto-fill, no
+     answer corrections — two fillers on one form undo each other, and both slow down. */
+  const FOREIGN_RUN_RE = /automation in progress|auto-?applying|auto-?filling|autofilling|applying to (this )?job|filling (the |your )?(application|form)/i;
+  function otherAutomationOnPage() {
+    try {
+      if (window.top !== window.self) { try { return !!window.top.document && otherAutomationOnPageIn(window.top.document); } catch (_) { return false; } }
+      return otherAutomationOnPageIn(document);
+    } catch (_) { return false; }
+  }
+  function otherAutomationOnPageIn(doc) {
+    if (doc.getElementById('ua-ctrl')) return true;
+    const roots = [...doc.documentElement.children, ...(doc.body ? doc.body.children : [])];
+    for (const el of roots) {
+      if (!el || el === doc.body || el === doc.head || /^(oh-|wd-)|optimhire/i.test(el.id || '')) continue;
+      const cs = getComputedStyle(el);
+      if (cs.position !== 'fixed' || cs.display === 'none' || cs.visibility === 'hidden') continue;
+      if (FOREIGN_RUN_RE.test((el.innerText || '').slice(0, 400))) return true;
+    }
+    return false;
+  }
   const _rawATS = Object.entries(ATS_DOMAINS)
     .find(([domain]) => HOST.includes(domain))?.[1] || null;
   // LinkedIn: only activate on /jobs path — not on feeds, profiles, or messaging
@@ -883,7 +931,8 @@
          terminal-submit (T43) bails on its very first line when
          automation is inactive, the run sat on "Review and submit the
          form" waiting for a human click. */
-      const active = (!!csvActiveJobId || isRunning || mayAutomate(d)) && !notTheJobTab(d);
+      const active = (!!csvActiveJobId || isRunning || mayAutomate(d)) && !notTheJobTab(d) &&
+                     !isPageAutofillJob(d);   // a job you autofilled by hand: you submit it
       _automationCache = { active, ts: Date.now() };
       return active;
     } catch (_) {
@@ -1622,6 +1671,15 @@
    * so we match on the button's own text, plus aria-label/title as a
    * fallback, and explicitly reject the Skip (thumbs-down) twin.
    * ────────────────────────────────────────────────────────────────── */
+  /* optimhire.com's own job lists are put ATS-first in the page (oh-queue-order.js, page world);
+     "Quickest ATS first" switched off (ohPreferAts) leaves them in the site's order. */
+  (function markAtsFirst() {
+    if (!/(^|\.)optimhire\.com$/i.test(location.hostname)) return;
+    const paint = d => document.documentElement.setAttribute('data-oh-ats-first', d && d.ohPreferAts === false ? '0' : '1');
+    ST.get(['ohPreferAts']).then(paint, () => {});
+    try { chrome.storage.onChanged.addListener((c, area) => { if (area === 'local' && c.ohPreferAts) paint({ ohPreferAts: c.ohPreferAts.newValue }); }); } catch (_) {}
+  })();
+
   (function installPageApplyClicker() {
     if (!/(^|\.)optimhire\.com$/i.test(location.hostname)) return;
     if (window.top !== window.self) return;
@@ -1650,11 +1708,20 @@
       return null;
     }
 
-    /* Identify the current job so we press Apply at most once per job. */
+    /* Identify the current job so we press Apply at most once per job.
+       Not "the first h1/h2": on this page that is the fixed "Explore Our
+       Success Stories" heading, the same for every job — so after the
+       first job Apply was never pressed again, and each later job sat
+       until a timeout skipped it. The job's own title (h1.jva-job-title),
+       its company line and the "Job N of …" counter change per job. */
     function jobKey() {
       try {
-        const h = document.querySelector('h1,h2');
-        return ((h && (h.innerText || h.textContent)) || '').trim().slice(0, 120);
+        const own = el => ((el && (el.innerText || el.textContent)) || '').replace(/\s+/g, ' ').trim();
+        const title = document.querySelector('.jva-job-title') ||
+                      [...document.querySelectorAll('h1')].find(isVisible) || null;
+        const head = title && title.closest('[class*="job-head"]');
+        const counter = [...document.querySelectorAll('div,span,p')].find(e => e.children.length === 0 && /^job \d+ of\b/i.test(own(e)));
+        return [own(title), own(head && head.parentElement), own(counter)].filter(Boolean).join(' | ').slice(0, 240);
       } catch (_) { return ''; }
     }
 
@@ -1664,8 +1731,13 @@
         /* Only while the user has actually engaged auto-apply (or a
            session/queue is running) — never while they are just browsing
            jobs by hand. */
-        const d = await ST.get(AUTOMATION_KEYS.concat(['copilotTabId']));
+        const d = await ST.get(AUTOMATION_KEYS.concat(['copilotTabId', 'ohPageAutofillTs', 'ohStoppedTs']));
         if (!mayAutomate(d)) return;
+        /* A page autofill shows this page while it loads ITS job: pressing
+           Apply here started OptimHire's whole queue instead. Same just
+           after Stop. */
+        if (Date.now() - (+d.ohPageAutofillTs || 0) < 180_000) return;
+        if (Date.now() - (+d.ohStoppedTs || 0) < 60_000) return;
         /* Only one tab may drive applications: the pinned job tab, or —
            when no side panel is pinning — the elected owner. */
         if (!isPingedJobTab() && !(await isAutomationOwnerTab())) return;
@@ -1807,7 +1879,11 @@
         const ps = (o.textContent || '').split(',').map(x => x.trim().toLowerCase()).filter(Boolean);
         return (ps[0] === want ? 2 : 1) + (country && ps.length > 1 && norm(ps[ps.length - 1]) === norm(country) ? 4 : 0);
       };
-      const matching = () => visibleOptions(el).filter(o => (o.textContent || '').toLowerCase().includes(want))
+      /* A place, not a building in it: "National University of Ireland, Galway"
+         was picked for a Galway address. */
+      const NOT_A_PLACE_RE = /\b(universit(y|ies)|college|school|academy|institute|campus|hospital|clinic|airport|station|hotel|stadium|park|centre|center|museum|library|church|ltd|limited|inc|llc|plc|gmbh|corporation|company|bank|office)\b/i;
+      const isPlace = o => !NOT_A_PLACE_RE.test((o.textContent || '').split(',')[0]);
+      const matching = () => visibleOptions(el).filter(o => isPlace(o) && (o.textContent || '').toLowerCase().includes(want))
         .map((o, i) => ({ o, i, s: score(o) })).sort((a, b) => b.s - a.s || a.i - b.i).map(x => x.o);
       let opts = matching();
       if (!opts.length) {                    // retry with a shorter query
@@ -1819,7 +1895,7 @@
           opts = matching();
         }
       }
-      if (!opts.length && ownList(el)) opts = visibleOptions(el);   // the field's own list: its best guess
+      if (!opts.length && ownList(el)) opts = visibleOptions(el).filter(isPlace);   // the field's own list: its best guess (a place)
       if (opts.length) {
         const best = opts[0];
         try { realClick(best); } catch (_) { try { best.click(); } catch (__) {} }
@@ -1856,7 +1932,7 @@
         _tries++;
         const p = await getProfile();
         for (const t of targets) {
-          let val = guessValue(t.lbl, p);
+          let val = placeOnly(guessValue(t.lbl, p));
           if (!val) val = `${(p && p.city) || 'Dublin'}, ${(p && p.country) || 'Ireland'}`;
           await fillOne(t, val);
         }
@@ -2873,9 +2949,15 @@
   const CONTACT_LABEL_RE = /\b(first|last|middle|full|given|family|preferred|legal|sur)?\s?name\b|e-?mail|phone|mobile|telephone|address|street|city|town|post ?code|postal|zip|county|state|province|country|linkedin|github|website|portfolio|url\b/i;
 
   /* ── Profile helper ─────────────────────────────────────── */
+  const PLACE_PART = { location: 1, city: 1, state: 1, province: 1, region: 1, country: 1, county: 1, zip: 1, zipcode: 1,
+                       postal: 1, postcode: 1, address: 1, street: 1, lat: 1, lng: 1, latitude: 1, longitude: 1, timezone: 1 };
+  function isPlaceKey(k) {
+    return /post_?code/i.test(k) || String(k).split(/[_\W]+|(?=[A-Z])/).some(p => PLACE_PART[p.toLowerCase()]);
+  }
   async function getProfile() {
     const keys = ['candidateDetails', 'cachedSeekerInfo', 'seekerDetails', 'userDetails'];
-    const data = await ST.get(keys.concat(['autoApplyState', 'complexFormData', 'manualApplicationDetail', 'ohWdSeeker']));
+    const data = await ST.get(keys.concat(['autoApplyState', 'complexFormData', 'manualApplicationDetail', 'ohWdSeeker',
+                                           'ohMyPhone', 'ohCvProfile', 'appAccountEmail']));
     /* Outside a run OptimHire keeps little more than your name: your details
        from the last OptimHire job (kept by the Workday engine) are the base. */
     let merged = {};
@@ -2894,7 +2976,14 @@
         if (ad && ad.seeker && typeof ad.seeker === 'object') { merged = Object.assign({}, ad.seeker, merged); }
       } catch (_) {}
     }
-    if (data.ohWdSeeker && typeof data.ohWdSeeker === 'object') merged = Object.assign({}, data.ohWdSeeker, merged);   // lowest of all
+    if (data.ohWdSeeker && typeof data.ohWdSeeker === 'object') {   // lowest of all
+      /* Where you live goes as a whole: when the job now names any of it, none
+         of the kept copy's (an old location beside a new city picked the old town). */
+      const kept = Object.assign({}, data.ohWdSeeker);
+      if (Object.keys(merged).some(k => isPlaceKey(k) && merged[k] != null && merged[k] !== '' && typeof merged[k] !== 'object'))
+        Object.keys(kept).forEach(k => { if (isPlaceKey(k)) delete kept[k]; });
+      merged = Object.assign({}, kept, merged);
+    }
 
     // Parse and merge all available profile sources
     for (const key of keys) {
@@ -2922,9 +3011,27 @@
       if (code && !merged.phone_country_code) merged.phone_country_code = '+' + code;
       if (code) _profileDialCode = code;
     }
+    /* The phone you typed on the side panel's card (Applications Account) wins;
+       else your details from OptimHire's jobs; else your CV's own header. The
+       Applications Account e-mail stands in when OptimHire gives none. */
+    {
+      const mine = String(data.ohMyPhone || '').trim();
+      if (mine) {
+        merged.phone = mine;
+        const m = mine.match(/^\+\s*(\d{1,3})/);
+        if (m) { merged.phone_country_code = '+' + m[1]; _profileDialCode = m[1]; }
+      }
+      const cvc = data.ohCvProfile && data.ohCvProfile.profile && data.ohCvProfile.profile.contact;
+      if (cvc && typeof cvc === 'object') {
+        if (!merged.phone && cvc.phone) merged.phone = cvc.phone;
+        if (!merged.email && cvc.email) merged.email = cvc.email;
+      }
+      if (!merged.email && data.appAccountEmail) merged.email = String(data.appAccountEmail).trim();
+    }
     merged.first_name = pick('first_name', 'firstName', 'given_name', 'givenName');
     merged.last_name  = pick('last_name',  'lastName',  'family_name','familyName', 'surname');
-    merged.linkedin_profile_url = pick('linkedin_profile_url','linkedin_url','linkedinUrl','linkedin','LinkedIn');
+    merged.linkedin_profile_url = pick('linkedin_profile_url','linkedin_url','linkedinUrl','linkedin','LinkedIn') ||
+      String((data.ohCvProfile && data.ohCvProfile.profile && data.ohCvProfile.profile.contact && data.ohCvProfile.profile.contact.linkedin) || '');
     merged.github_url    = pick('github_url', 'github', 'githubUrl', 'GitHub');
     merged.website_url   = pick('website_url', 'website', 'websiteUrl', 'portfolio', 'portfolioUrl', 'personal_website');
     merged.twitter_url   = pick('twitter_url', 'twitter', 'twitterUrl', 'x_url', 'x_handle');
@@ -3110,7 +3217,7 @@
       driversLicence: null, clearance: false,
       previouslyEmployed: false, relatives: false, nonCompete: false, convicted: false,
       englishFluent: true,
-      yearsExperience: '7', highestDegree: koDegreeFromCv(_koCv),
+      yearsExperience: '9', highestDegree: koDegreeFromCv(_koCv),
       certifications: ['AWS'],
       salary: String(p.expected_salary || '').trim(),          // as your profile writes it ("£85,000")
       confirmed: false,
@@ -3552,6 +3659,9 @@
   } catch (_) {}
   function koPageOk() {
     if (_IS_OH_PAGE || _koMasterOff || wdEngineOwns()) return false;
+    /* Only on a job OUR run (or your "Autofill this page") is applying to: another
+       extension's answers and Submit clicks are its own business. */
+    if (!_engagedNow) return false;
     if (CURRENT_ATS) return true;
     return !!document.querySelector('input[type="file"],[data-automation-id^="formField-"]') || /apply|application|career|job|recruit|candidate|vacanc/i.test(location.href);
   }
@@ -3613,13 +3723,15 @@
     gender:       'Prefer not to say',
     ethnicity:    'Prefer not to say',
     race:         'Prefer not to say',
-    years:        '7',           // every years-of-experience question, unless Knockout answers set another number (koFacts)
-    salary:       '80000',
-    salaryRange:  '80000-110000',
-    hourly:       '45',
-    notice:       '2 weeks',
-    availability: 'Immediately',
-    startDate:    '2 weeks from offer',
+    // Your values (CV + settings profile), not generic ones — these are only used when
+    // the profile itself has no answer.
+    years:        '9',           // every years-of-experience question, unless Knockout answers set another number (koFacts)
+    salary:       '60000',
+    salaryRange:  '60000-80000',
+    hourly:       '',
+    notice:       '1 month',
+    availability: '1 month notice',
+    startDate:    '1 month from offer',
     // Professional canned answers — used ONLY if profile has none
     cover: `I am excited to apply for this role. My background and skills make me a strong fit for the position, and I am eager to contribute to your team's continued success. I bring the technical expertise, drive, and collaborative mindset needed to make an immediate impact.`,
     why: 'I admire the company culture and the opportunity to make a meaningful impact through work that aligns with my skills and long-term career goals.',
@@ -4371,9 +4483,13 @@
     const desc = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'files');
     if (!desc || !desc.set) return;
     /* The box's own heading: the nearest ancestor (a few levels up) that
-       holds a label-like element, or the group naming it. */
+       holds a label-like element, or the group naming it — never one that
+       also holds another upload box: that heading is the neighbour's (the
+       "Resume/CV *" above made the cover letter look required, and the CV
+       went into it). */
     function head(inp) {
       for (let n = inp.parentElement, i = 0; n && i < 5; n = n.parentElement, i++) {
+        if (n.querySelectorAll('input[type="file"]').length > 1) break;
         const by = n.getAttribute && n.getAttribute('aria-labelledby');
         const named = by && document.getElementById(by.split(/\s+/)[0]);
         if (named) return named.textContent || '';
@@ -4393,16 +4509,45 @@
       if (inp.required || inp.getAttribute('aria-required') === 'true') return true;
       return /\*/.test(head(inp));
     }
+    /* OptimHire writes a cover letter per job and attaches it as plain text, named after its
+       link: "cover-letter.txt". It goes in as a PDF with your name — "Maxmilliam-Okafor-
+       <role>-Cover-Letter.pdf" — when the box takes PDFs; as it came when that fails. */
+    const isText = f => /^text\/plain/i.test(f.type || '') || /\.txt$/i.test(f.name || '');
+    const takesPdf = inp => { const a = (inp.getAttribute('accept') || '').toLowerCase(); return !a || /pdf|\*/.test(a); };
+    function attachAsPdf(inp, f) {
+      (async () => {
+        let out = f;
+        try {
+          const text = await f.text();
+          const lib = await cvLib();
+          const role = String(($('h1') || {}).textContent || document.title || '').replace(/\s+/g, ' ').trim().slice(0, 80);
+          const doc = lib && lib.coverLetter && lib.coverLetter({ text, person: await getProfile(), title: role });
+          if (doc) {
+            const bin = atob(doc.base64), bytes = new Uint8Array(bin.length);
+            for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+            out = new File([bytes], doc.fileName, { type: doc.mime });
+          }
+        } catch (_) {}
+        const dt = new DataTransfer();
+        dt.items.add(out);
+        desc.set.call(inp, dt.files);
+        inp.dispatchEvent(new Event('input', { bubbles: true }));
+        inp.dispatchEvent(new Event('change', { bubbles: true }));
+        LOG(out === f ? `Cover letter box: "${f.name}" attached as it came` : `Cover letter box: "${f.name}" attached as ${out.name}`);
+      })();
+    }
     Object.defineProperty(HTMLInputElement.prototype, 'files', {
       configurable: true,
       enumerable: desc.enumerable,
       get() { return desc.get.call(this); },
       set(list) {
         try {
-          if (this.type === 'file' && list && list.length && COVER_BOX_RE.test(boxText(this)) &&
-              !Array.prototype.some.call(list, f => COVER_FILE_RE.test(f.name || '')) && !required(this)) {
-            LOG(`Cover letter box: not attaching "${list[0].name}" — that's the CV, not a cover letter`);
-            return;
+          if (this.type === 'file' && list && list.length && COVER_BOX_RE.test(boxText(this))) {
+            if (!Array.prototype.some.call(list, f => COVER_FILE_RE.test(f.name || '')) && !required(this)) {
+              LOG(`Cover letter box: not attaching "${list[0].name}" — that's the CV, not a cover letter`);
+              return;
+            }
+            if (list.length === 1 && isText(list[0]) && takesPdf(this)) { attachAsPdf(this, list[0]); return; }
           }
         } catch (_) {}
         desc.set.call(this, list);
@@ -4410,20 +4555,57 @@
     });
   })();
 
-  /* Which job to apply to first (the CSV queue): quickest company ATS first, then ATS sites
-     that need an account, company career sites, job boards, Reed last — lower = sooner.
-     Same order as self.ohJobRank in oh-bg.js. */
+  /* A location as a place: a profile location picked from a suggestion list can be a
+     building in the town ("National University of Ireland, Galway, Ireland") — that
+     part goes ("Galway, Ireland"). */
+  const NOT_A_PLACE_RE = /\b(universit(y|ies)|college|school|academy|institute|campus|hospital|clinic|airport|station|hotel|stadium|museum|library|church|ltd|limited|inc|llc|plc|gmbh|corporation|company|bank|office)\b/i;
+  /* The suggestion to pick for a place: the town itself first ("Galway, County Galway,
+     Ireland"), then another place naming it — never a building in it. null when only
+     buildings match (better left for you than a university as your city). */
+  function bestPlaceOption(opts, val) {
+    const parts = String(val || '').split(',').map(x => x.trim().toLowerCase()).filter(Boolean);
+    const city = parts[0] || '', country = parts.length > 1 ? parts[parts.length - 1] : '';
+    if (!city) return null;
+    const t = o => (o.textContent || '').replace(/\s+/g, ' ').trim().toLowerCase();
+    const places = opts.filter(o => !NOT_A_PLACE_RE.test(t(o).split(',')[0]));
+    return places.find(o => t(o).startsWith(city + ',') && (!country || t(o).endsWith(country))) ||
+           places.find(o => t(o) === city || t(o).startsWith(city + ',') || t(o).startsWith(city + ' ')) ||
+           places.find(o => t(o).includes(city)) || null;
+  }
+  function placeOnly(v) {
+    const parts = String(v || '').split(',').map(x => x.trim()).filter(Boolean);
+    while (parts.length > 1 && NOT_A_PLACE_RE.test(parts[0])) parts.shift();
+    return parts.length === 1 && NOT_A_PLACE_RE.test(parts[0]) ? '' : parts.join(', ');
+  }
+
+  /* Job boards and recruitment sites (eFinancialCareers, Totaljobs, Jobsite, IrishJobs, Built In, Hays…) —
+     the same list as BOARD_HOST_RE in oh-bg.js. */
+  const JOB_BOARD_RANK_RE = new RegExp('(^|\\.)(' + [
+    'linkedin', 'indeed', 'glassdoor', 'ziprecruiter', 'adzuna', 'dice', 'monster', 'totaljobs', 'cwjobs', 'jobsite', 'cv-library',
+    'caterer', 'milkround', 'efinancialcareers', 'efinancial', 'irishjobs', 'jobs\\.ie', 'nijobs', 'recruitireland', 'jobs\\.ac\\.uk',
+    'simplyhired', 'careerbuilder', 'jooble', 'careerjet', 'jora', 'talent\\.com', 'neuvoo', 'lensa', 'snagajob', 'theladders', 'ladders',
+    'hired', 'wellfound', 'angel\\.co', 'otta', 'welcometothejungle', 'builtin[a-z]*', 'stepstone', 'xing', 'seek', 'jobstreet', 'naukri',
+    'foundit', 'bayt', 'gulftalent', 'workinstartups', 'jobserve', 'technojobs', 'jobs\\.theguardian', 'guardianjobs', 'charityjob',
+    'escapethecity', 'idealist', 'remoteok', 'weworkremotely', 'remotive', 'flexjobs', 'himalayas', 'jobgether', 'jobleads', 'jobright',
+    'hiring\\.cafe', 'getwork', 'joblist', 'clearancejobs', 'usajobs', 'civilservicejobs', 'findajob', 'jobs\\.nhs', 'hays', 'michaelpage',
+    'pagepersonnel', 'roberthalf', 'randstad', 'adecco', 'jobteaser', 'gradcracker', 'targetjobs', 'prospects', 'jobindex',
+    'infojobs', 'computrabajo', 'catho', 'bumeran', 'apec', 'jobat', 'jobs\\.ch', 'karriere\\.at', 'pracuj',
+    'jobrapido', 'trovit', 'mitula', 'dailyremote', 'workingnomads', 'nodesk', 'jobbank', 'workopolis', 'eluta',
+  ].join('|') + ')\\.', 'i');
+  /* Which job to apply to first (the CSV queue), lower = sooner: ATS in your order (Greenhouse,
+     Workable, SmartRecruiters, Workday, Oracle, iCIMS, Lever, Ashby, BambooHR…), then company
+     career sites, job boards, Reed last. Same order as self.ohJobRank in oh-bg.js. */
   function jobRank(u) {
     let h = ''; try { h = new URL(u).hostname.toLowerCase(); } catch (_) { return 30; }
     if (/(^|\.)reed\.co\.uk$/.test(h)) return 99;
     const boards = [[/(^|\.)linkedin\./, 40], [/(^|\.)indeed\./, 41], [/(^|\.)dice\./, 42], [/(^|\.)ziprecruiter\./, 43], [/(^|\.)adzuna\./, 44],
-      [/(^|\.)(glassdoor|totaljobs|cv-library|monster|jobsite|irishjobs|jobs\.ie|simplyhired|careerbuilder|jooble|hiring\.cafe)\./, 45]];
+      [JOB_BOARD_RANK_RE, 45]];
     for (const [re, r] of boards) if (re.test(h + '.')) return r;
-    const ats = [[/greenhouse\.io|grnh\.se/, 0], [/lever\.co/, 1], [/ashbyhq/, 2], [/workable/, 3], [/smartrecruiters/, 4], [/recruitee/, 5],
-      [/teamtailor/, 6], [/bamboohr/, 7], [/breezy\.hr/, 8], [/jazzhr|resumatorapi|applytojob/, 9], [/pinpointhq/, 10], [/rippling/, 11],
-      [/comeet/, 12], [/personio/, 13], [/jobvite/, 14], [/freshteam|manatal|recooty|gohire|forhyre|homerun|dover|wellfound/, 15],
-      [/myworkdayjobs|myworkdaysite|workdayjobs|\.workday\.com/, 20], [/icims/, 21], [/successfactors|sapsf/, 22], [/oraclecloud/, 23],
-      [/taleo/, 24], [/paylocity|ultipro|ukg\.com|adp\.com|avature|bullhorn/, 25]];
+    const ats = [[/greenhouse\.io|grnh\.se/, 0], [/workable/, 1], [/smartrecruiters/, 2], [/myworkdayjobs|myworkdaysite|myworkday\.com|workdayjobs|\.workday\.com/, 3],
+      [/oraclecloud/, 4], [/icims/, 5], [/lever\.co/, 6], [/ashbyhq/, 7], [/bamboohr/, 8], [/jobvite/, 9], [/teamtailor/, 10], [/recruitee/, 11],
+      [/breezy\.hr/, 12], [/jazzhr|resumatorapi|applytojob/, 13], [/successfactors|sapsf/, 14], [/pinpointhq/, 15], [/rippling/, 16],
+      [/comeet/, 17], [/personio/, 18], [/freshteam|manatal|recooty|gohire|forhyre|homerun|dover|jobs\.gem\.com|join\.com|factorialhr/, 19],
+      [/taleo/, 20], [/paylocity|ultipro|ukg\.com|adp\.com|avature|bullhorn|dayforcehcm|brassring/, 21]];
     const lu = String(u).toLowerCase();
     for (const [re, r] of ats) if (re.test(lu)) return r;
     return 30;
@@ -4646,7 +4828,7 @@
        matched nothing here and returned '', so the field was skipped and
        the form could never be submitted. */
     if (/^location$|\blocation\b|residence|where.*(based|live|located)|current.*(country|city)|country.*and.*city|city.*and.*country/.test(l)) {
-      if (p.location) return p.location;
+      if (p.location && placeOnly(p.location)) return placeOnly(p.location);
       const _city = p.city || 'Dublin';
       const _ctry = p.country || 'Ireland';
       return `${_city}, ${_ctry}`;
@@ -4697,7 +4879,7 @@
                                                           return DEFAULTS.howHeard;
 
     // ── Experience ─────────────────────────────────────────────────────────
-    // Any question asking for a number of years → return 7 (our default)
+    // Any question asking for a number of years → return 9 (our default)
     // This covers text inputs, number inputs, and range dropdowns.
     // The select handler will convert this to the closest range option.
     if (EXP_LABEL_RE.test(l))                             return koFacts().yearsExperience || p.years_experience || DEFAULTS.years;
@@ -5349,7 +5531,7 @@
 
       // 3a) Experience range: pick the bracket closest to our years value
       if (!chosen && EXP_LABEL_RE.test(l)) {
-        const targetYears = parseInt((koFacts().yearsExperience || p.years_experience || DEFAULTS.years).toString()) || 7;
+        const targetYears = parseInt((koFacts().yearsExperience || p.years_experience || DEFAULTS.years).toString()) || 9;
         let bestDist = Infinity;
         for (const o of opts) {
           const nums = (o.text.match(/\d+/g) || []).map(Number).filter(Boolean);
@@ -5478,7 +5660,9 @@
         const opts = $$('[role="option"],[class*="react-select__option"],[class*="Select__option"],[class*="select2-results__option"]', listbox)
           .filter(isVisible);
         const vl = val.toLowerCase();
-        const best = opts.find(o => o.textContent.toLowerCase().includes(vl))
+        const isLoc = /location|\bcity\b|\btown\b|residence|where.*(based|live|located)/i.test(lbl);
+        const best = isLoc ? bestPlaceOption(opts, val)
+          : opts.find(o => o.textContent.toLowerCase().includes(vl))
           || opts.find(o => vl.includes(o.textContent.toLowerCase().trim()))
           || opts[0];
         if (best) { realClick(best); await sleep(300); filledCount++; if (lbl) reportFieldFilled(lbl, 'filled'); }
@@ -5616,7 +5800,7 @@
       ['#last_name,input[id*="last_name"],input[name*="last_name"]',       p.last_name],
       ['#email,input[type="email"],input[id*="email"]',                    p.email],
       ['#phone,input[type="tel"],input[id*="phone"]',                      p.phone],
-      ['input[id*="location"],input[name*="location"]',                    p.city || p.location || ''],
+      ['input[id*="location"],input[name*="location"]',                    p.city || placeOnly(p.location) || ''],
       ['input[id*="linkedin"],input[name*="linkedin"]',                    p.linkedin_profile_url || ''],
       ['input[id*="website"],input[name*="website"],input[id*="portfolio"]', p.website_url || ''],
       ['input[id*="github"],input[name*="github"]',                        p.github_url || ''],
@@ -7610,6 +7794,88 @@
       }
     }
     await autoFillPage();
+    /* OptimHire's own pass fills after this one and can leave Country at the default: checked again. */
+    for (const wait of [0, 4000, 9000]) {
+      await sleep(wait);
+      if (CURRENT_ATS !== 'BambooHR' || !(await bambooAddress(p))) break;
+    }
+  }
+
+  /* BambooHR's address. Country and State are its own dropdowns (a button, a menu with a
+     Search box and options, a hidden <select>): typing never reached them, so Country stayed
+     on the default "United States" and the State list was the US one; both menus were left
+     open. ZIP got a place ("Dublin, D…") rather than the postcode. Returns true when it
+     changed something (checked again a little later). */
+  async function bambooAddress(p) {
+    const sq = v => String(v || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+    const label = l => (l.textContent || '').replace(/[*:]/g, ' ').replace(/\s+/g, ' ').trim();
+    const shown = b => (b.textContent || '').replace(/[×✕]/g, '').replace(/\s+/g, ' ').trim();
+    function field(re) {
+      for (const l of $$('label')) {
+        if (!re.test(label(l))) continue;
+        for (let n = l.parentElement, i = 0; n && i < 4; n = n.parentElement, i++) {
+          const toggles = n.querySelectorAll('.fab-Select button, button[aria-haspopup="listbox"]');
+          if (toggles.length > 1) break;
+          if (toggles.length) return { label: l, button: toggles[0], select: n.querySelector('select') };
+          const inp = n.querySelector('input[type="text"], input:not([type])');
+          if (inp && !inp.closest('[data-helium-id]')) return { label: l, input: inp };
+        }
+      }
+      return null;
+    }
+    function menuOf(btn) {
+      const id = btn.getAttribute('data-menu-id') || btn.getAttribute('aria-controls');
+      const m = id && (document.querySelector(`[data-helium-id="${CSS.escape(id)}"]`) || document.getElementById(id));
+      return m && isVisible(m) ? m : null;
+    }
+    function closeMenus() {
+      const t = document.activeElement || document.body;
+      for (const type of ['keydown', 'keyup']) t.dispatchEvent(new KeyboardEvent(type, { key: 'Escape', code: 'Escape', keyCode: 27, bubbles: true }));
+    }
+    /* The option for `want` (exact, then the country's longer name), or null. */
+    function optionFor(opts, want) {
+      const w = sq(want);
+      return opts.find(o => sq(o.textContent) === w) ||
+             opts.find(o => sq(o.textContent).startsWith(w) || sq(o.textContent).includes('republicof' + w)) || null;
+    }
+    async function choose(f, want) {
+      if (!f || !f.button || !want || sq(shown(f.button)) === sq(want)) return false;
+      realClick(f.button);
+      let menu = null;
+      for (let i = 0; i < 10 && !(menu = menuOf(f.button)); i++) await sleep(100);
+      if (!menu) return false;
+      const search = menu.querySelector('input[type="text"], input[type="search"], input:not([type])');
+      if (search) { search.focus(); nativeSet(search, String(want)); await sleep(300); }
+      const opt = optionFor([...menu.querySelectorAll('.fab-MenuOption, [role="option"], [role="menuitem"]')].filter(isVisible), want);
+      if (!opt) { closeMenus(); await sleep(150); if (menuOf(f.button)) realClick(f.button); return false; }
+      realClick(opt);
+      await sleep(300);
+      if (menuOf(f.button)) closeMenus();
+      LOG(`BambooHR: ${label(f.label).slice(0, 30)} → ${shown(f.button)}`);
+      return true;
+    }
+    let changed = false;
+    const country = String(p.country || '').trim();
+    if (await choose(field(/^country\b/i), country)) { changed = true; await sleep(500); }
+    /* State: only what you live in, and only when the list (now this country's) has it. */
+    const st = field(/^(state|province|county|region)\b/i);
+    if (st && st.button) {
+      const want = [p.state, p.county, p.city].map(v => String(v || '').trim()).find(Boolean);
+      if (want && sq(shown(st.button)) !== sq(want) && !sq(shown(st.button)).includes(sq(want))) {
+        if (await choose(st, want)) changed = true;
+        else if (await choose(st, 'County ' + want) || await choose(st, 'Co. ' + want)) changed = true;
+      }
+    }
+    /* ZIP: your postcode; a place typed there loses the place. */
+    const zip = field(/^(zip|postal code|post code|postcode|eircode|zip\s*\/\s*postal code)\b/i);
+    if (zip && zip.input) {
+      const cur = (zip.input.value || '').trim(), mine = String(p.postal_code || '').trim();
+      const want = mine || (/^[^\d,]+,\s*(?=.*\d)/.test(cur) ? cur.replace(/^[^\d,]+,\s*/, '') : '');
+      if (want && sq(cur) !== sq(want)) { nativeSet(zip.input, want); changed = true; LOG(`BambooHR: ZIP → ${want}`); }
+    }
+    /* Never leave a menu open (two were left open over the form). */
+    if ($$('.fab-Select button, button[aria-haspopup="listbox"]').some(b => menuOf(b))) closeMenus();
+    return changed;
   }
 
   /* ── Jobvite autofill ────────────────────────────────────── */
@@ -8920,6 +9186,7 @@
   let _autoTriggered = false;
   let _autoTriggerRunning = false;
 
+  let _foreignNoted = false;
   async function autoTriggerAutofill() {
     /* Guards */
     if (wdEngineOwns()) return;
@@ -8943,6 +9210,11 @@
     if (ohAutoTrigger === false) return; /* user explicitly disabled */
     const active = await isAutomationActive();
     if (ohAutoTrigger !== true && !active) return;   // unset → only during a run
+    /* Another extension is applying on this page: leave it to it (not our run). */
+    if (!active && otherAutomationOnPage()) {
+      if (!_foreignNoted) { _foreignNoted = true; LOG('Another autofill extension is applying on this page — not auto-filling it'); }
+      return;
+    }
     /* "Auto-fill on supported ATS pages" while browsing: a job board's
        search / listing pages are not application forms (Indeed fired here
        while the user was browsing); its own apply step is. During a run,
@@ -9544,7 +9816,7 @@
   (function installQueueRunner() {
     const POLL_MS         = 2_000;
     const JOB_TIMEOUT_MS  = 180_000;  // 3 min hard cap per job
-    const WD_JOB_TIMEOUT_MS = 480_000; // Workday: many steps plus the account
+    const WD_JOB_TIMEOUT_MS = 240_000; // Workday: many steps plus the account
     const NO_FORM_GRACE_MS = 18_000;  // if no fillable form by now → unsupported, skip
     const SUBMIT_GRACE_MS = 8_000;    // wait this long after submit before declaring success
     const CONFIRM_WAIT_MS = 30_000;   // keep looking for a REAL confirmation this long after submit

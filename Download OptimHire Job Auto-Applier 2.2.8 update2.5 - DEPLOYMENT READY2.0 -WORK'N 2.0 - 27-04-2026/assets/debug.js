@@ -132,9 +132,18 @@
     setTimeout(function () { el.remove(); }, 2200);
   }
 
+  /* The pages' log and the service worker's (oh-bg.js 16), in time order. */
+  var _pageLog = [], _bgLog = [];
+  function mergeLogs() {
+    entries = _pageLog.concat(_bgLog.map(function (e) {
+      return { ts: e.ts, seq: 0, src: 'service-worker', url: '', top: true, cat: 'background', lvl: e.lvl || 'info', msg: e.msg };
+    })).sort(function (a, b) { return (a.ts || 0) - (b.ts || 0) || (a.seq || 0) - (b.seq || 0); });
+  }
   function load() {
-    ST.get([KEY, KEY_ENABLED, KEY_PAUSED], function (d) {
-      entries = Array.isArray(d[KEY]) ? d[KEY] : [];
+    ST.get([KEY, KEY_ENABLED, KEY_PAUSED, 'ohBgLog'], function (d) {
+      _pageLog = Array.isArray(d[KEY]) ? d[KEY] : [];
+      _bgLog = Array.isArray(d.ohBgLog) ? d.ohBgLog : [];
+      mergeLogs();
       document.getElementById("toggleEnabled").checked = d[KEY_ENABLED] === true;
       document.getElementById('togglePaused').checked  = !!d[KEY_PAUSED];
       renderAll();
@@ -144,10 +153,13 @@
   /* Live tail — subscribe to storage changes. */
   chrome.storage.onChanged.addListener(function (changes, area) {
     if (area !== 'local') return;
-    if (changes[KEY]) {
-      entries = changes[KEY].newValue || [];
+    if (changes[KEY] || changes.ohBgLog) {
+      if (changes[KEY]) _pageLog = changes[KEY].newValue || [];
+      if (changes.ohBgLog) _bgLog = changes.ohBgLog.newValue || [];
+      mergeLogs();
       renderAll();
     }
+    if (changes[KEY_ENABLED] || changes.ohDebugUntil) paintAuditBar();
     if (changes[KEY_ENABLED]) document.getElementById('toggleEnabled').checked = changes[KEY_ENABLED].newValue === true;
     if (changes[KEY_PAUSED])  document.getElementById('togglePaused').checked  = !!changes[KEY_PAUSED].newValue;
   });
@@ -176,7 +188,7 @@
   /* ── Clear ────────────────────────────────────────────────────── */
   document.getElementById('btnClear').addEventListener('click', function () {
     if (!confirm('Clear ALL ' + entries.length + ' debug entries? This cannot be undone.')) return;
-    ST.set({ ohDebugLog: [] });
+    ST.set({ ohDebugLog: [], ohBgLog: [] });
     toast('Buffer cleared');
   });
 
@@ -244,43 +256,43 @@
     }
   });
 
-  /* ── Diagnostic snapshot — bundles current storage state + manifest
-        + all entries into one JSON file. Use when reporting a bug. ─ */
-  document.getElementById('btnSnapshot').addEventListener('click', function () {
-    chrome.storage.local.get(null, function (allStorage) {
-      var manifest = chrome.runtime.getManifest ? chrome.runtime.getManifest() : {};
-      /* Redact massive arrays from storage so the snapshot stays
-         readable. The ohDebugLog is included via 'entries' already. */
-      var redacted = {};
-      Object.keys(allStorage || {}).forEach(function (k) {
-        if (k === 'ohDebugLog') return; // included separately
-        var v = allStorage[k];
-        if (Array.isArray(v) && v.length > 50) {
-          redacted[k] = { __truncated: true, length: v.length, sample: v.slice(0, 10) };
-        } else {
-          redacted[k] = v;
-        }
-      });
-      var snapshot = {
-        snapshotAt: new Date().toISOString(),
-        extension: {
-          name: manifest.name,
-          version: manifest.version,
-          manifestVersion: manifest.manifest_version
-        },
-        browser: { userAgent: navigator.userAgent },
-        storageState: redacted,
-        debugLog: entries
-      };
-      var blob = new Blob([JSON.stringify(snapshot, null, 2)], { type: 'application/json' });
-      var a = document.createElement('a');
-      a.href = URL.createObjectURL(blob);
-      a.download = 'optimhire-diagnostic-' + tsForFile() + '.json';
-      document.body.appendChild(a); a.click(); a.remove();
-      setTimeout(function () { URL.revokeObjectURL(a.href); }, 1000);
-      toast('Diagnostic snapshot saved (' + entries.length + ' log entries + full storage)');
+  /* ── Full audit (and the old "Diagnostic snapshot", which included your login
+        token): one redacted file from oh-audit.js. ─ */
+  function exportAudit() {
+    if (!window.OH_AUDIT) { toast('Audit module missing'); return; }
+    window.OH_AUDIT.exportFile(function (a, name) {
+      toast('Saved ' + name + ' — ' + a.summary.logEntries + ' page + ' + a.summary.backgroundEntries + ' background entries, ' + a.summary.errors + ' errors');
     });
-  });
+  }
+  document.getElementById('btnAudit').addEventListener('click', exportAudit);
+  document.getElementById('btnSnapshot').addEventListener('click', exportAudit);
+
+  /* ── Recording: on for 8 h from the card's Audit, or here ── */
+  function paintAuditBar() {
+    var bar = document.getElementById('auditBar');
+    if (!bar || !window.OH_AUDIT) return;
+    window.OH_AUDIT.status(function (st) {
+      bar.className = 'audit-bar ' + (st.on ? 'on' : 'off');
+      bar.innerHTML = '';
+      var t = document.createElement('span');
+      var btn = document.createElement('button');
+      if (st.on) {
+        var mins = Math.ceil(Math.max(0, st.until - Date.now()) / 60e3), h = Math.floor(mins / 60), m = mins % 60;
+        t.textContent = 'Recording everything — every tab, the side panel and the background — ' + (h ? h + 'h ' : '') + m + 'm left' +
+                        (st.since ? ' (since ' + new Date(st.since).toLocaleTimeString() + ')' : '') + '. Export full audit when done.';
+        btn.textContent = 'Stop recording';
+        btn.addEventListener('click', function () { window.OH_AUDIT.stop(paintAuditBar); });
+      } else {
+        t.textContent = 'Not recording. Record everything for 8 hours, reproduce the problem, then Export full audit.';
+        btn.textContent = 'Record everything (8 h)';
+        btn.className = 'btn-primary';
+        btn.addEventListener('click', function () { window.OH_AUDIT.record(8, paintAuditBar); });
+      }
+      bar.appendChild(t); bar.appendChild(btn);
+    });
+  }
+  setInterval(paintAuditBar, 30000);
+  paintAuditBar();
 
   function tsForFile() {
     var d = new Date();

@@ -18,6 +18,26 @@ export interface CvProfile {
   skills: string[];
   languages: { language: string; proficiency: string; native: boolean }[];
   summary: string;
+  /** [oh] From the CV's header: the fallback when OptimHire has no phone / e-mail for you. */
+  contact?: { email: string; phone: string; linkedin: string };
+}
+
+/** E-mail, phone and LinkedIn as the CV's top lines give them. */
+export function parseContact(text: string): { email: string; phone: string; linkedin: string } {
+  const head = text.slice(0, 1500);
+  const email = (head.match(/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/) || [""])[0];
+  const linkedin = ((head.match(/(?:https?:\/\/)?(?:[a-z]{2,3}\.)?linkedin\.com\/in\/[A-Za-z0-9_%-]+\/?/i) || [""])[0]).replace(/^(?!https?:)/i, "https://");
+  let phone = "";
+  // +353 87 123 4567, (415) 525-1604, 07700 900123, +44 (0)7700 900123 — 9 to 15 digits, not a date or year range.
+  for (const m of head.matchAll(/(\+?\(?\d[\d\s().-]{7,20}\d)/g)) {
+    const raw = m[1].trim();
+    const digits = raw.replace(/\D/g, "");
+    if (digits.length < 9 || digits.length > 15) continue;
+    if (/^(19|20)\d{2}\s*[-–]\s*(19|20)\d{2}$/.test(raw) || /\d{1,2}[/.]\d{1,2}[/.]\d{2,4}/.test(raw)) continue;
+    phone = raw.replace(/\s+/g, " ");
+    break;
+  }
+  return { email, phone, linkedin: linkedin === "https://" ? "" : linkedin };
 }
 
 const MONTHS: Record<string, number> = {
@@ -267,5 +287,6 @@ export function parseCv(text: string): CvProfile {
     skills: parseSkills(sec.skills || []),
     languages: parseLanguages(sec.languages || []),
     summary: clean((sec.summary || []).join(" ")).slice(0, 1200),
+    contact: parseContact(text),
   };
 }

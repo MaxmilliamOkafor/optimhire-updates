@@ -88,11 +88,24 @@ async function getCreds(host: string): Promise<CredReply> {
 }
 
 function captchaPresent(): boolean {
-  return qa('iframe[src*="recaptcha"], iframe[src*="hcaptcha"], iframe[title*="captcha" i], [data-automation-id*="captcha" i]').some(isVisible);
+  // [oh] Not [data-automation-id*="captcha"]: "noCaptchaWrapper" is Workday's wrapper around the
+  // Create Account / Sign In button itself (seen at Medtronic), so every account page "had a CAPTCHA".
+  // A real challenge is a reCAPTCHA / hCaptcha / Turnstile frame.
+  return qa(
+    'iframe[src*="recaptcha"], iframe[src*="hcaptcha"], iframe[src*="challenges.cloudflare"], iframe[title*="captcha" i], [data-automation-id*="captcha" i] iframe'
+  ).some(isVisible);
+}
+
+/** [oh] The address already in the form's email box (put there by Workday, the browser or another
+ *  filler). A fresh install has no saved Workday login and, before its first OptimHire job, no
+ *  e-mail in its profile — and stopped with "Add your email" while the box showed it. */
+function typedEmail(): string {
+  const v = ((byAid("email") as HTMLInputElement | null)?.value || "").trim();
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(v) ? v : "";
 }
 
 function emailFor(ctx: Ctx, creds: CredReply): string {
-  return creds.cred?.email || ctx.profile.personal.email || creds.master?.email || "";
+  return creds.cred?.email || ctx.profile.personal.email || creds.master?.email || typedEmail();
 }
 
 /** Some tenants show "Sign in with Google / LinkedIn / Email" first. */
@@ -178,8 +191,21 @@ export async function handleSignIn(ctx: Ctx): Promise<void> {
     }
     throw new NeedsHuman("Sign-in was rejected. Check the saved password (Workday settings) or use 'Forgot password', then click Resume.");
   }
-  if (VERIFY_EMAIL_RX.test(text(document.body).slice(0, 3000)) && !byAid("next")) {
-    throw new NeedsHuman("Workday wants you to verify your email. Click the link in the email it sent, sign in again if asked, then click Resume.");
+  if (VERIFY_EMAIL_RX.test(errs + " " + text(document.body).slice(0, 3000)) && !byAid("next")) {
+    // [oh] "Verify your account before you sign in" (seen at Medtronic, on the sign-in page): with
+    // "Read verification emails" on, the host opens the link Workday emailed; then sign in again.
+    const r = await askHost<{ ok?: boolean; reason?: string }>({
+      type: "wd:auth:mailVerify", tenantHost: host, email: cred.email || emailFor(ctx, creds), since: Date.now() - 30 * 60_000,
+    });
+    if (r?.ok) {
+      ctx.log("Email verified from the link Workday sent — signing in again");
+      ctx.run.authAttempts = Math.max(0, ctx.run.authAttempts - 1);
+      await waitStable(600, 8000);
+      return;
+    }
+    throw new NeedsHuman(
+      `Workday wants you to verify your email${r?.reason ? ` (${r.reason})` : ""}. Click the link in the email it sent — or turn on "Read verification emails" in the side panel — then click Resume.`
+    );
   }
   ctx.log("Signed in");
 }
@@ -202,8 +228,8 @@ export async function handleCreateAccount(ctx: Ctx): Promise<void> {
   }
   if (ctx.run.createAttempts >= 2) throw new NeedsHuman("Account creation failed twice. Finish it yourself, then click Resume.");
 
-  const email = ctx.profile.personal.email || creds.master?.email;
-  if (!email) throw new NeedsHuman("Add your email to the Workday profile (Settings) first.");
+  const email = ctx.profile.personal.email || creds.master?.email || typedEmail();
+  if (!email) throw new NeedsHuman("No e-mail to create the account with: open the side panel → Job Queue card → Applications Account, untick \"Use profile email\", type your e-mail (it saves when you leave the box), then click Resume.");
 
   let password: string;
   if (ctx.settings.useMasterPassword && creds.master) {
