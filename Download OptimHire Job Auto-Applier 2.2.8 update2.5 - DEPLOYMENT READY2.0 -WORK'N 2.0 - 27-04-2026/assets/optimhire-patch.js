@@ -1671,6 +1671,15 @@
    * so we match on the button's own text, plus aria-label/title as a
    * fallback, and explicitly reject the Skip (thumbs-down) twin.
    * ────────────────────────────────────────────────────────────────── */
+  /* optimhire.com's own job lists are put ATS-first in the page (oh-queue-order.js, page world);
+     "Quickest ATS first" switched off (ohPreferAts) leaves them in the site's order. */
+  (function markAtsFirst() {
+    if (!/(^|\.)optimhire\.com$/i.test(location.hostname)) return;
+    const paint = d => document.documentElement.setAttribute('data-oh-ats-first', d && d.ohPreferAts === false ? '0' : '1');
+    ST.get(['ohPreferAts']).then(paint, () => {});
+    try { chrome.storage.onChanged.addListener((c, area) => { if (area === 'local' && c.ohPreferAts) paint({ ohPreferAts: c.ohPreferAts.newValue }); }); } catch (_) {}
+  })();
+
   (function installPageApplyClicker() {
     if (!/(^|\.)optimhire\.com$/i.test(location.hostname)) return;
     if (window.top !== window.self) return;
@@ -4569,6 +4578,20 @@
     return parts.length === 1 && NOT_A_PLACE_RE.test(parts[0]) ? '' : parts.join(', ');
   }
 
+  /* Job boards and recruitment sites (eFinancialCareers, Totaljobs, Jobsite, IrishJobs, Built In, Hays…) —
+     the same list as BOARD_HOST_RE in oh-bg.js. */
+  const JOB_BOARD_RANK_RE = new RegExp('(^|\\.)(' + [
+    'linkedin', 'indeed', 'glassdoor', 'ziprecruiter', 'adzuna', 'dice', 'monster', 'totaljobs', 'cwjobs', 'jobsite', 'cv-library',
+    'caterer', 'milkround', 'efinancialcareers', 'efinancial', 'irishjobs', 'jobs\\.ie', 'nijobs', 'recruitireland', 'jobs\\.ac\\.uk',
+    'simplyhired', 'careerbuilder', 'jooble', 'careerjet', 'jora', 'talent\\.com', 'neuvoo', 'lensa', 'snagajob', 'theladders', 'ladders',
+    'hired', 'wellfound', 'angel\\.co', 'otta', 'welcometothejungle', 'builtin[a-z]*', 'stepstone', 'xing', 'seek', 'jobstreet', 'naukri',
+    'foundit', 'bayt', 'gulftalent', 'workinstartups', 'jobserve', 'technojobs', 'jobs\\.theguardian', 'guardianjobs', 'charityjob',
+    'escapethecity', 'idealist', 'remoteok', 'weworkremotely', 'remotive', 'flexjobs', 'himalayas', 'jobgether', 'jobleads', 'jobright',
+    'hiring\\.cafe', 'getwork', 'joblist', 'clearancejobs', 'usajobs', 'civilservicejobs', 'findajob', 'jobs\\.nhs', 'hays', 'michaelpage',
+    'pagepersonnel', 'roberthalf', 'randstad', 'adecco', 'jobteaser', 'gradcracker', 'targetjobs', 'prospects', 'jobindex',
+    'infojobs', 'computrabajo', 'catho', 'bumeran', 'apec', 'jobat', 'jobs\\.ch', 'karriere\\.at', 'pracuj',
+    'jobrapido', 'trovit', 'mitula', 'dailyremote', 'workingnomads', 'nodesk', 'jobbank', 'workopolis', 'eluta',
+  ].join('|') + ')\\.', 'i');
   /* Which job to apply to first (the CSV queue): quickest company ATS first, then ATS sites
      that need an account, company career sites, job boards, Reed last — lower = sooner.
      Same order as self.ohJobRank in oh-bg.js. */
@@ -4576,7 +4599,7 @@
     let h = ''; try { h = new URL(u).hostname.toLowerCase(); } catch (_) { return 30; }
     if (/(^|\.)reed\.co\.uk$/.test(h)) return 99;
     const boards = [[/(^|\.)linkedin\./, 40], [/(^|\.)indeed\./, 41], [/(^|\.)dice\./, 42], [/(^|\.)ziprecruiter\./, 43], [/(^|\.)adzuna\./, 44],
-      [/(^|\.)(glassdoor|totaljobs|cv-library|monster|jobsite|irishjobs|jobs\.ie|simplyhired|careerbuilder|jooble|hiring\.cafe)\./, 45]];
+      [JOB_BOARD_RANK_RE, 45]];
     for (const [re, r] of boards) if (re.test(h + '.')) return r;
     const ats = [[/greenhouse\.io|grnh\.se/, 0], [/lever\.co/, 1], [/ashbyhq/, 2], [/workable/, 3], [/smartrecruiters/, 4], [/recruitee/, 5],
       [/teamtailor/, 6], [/bamboohr/, 7], [/breezy\.hr/, 8], [/jazzhr|resumatorapi|applytojob/, 9], [/pinpointhq/, 10], [/rippling/, 11],

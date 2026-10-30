@@ -236,8 +236,23 @@
     [/comeet/, 12], [/personio/, 13], [/jobvite/, 14], [/freshteam|manatal|recooty|gohire|forhyre|homerun|dover|wellfound/, 15],
     [/myworkdayjobs|myworkdaysite|workdayjobs|\.workday\.com/, 20], [/icims/, 21], [/successfactors|sapsf/, 22], [/oraclecloud/, 23],
     [/taleo/, 24], [/paylocity|ultipro|ukg\.com|adp\.com|avature|bullhorn/, 25]];
+  /* Job boards and recruitment sites: where OptimHire found a job, not the employer's own form.
+     After every ATS and company career site; Reed after all of them. Matched on the host + '.'. */
+  var BOARD_HOST_RE = new RegExp('(^|\\.)(' + [
+    'linkedin', 'indeed', 'glassdoor', 'ziprecruiter', 'adzuna', 'dice', 'monster', 'totaljobs', 'cwjobs', 'jobsite', 'cv-library',
+    'caterer', 'milkround', 'efinancialcareers', 'efinancial', 'irishjobs', 'jobs\\.ie', 'nijobs', 'recruitireland', 'jobs\\.ac\\.uk',
+    'simplyhired', 'careerbuilder', 'jooble', 'careerjet', 'jora', 'talent\\.com', 'neuvoo', 'lensa', 'snagajob', 'theladders', 'ladders',
+    'hired', 'wellfound', 'angel\\.co', 'otta', 'welcometothejungle', 'builtin[a-z]*', 'stepstone', 'xing', 'seek', 'jobstreet', 'naukri',
+    'foundit', 'bayt', 'gulftalent', 'workinstartups', 'jobserve', 'technojobs', 'jobs\\.theguardian', 'guardianjobs', 'charityjob',
+    'escapethecity', 'idealist', 'remoteok', 'weworkremotely', 'remotive', 'flexjobs', 'himalayas', 'jobgether', 'jobleads', 'jobright',
+    'hiring\\.cafe', 'getwork', 'joblist', 'clearancejobs', 'usajobs', 'civilservicejobs', 'findajob', 'jobs\\.nhs', 'hays', 'michaelpage',
+    'pagepersonnel', 'roberthalf', 'randstad', 'adecco', 'reed', 'jobteaser', 'gradcracker', 'targetjobs', 'prospects', 'jobindex',
+    'infojobs', 'computrabajo', 'catho', 'bumeran', 'apec', 'welcometothejungle', 'jobat', 'jobs\\.ch', 'karriere\\.at', 'pracuj',
+    'jobrapido', 'trovit', 'mitula', 'ziprecruiterpaid', 'dailyremote', 'workingnomads', 'nodesk', 'jobbank', 'workopolis', 'eluta',
+  ].join('|') + ')\\.', 'i');
+  var BOARD_NAME_RE = /\b(linkedin|indeed|ziprecruiter|adzuna|dice|glassdoor|monster|totaljobs|cwjobs|jobsite|cv-?library|e-?financial ?careers|efc|irishjobs|jobs\.ie|stepstone|careerjet|jooble|simplyhired|careerbuilder|talent\.com|seek|naukri|wellfound|otta|welcome to the jungle|built ?in|hays|michael page|robert half|randstad|adecco|guardian jobs|jobserve|hired)\b/i;
   var RANK_BOARDS = [[/(^|\.)linkedin\./, 40], [/(^|\.)indeed\./, 41], [/(^|\.)dice\./, 42], [/(^|\.)ziprecruiter\./, 43], [/(^|\.)adzuna\./, 44],
-    [/(^|\.)(glassdoor|totaljobs|cv-library|monster|jobsite|irishjobs|jobs\.ie|simplyhired|careerbuilder|jooble|hiring\.cafe)\./, 45]];
+    [BOARD_HOST_RE, 45]];
   self.ohJobRank = function (url) {
     var host = '';
     try { host = new URL(url).hostname.toLowerCase(); } catch (_) { return 30; }
@@ -252,7 +267,6 @@
   var _tierSig = '';
   var NEXT_JOB_RE = /\/candidate\/[^/?#]+\/application(?:[?#]|$)/;
   var REED_HOST_RE = /(^|\.)reed\.co\.uk$/i;
-  var BOARD_HOST_RE = /(^|\.)(linkedin|indeed|ziprecruiter|adzuna|dice|glassdoor|monster|totaljobs|cv-library|simplyhired|careerbuilder|jooble)\./i;
   var ATS_HOST_RE = /greenhouse|lever\.co|myworkdayjobs|workday|ashbyhq|smartrecruiters|workable|bamboohr|breezy|jazzhr|resumatorapi|jobvite|recruitee|rippling|comeet|paylocity|manatal|freshteam|recooty|gohire|icims|taleo|oraclecloud|successfactors|ultipro|teamtailor|pinpointhq|avature/i;
   var _fetch = self.fetch.bind(self);
 
@@ -288,9 +302,9 @@
        (seen live: a Medtronic Workday job replaced by a Lever one). */
     if (REED_HOST_RE.test(host)) return 'reed';
     if (ATS_HOST_RE.test(host)) return 'ats';
-    if (BOARD_HOST_RE.test(host)) return 'board';
+    if (BOARD_HOST_RE.test(host + '.')) return 'board';
     if (/\breed\b/i.test(names)) return 'reed';
-    if (/\b(linkedin|indeed|ziprecruiter|adzuna|dice)\b/i.test(names)) return 'board';
+    if (BOARD_NAME_RE.test(names)) return 'board';
     if (ATS_HOST_RE.test(names)) return 'ats';
     return 'other';
   }

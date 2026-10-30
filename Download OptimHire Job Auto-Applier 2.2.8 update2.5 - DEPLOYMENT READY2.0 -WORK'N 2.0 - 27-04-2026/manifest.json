@@ -68,6 +68,19 @@
         },
         {
             "matches": [
+                "https://optimhire.com/*",
+                "https://*.optimhire.com/*"
+            ],
+            "js": [
+                "assets/oh-queue-order.js"
+            ],
+            "all_frames": false,
+            "run_at": "document_start",
+            "css": [],
+            "world": "MAIN"
+        },
+        {
+            "matches": [
                 "https://*.myworkdayjobs.com/*",
                 "https://*.myworkdaysite.com/*",
                 "https://*.myworkday.com/*",
