@@ -1539,10 +1539,10 @@
       return null;
     }
   }
-  async function resetByEmail(ctx, email) {
+  async function resetByEmail(ctx, email, why = "This employer already has an account with another password (or it is locked)") {
     const link = byAid("forgotPassword") ?? buttonByText(FORGOT_RX);
     if (!link || !email) return 'no "Forgot your password?" link here';
-    ctx.log("This employer already has an account with another password (or it is locked) — resetting it by email");
+    ctx.log(`${why} — resetting the password by email`);
     await humanClick(link);
     await waitStable(600);
     const em = byAid("email") ?? qa('input[type="email"]').find(isVisible) ?? null;
@@ -1659,17 +1659,30 @@
       throw new NeedsHuman("Sign-in was rejected. Check the saved password (Workday settings) or use 'Forgot password', then click Resume.");
     }
     if (VERIFY_EMAIL_RX.test(errs + " " + text(document.body).slice(0, 3e3)) && !byAid("next")) {
+      const em = cred.email || emailFor(ctx, creds);
+      ctx.log("Workday wants the e-mail verified — looking for its verification email");
       const r = await askHost({
         type: "wd:auth:mailVerify",
         tenantHost: host2,
-        email: cred.email || emailFor(ctx, creds),
-        since: Date.now() - 30 * 6e4
+        email: em,
+        since: Date.now() - 30 * 6e4,
+        wait: 25e3
       });
       if (r?.ok) {
         ctx.log("Email verified from the link Workday sent — signing in again");
         ctx.run.authAttempts = Math.max(0, ctx.run.authAttempts - 1);
         await waitStable(600, 8e3);
         return;
+      }
+      if (!r?.off && !ctx.run.verifyReset) {
+        ctx.run.verifyReset = true;
+        ctx.run.authAttempts = Math.max(0, ctx.run.authAttempts - 1);
+        await ctx.save();
+        const why = await resetByEmail(ctx, em, `No verification email found${r?.reason ? ` (${r.reason})` : ""}`);
+        if (!why) return;
+        throw new NeedsHuman(
+          `Workday wants you to verify your email, and the password reset by email didn't work either (${why}). Click the link in the email Workday sent, then click Resume.`
+        );
       }
       throw new NeedsHuman(
         `Workday wants you to verify your email${r?.reason ? ` (${r.reason})` : ""}. Click the link in the email it sent — or turn on "Read verification emails" in the side panel — then click Resume.`
@@ -3140,15 +3153,20 @@ OPTIONS: ${JSON.stringify(options.slice(0, 150))}`
     const r = resetsToday(site);
     return d.ohGmailCodes === true && login.resetByEmail !== false && !!email && r.length < 2 && !(r.length && Date.now() - Math.max(...r) < RESET_EVERY);
   }
-  function mailLink(kind, host2, email, since, password) {
+  function mailLink(kind, host2, email, since, password, wait = 15e4) {
     return new Promise((resolve) => {
+      const t = setTimeout(() => resolve({ ok: false, reason: "timed out waiting for the email" }), wait + 3e4);
+      const done = (r) => {
+        clearTimeout(t);
+        resolve(r);
+      };
       try {
-        chrome.runtime.sendMessage({ type: "OH_WD_MAIL_LINK", kind, host: host2, email, since, password }, (r) => {
+        chrome.runtime.sendMessage({ type: "OH_WD_MAIL_LINK", kind, host: host2, email, since, password, wait }, (r) => {
           void chrome.runtime.lastError;
-          resolve(r || { ok: false, reason: "no answer" });
+          done(r || { ok: false, reason: "no answer" });
         });
       } catch {
-        resolve({ ok: false, reason: "extension reloaded" });
+        done({ ok: false, reason: "extension reloaded" });
       }
     });
   }
@@ -3211,9 +3229,10 @@ OPTIONS: ${JSON.stringify(options.slice(0, 150))}`
       case "wd:auth:mailVerify": {
         const { email } = await workdayLogin();
         const host2 = String(msg.tenantHost || tenantHost());
-        const r = await mailLink("verify", host2, String(msg.email || email), Number(msg.since) || Date.now() - 6e5);
+        const wait = Math.max(1e4, Math.min(15e4, Number(msg.wait) || 15e4));
+        const r = await mailLink("verify", host2, String(msg.email || email), Number(msg.since) || Date.now() - 6e5, void 0, wait);
         if (r.ok) await noteSite("account", {}, host2);
-        return { ok: !!r.ok, reason: r.reason };
+        return { ok: !!r.ok, reason: r.reason, off: /codes are off|not signed in/i.test(String(r.reason || "")) };
       }
       case "wd:cred:set":
         await noteSite("account", { password: String(msg.password || "") || void 0 });

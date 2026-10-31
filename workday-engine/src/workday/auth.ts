@@ -50,10 +50,14 @@ async function askHost<T>(msg: Record<string, unknown>): Promise<T | null> {
 
 /** [oh] The account exists with a password we don't have, or is locked: "Forgot your password?",
  *  then the host opens the emailed link and sets your Workday password with it. null = done. */
-async function resetByEmail(ctx: Ctx, email: string): Promise<string | null> {
+async function resetByEmail(
+  ctx: Ctx,
+  email: string,
+  why = "This employer already has an account with another password (or it is locked)"
+): Promise<string | null> {
   const link = byAid("forgotPassword") ?? buttonByText(FORGOT_RX);
   if (!link || !email) return "no \"Forgot your password?\" link here";
-  ctx.log("This employer already has an account with another password (or it is locked) — resetting it by email");
+  ctx.log(`${why} — resetting the password by email`);
   await humanClick(link);
   await waitStable(600);
   const em = byAid("email") ?? qa<HTMLInputElement>('input[type="email"]').find(isVisible) ?? null;
@@ -194,14 +198,31 @@ export async function handleSignIn(ctx: Ctx): Promise<void> {
   if (VERIFY_EMAIL_RX.test(errs + " " + text(document.body).slice(0, 3000)) && !byAid("next")) {
     // [oh] "Verify your account before you sign in" (seen at Medtronic, on the sign-in page): with
     // "Read verification emails" on, the host opens the link Workday emailed; then sign in again.
-    const r = await askHost<{ ok?: boolean; reason?: string }>({
-      type: "wd:auth:mailVerify", tenantHost: host, email: cred.email || emailFor(ctx, creds), since: Date.now() - 30 * 60_000,
+    // Looked for briefly: it was sent when the account was made, so it is there now or not at all
+    // (waiting the full 2.5 min left the run on "Filling… signIn" with nothing in the log).
+    const em = cred.email || emailFor(ctx, creds);
+    ctx.log("Workday wants the e-mail verified — looking for its verification email");
+    const r = await askHost<{ ok?: boolean; reason?: string; off?: boolean }>({
+      type: "wd:auth:mailVerify", tenantHost: host, email: em, since: Date.now() - 30 * 60_000, wait: 25_000,
     });
     if (r?.ok) {
       ctx.log("Email verified from the link Workday sent — signing in again");
       ctx.run.authAttempts = Math.max(0, ctx.run.authAttempts - 1);
       await waitStable(600, 8000);
       return;
+    }
+    // No usable link (gone, expired, never sent): "Forgot your password?" instead. Setting the
+    // password from the emailed reset link proves the e-mail is yours, which Workday takes as
+    // verified. Once per run; not when the email reader is off or Gmail isn't signed in.
+    if (!r?.off && !ctx.run.verifyReset) {
+      ctx.run.verifyReset = true;
+      ctx.run.authAttempts = Math.max(0, ctx.run.authAttempts - 1);
+      await ctx.save();
+      const why = await resetByEmail(ctx, em, `No verification email found${r?.reason ? ` (${r.reason})` : ""}`);
+      if (!why) return;
+      throw new NeedsHuman(
+        `Workday wants you to verify your email, and the password reset by email didn't work either (${why}). Click the link in the email Workday sent, then click Resume.`
+      );
     }
     throw new NeedsHuman(
       `Workday wants you to verify your email${r?.reason ? ` (${r.reason})` : ""}. Click the link in the email it sent — or turn on "Read verification emails" in the side panel — then click Resume.`

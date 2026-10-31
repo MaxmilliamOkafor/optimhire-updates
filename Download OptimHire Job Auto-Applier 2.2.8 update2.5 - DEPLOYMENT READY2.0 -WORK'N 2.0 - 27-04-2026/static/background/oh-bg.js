@@ -881,7 +881,8 @@
     var kind = msg.kind === 'verify' ? 'verify' : 'reset';
     var since = Number(msg.since) || Date.now();
     var seen = {}, start = Date.now(), signedIn = false;
-    while (Date.now() - start < 150000) {
+    var wait = Math.max(10000, Math.min(150000, Number(msg.wait) || 150000));
+    while (Date.now() - start < wait) {
       keepAlive();
       var r = await gmailEntries(kind, [msg.host], since);
       signedIn = signedIn || r.signedIn;

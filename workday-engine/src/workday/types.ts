@@ -236,6 +236,8 @@ export interface RunState {
   authAttempts: number;
   /** Account-creation attempts this run. */
   createAttempts: number;
+  /** [oh] "Verify your account" was answered with a password reset by email this run (tried once). */
+  verifyReset?: boolean;
   updatedAt: number;
 }
 

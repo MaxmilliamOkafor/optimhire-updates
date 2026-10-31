@@ -226,15 +226,23 @@ function mayReset(login: Any, d: Any, site: Any, email: string): boolean {
   const r = resetsToday(site);
   return d.ohGmailCodes === true && login.resetByEmail !== false && !!email && r.length < 2 && !(r.length && Date.now() - Math.max(...r) < RESET_EVERY);
 }
-function mailLink(kind: "reset" | "verify", host: string, email: string, since: number, password?: string): Promise<Any> {
+/** `wait`: how long the background may look for the email. The answer is given up on 30 s after
+ *  that (a stuck Gmail tab or a sleeping service worker used to leave the run on "Filling…" with
+ *  no end). */
+function mailLink(kind: "reset" | "verify", host: string, email: string, since: number, password?: string, wait = 150_000): Promise<Any> {
   return new Promise((resolve) => {
+    const t = setTimeout(() => resolve({ ok: false, reason: "timed out waiting for the email" }), wait + 30_000);
+    const done = (r: Any) => {
+      clearTimeout(t);
+      resolve(r);
+    };
     try {
-      chrome.runtime.sendMessage({ type: "OH_WD_MAIL_LINK", kind, host, email, since, password }, (r: Any) => {
+      chrome.runtime.sendMessage({ type: "OH_WD_MAIL_LINK", kind, host, email, since, password, wait }, (r: Any) => {
         void chrome.runtime.lastError;
-        resolve(r || { ok: false, reason: "no answer" });
+        done(r || { ok: false, reason: "no answer" });
       });
     } catch {
-      resolve({ ok: false, reason: "extension reloaded" });
+      done({ ok: false, reason: "extension reloaded" });
     }
   });
 }
@@ -304,9 +312,11 @@ async function answerWd(msg: Any): Promise<unknown> {
     case "wd:auth:mailVerify": {
       const { email } = await workdayLogin();
       const host = String(msg.tenantHost || tenantHost());
-      const r = await mailLink("verify", host, String(msg.email || email), Number(msg.since) || Date.now() - 600_000);
+      const wait = Math.max(10_000, Math.min(150_000, Number(msg.wait) || 150_000));
+      const r = await mailLink("verify", host, String(msg.email || email), Number(msg.since) || Date.now() - 600_000, undefined, wait);
       if (r.ok) await noteSite("account", {}, host);
-      return { ok: !!r.ok, reason: r.reason };
+      // off: the reader is off or Gmail isn't signed in, so a reset email couldn't be read either
+      return { ok: !!r.ok, reason: r.reason, off: /codes are off|not signed in/i.test(String(r.reason || "")) };
     }
     case "wd:cred:set":
       await noteSite("account", { password: String(msg.password || "") || undefined });
