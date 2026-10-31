@@ -278,7 +278,10 @@ export async function multiselectPick(target: HTMLElement, wanted: string, opts:
   await humanClick(input);
   setNativeValue(input, wanted);
   const before = multiselectSelected(target).length;
-  input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", code: "Enter", keyCode: 13, bubbles: true }));
+  // Workday searches on Enter (typing alone lists nothing); the text has to land first.
+  await sleep(200);
+  for (const t of ["keydown", "keypress", "keyup"])
+    input.dispatchEvent(new KeyboardEvent(t, { key: "Enter", code: "Enter", keyCode: 13, which: 13, bubbles: true }));
   await sleep(250);
   // Enter can select whatever row is highlighted (it picked "Accounting" for Field of Study).
   if (!opts.fallbackFirst) await dropWrongPicks(target, before, wanted, "", min);

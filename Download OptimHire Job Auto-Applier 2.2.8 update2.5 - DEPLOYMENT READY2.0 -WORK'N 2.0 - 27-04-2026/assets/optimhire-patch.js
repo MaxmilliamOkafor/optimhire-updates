@@ -10057,10 +10057,11 @@
           LOG(`[Queue Runner] on job: ${job.title || job.url}`);
         }
 
-        /* Workday: the Workday engine applies (sign-in, CV, every step,
-           Submit) and says how it went; this only reads its result. */
+        /* Workday: the Workday engine does Apply and the sign-in / account; the
+           application pages after that are filled here like any other ATS
+           (formsToOptimHire). Its result, when it ran to the end, is read here. */
         const wde = window.__ohWdEngine;
-        if (wde && wde.isWorkday && wde.isWorkday()) {
+        if (wde && wde.isWorkday && wde.isWorkday() && !(wde.formsToOptimHire && wde.formsToOptimHire())) {
           const r = wde.queueResult(job.id);
           if (r) {
             if (r.outcome === 'submitted') {

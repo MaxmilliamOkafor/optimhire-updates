@@ -212,7 +212,18 @@ async function waitForExternalDocs(ctx: Ctx) {
 /** [oh] Pages assist mode fills; on the rest (posting, sign-in, Review…) it does nothing. */
 const ASSIST_PAGES: PageKind[] = ["resumeUpload", "myInformation", "myExperience", "questions", "voluntaryDisclosures", "selfIdentify"];
 
+/** [oh] The application's own pages: with hooks.handOff, the host's filler takes these. */
+export const HANDOFF_PAGES: PageKind[] = [...ASSIST_PAGES, "review"];
+
 async function handlePage(ctx: Ctx, page: PageKind): Promise<StepResult> {
+  // [oh] Past Apply and the sign-in: OptimHire's own Workday autofill fills the application.
+  if (hooks.handOff && HANDOFF_PAGES.includes(page) && (await hooks.handOff(ctx.run))) {
+    ctx.run.status = "idle";
+    ctx.run.pauseReason = undefined;
+    ctx.log("Signed in — OptimHire's own autofill fills the application from here");
+    await ctx.save();
+    return "stop";
+  }
   if (hooks.advance && !hooks.advance() && !ASSIST_PAGES.includes(page)) return "stop"; // [oh]
   // [oh] Workday refuses a second application to the same job: stop at once instead of retrying.
   if (["jobPosting", "applyMethod", "candidateHome", "unknown"].includes(page) && ALREADY_APPLIED_RX.test(text(document.body).slice(0, 6000))) {

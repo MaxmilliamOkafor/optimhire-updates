@@ -65,6 +65,12 @@
  *    step, submits and reports back like OptimHire's own filler. If it
  *    doesn't answer within 8 s the message goes to OptimHire's filler as
  *    before. ohWdEngineOff: true in storage turns it off.
+ *    9b. The engine only does Apply, the sign-in and the account now: on the
+ *    first application page (CV, My Information…) it says OH_WD_HANDOFF and
+ *    the job goes to OptimHire's original Workday filler — the FILL_COMPLEX_FORM
+ *    OptimHire sent, or the page's "Autofill Application" press, given to it
+ *    as it came. That tab's job is OptimHire's from then on (30 min).
+ *    ohWdEngineForms: true gives the application pages back to the engine.
  *
  * 10. Verification codes from the Gmail you are signed in to (opt-in:
  *    ohGmailCodes, Queue Manager → Workday sign-in). Oracle's "Confirm Your
@@ -91,6 +97,46 @@
  * relative to the worker script changes.
  */
 /* global importScripts */   // service-worker global
+
+/* 9b. Shared by the FILL_COMPLEX_FORM hand-over (below) and the page button (15): what each
+   Workday tab was given, and which tabs' jobs went back to OptimHire after the sign-in. */
+var HANDOFF_TTL_MS = 30 * 60 * 1000;
+function handoffState() {
+  return self.__ohWdHandoff || (self.__ohWdHandoff = { fills: {}, presses: {}, done: {}, send: null, ohListeners: [] });
+}
+function jobIdOf(msg) {
+  var ad = msg && msg.applicationDetails;
+  return ad ? String(ad.application_id || ad.copilot_job_id || '') : '';
+}
+/** This tab's job went to OptimHire's filler after the sign-in (the same job, not a newer one). */
+function handedOff(tabId, msg) {
+  var d = handoffState().done[tabId];
+  if (!d || Date.now() - d.at > HANDOFF_TTL_MS) return false;
+  var id = jobIdOf(msg);
+  return !id || !d.jobId || id === d.jobId;
+}
+/* Kept in session storage too: a service worker put to sleep during a long sign-in forgets it. */
+function saveHandoff() {
+  var h = handoffState();
+  try { chrome.storage.session.set({ ohWdHandoff: { fills: h.fills, presses: h.presses, done: h.done } }); } catch (_) {}
+}
+function loadHandoff() {
+  var h = handoffState();
+  return new Promise(function (resolve) {
+    try {
+      chrome.storage.session.get('ohWdHandoff', function (d) {
+        void chrome.runtime.lastError;
+        var s = d && d.ohWdHandoff;
+        if (s) ['fills', 'presses', 'done'].forEach(function (k) {
+          Object.keys(s[k] || {}).forEach(function (t) { if (!h[k][t]) h[k][t] = s[k][t]; });
+        });
+        resolve(h);
+      });
+    } catch (_) { resolve(h); }
+  });
+}
+loadHandoff();
+
 (function () {
   'use strict';
   var KEYS = ['copilotTabId', 'isAutoProcessStartJob', 'isManuallyStartJob', 'autoApplyState',
@@ -592,6 +638,8 @@
 
   if (tabsApi && typeof tabsApi.sendMessage === 'function') {
     var origSend = tabsApi.sendMessage.bind(tabsApi);
+    var wdh = handoffState();
+    wdh.send = origSend;
     tabsApi.sendMessage = function (tabId, msg) {
       var args = arguments;
       if (msg && typeof msg === 'object' && (msg.type === 'FILL_COMPLEX_FORM' || msg.type === 'MANUALLY_FORM_SUBMIT') &&
@@ -605,11 +653,16 @@
             typeof args[args.length - 1] !== 'function' && snap.ohAutomationDisabled !== true && snap.ohWdEngineOff !== true) {
           return tabHost(tabId).then(function (host) {
             if (!WD_ENGINE_RE.test(host)) return origSend.apply(null, args);
+            // Signed in already and handed back: this job's application is OptimHire's.
+            if (handedOff(tabId, msg)) return origSend.apply(null, args);
             var start = Object.assign({}, msg, { type: 'oh:wd:start' });
             return within(origSend(tabId, start, { frameId: 0 }).catch(function () { return null; }), WD_ENGINE_ACK_MS)
               .then(function (r) {
                 if (r && r.acknowledged) {
                   try { console.info('[OH-BG] Workday job handed to the Workday engine on ' + host); } catch (_) {}
+                  wdh.fills[tabId] = { msg: msg, at: Date.now() };
+                  delete wdh.presses[tabId];
+                  saveHandoff();
                   return { acknowledged: true };
                 }
                 try { console.info('[OH-BG] Workday engine did not answer on ' + host + ' — OptimHire fills it'); } catch (_) {}
@@ -1124,14 +1177,50 @@
   } catch (_) {}
   function isWorkdayPagePress(msg, sender) {
     if (engineOff || !msg || msg.action !== 'START_PAGE_AUTOFILL' || !sender || !sender.tab) return false;
+    if (handedOff(sender.tab.id, null)) return false;   // signed in and handed back: OptimHire's press
     var host = '';
     try { host = new URL(sender.tab.url || '').hostname; } catch (_) {}
     return WD_PAGE_RE.test(host);
   }
+  var h = handoffState();
+  /* 9b. The engine is past the sign-in: the job goes to OptimHire's original filler, as it came. */
+  ev.addListener(function (msg, sender, reply) {
+    if (!msg || msg.type !== 'OH_WD_HANDOFF' || sender.id !== chrome.runtime.id || !sender.tab) return;
+    var tabId = sender.tab.id;
+    loadHandoff().then(function () {
+      var fill = h.fills[tabId], press = h.presses[tabId];
+      if (fill && Date.now() - fill.at > HANDOFF_TTL_MS) fill = null;
+      if (press && Date.now() - press.at > HANDOFF_TTL_MS) press = null;
+      h.done[tabId] = { at: Date.now(), jobId: fill ? jobIdOf(fill.msg) : '' };
+      delete h.fills[tabId];
+      delete h.presses[tabId];
+      saveHandoff();
+      if (fill && h.send) {
+        try { console.info('[OH-BG] Workday: signed in — OptimHire\'s own filler takes the application'); } catch (_) {}
+        h.send(tabId, fill.msg).catch(function () {});
+        reply({ via: 'fill' });
+        return;
+      }
+      if (press) {
+        try { console.info('[OH-BG] Workday: signed in — OptimHire\'s own Autofill Application fills the page'); } catch (_) {}
+        h.ohListeners.forEach(function (fn) {
+          try { fn(press.msg, press.sender, function () {}); } catch (e) { try { console.warn('[OH-BG] page autofill hand-over:', e); } catch (_) {} }
+        });
+        reply({ via: 'button' });
+        return;
+      }
+      reply({ via: 'none' });
+    });
+    return true;
+  });
+  try { chrome.tabs.onRemoved.addListener(function (tabId) { delete h.fills[tabId]; delete h.presses[tabId]; delete h.done[tabId]; saveHandoff(); }); } catch (_) {}
   /* Ours runs first and answers the button. */
   ev.addListener(function (msg, sender, reply) {
     if (!isWorkdayPagePress(msg, sender)) return;
     var tabId = sender.tab.id;
+    h.presses[tabId] = { msg: msg, sender: { id: sender.id, tab: sender.tab, frameId: sender.frameId, url: sender.url, origin: sender.origin }, at: Date.now() };
+    delete h.fills[tabId];
+    saveHandoff();
     try { console.info('[OH-BG] Autofill Application on a Workday job — the Workday engine applies on this page'); } catch (_) {}
     chrome.tabs.sendMessage(tabId, { type: 'OH_AUTOFILL_THIS_PAGE', submit: true, pageOnly: false }, { frameId: 0 }, function () {
       void chrome.runtime.lastError;
@@ -1146,6 +1235,7 @@
       if (isWorkdayPagePress(msg, sender)) return false;
       return fn.apply(this, arguments);
     };
+    h.ohListeners.push(fn);   // given the press itself after the sign-in (9b)
     return realAdd(wrapped);
   };
 })();

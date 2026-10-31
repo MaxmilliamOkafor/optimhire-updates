@@ -976,7 +976,9 @@
     await humanClick(input);
     setNativeValue(input, wanted);
     const before = multiselectSelected(target).length;
-    input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", code: "Enter", keyCode: 13, bubbles: true }));
+    await sleep(200);
+    for (const t of ["keydown", "keypress", "keyup"])
+      input.dispatchEvent(new KeyboardEvent(t, { key: "Enter", code: "Enter", keyCode: 13, which: 13, bubbles: true }));
     await sleep(250);
     if (!opts.fallbackFirst) await dropWrongPicks(target, before, wanted, "", min);
     for (let depth = 0; depth < 3; depth++) {
@@ -2729,7 +2731,15 @@ OPTIONS: ${JSON.stringify(options.slice(0, 150))}`
     ctx.log("Tailoring tool didn't respond in 90 s — continuing with the fallback CV", "warn");
   }
   var ASSIST_PAGES = ["resumeUpload", "myInformation", "myExperience", "questions", "voluntaryDisclosures", "selfIdentify"];
+  var HANDOFF_PAGES = [...ASSIST_PAGES, "review"];
   async function handlePage(ctx, page) {
+    if (hooks.handOff && HANDOFF_PAGES.includes(page) && await hooks.handOff(ctx.run)) {
+      ctx.run.status = "idle";
+      ctx.run.pauseReason = void 0;
+      ctx.log("Signed in — OptimHire's own autofill fills the application from here");
+      await ctx.save();
+      return "stop";
+    }
     if (hooks.advance && !hooks.advance() && !ASSIST_PAGES.includes(page)) return "stop";
     if (["jobPosting", "applyMethod", "candidateHome", "unknown"].includes(page) && ALREADY_APPLIED_RX.test(text(document.body).slice(0, 6e3))) {
       throw new NeedsHuman("You have already applied to this job (Workday allows one application per job).");
@@ -3018,14 +3028,19 @@ OPTIONS: ${JSON.stringify(options.slice(0, 150))}`
     } catch {
     }
   }
-  var ASSIST_KEYS = ["ohAutoTrigger", "ohWdEngineOff", "ohAutomationDisabled", "isAutoProcessStartJob", "isManuallyStartJob", "ohJobQueueActive"];
+  var ASSIST_KEYS = ["ohAutoTrigger", "ohWdEngineOff", "ohAutomationDisabled", "isAutoProcessStartJob", "isManuallyStartJob", "ohJobQueueActive", "ohWdEngineForms"];
   var assistOn = false;
+  var engineForms = false;
   function readAssist() {
     ST.get(ASSIST_KEYS).then((d) => {
       const running = !!(d.isAutoProcessStartJob || d.isManuallyStartJob || d.ohJobQueueActive);
-      assistOn = d.ohAutoTrigger !== false && d.ohWdEngineOff !== true && d.ohAutomationDisabled !== true && !running;
+      engineForms = d.ohWdEngineForms === true;
+      assistOn = engineForms && d.ohAutoTrigger !== false && d.ohWdEngineOff !== true && d.ohAutomationDisabled !== true && !running;
     }, () => {
     });
+  }
+  function formsToOptimHire() {
+    return !engineForms && hasWorkdayApp() && HANDOFF_PAGES.includes(detectPage());
   }
   readAssist();
   chrome.storage.onChanged.addListener((c, area) => {
@@ -3042,8 +3057,10 @@ OPTIONS: ${JSON.stringify(options.slice(0, 150))}`
   }
   window.__ohWdEngine = {
     // …and the pages of Workday's emailed links, which the background fills in its own tab.
-    owns: () => TOP && (!!readMode() || isActive() || assistOn && hasWorkdayApp() || /passwordreset|resetpassword|\/activate\b|verifyemail|verifyaccount/i.test(location.pathname)),
+    owns: () => TOP && !formsToOptimHire() && (!!readMode() || isActive() || assistOn && hasWorkdayApp() || /passwordreset|resetpassword|\/activate\b|verifyemail|verifyaccount/i.test(location.pathname)),
     takesManual: () => TOP && hasWorkdayApp(),
+    // The CSV queue fills these pages the way it fills every other ATS.
+    formsToOptimHire: () => TOP && formsToOptimHire(),
     isWorkday: () => TOP && isWorkdayHost(),
     startQueueJob: (job) => void startQueueJob(job),
     queueResult
@@ -3690,8 +3707,55 @@ OPTIONS: ${JSON.stringify(options.slice(0, 150))}`
       answer: hostAnswer,
       onPage: (run) => onPage(mode, run),
       beforeExperience: () => within(cvReady, 3e4).then(() => void 0),
-      onFinish: (run, outcome) => void finish(mode, run, outcome)
+      onFinish: (run, outcome) => void finish(mode, run, outcome),
+      ...engineForms || mode.assist ? {} : { handOff: () => handOff(mode, profile) }
     });
+  }
+  var SKILLS_KEY = "ohWdSkills";
+  var skillsFor = [];
+  async function skillsList() {
+    if (skillsFor.length) return skillsFor;
+    try {
+      skillsFor = JSON.parse(sessionStorage.getItem(SKILLS_KEY) || "[]");
+    } catch {
+    }
+    if (!skillsFor.length) {
+      const p = await within(buildProfile(void 0, await primaryCvUrl()), 2e4).catch(() => null);
+      skillsFor = (p?.skills || []).slice(0, 15);
+    }
+    return skillsFor;
+  }
+  async function handOff(mode, profile) {
+    clearMode();
+    skillsFor = (profile.skills || []).slice(0, 15);
+    try {
+      sessionStorage.setItem(SKILLS_KEY, JSON.stringify(skillsFor));
+    } catch {
+    }
+    say("signed in — OptimHire's own Workday autofill fills the application from here");
+    const r = await within(chrome.runtime.sendMessage({ type: "OH_WD_HANDOFF" }), 5e3).catch(() => null);
+    say(`handed to OptimHire (${r?.via || "its page filler"})`);
+    if (mode.auto && r?.via !== "fill") send({ type: "COMPLEX_FORM_PROGRESS", progress: 75, message: "Workday: OptimHire fills the application" });
+    return true;
+  }
+  async function fillSkills() {
+    const box = field("skills");
+    const list = box ? await skillsList() : [];
+    if (!box || !list.length) return;
+    const c = box.closest('[data-automation-id^="formField"]') ?? box;
+    let added = 0;
+    for (const s of list) {
+      if (detectPage() !== "myExperience") return;
+      if (multiselectSelected(c).some((x) => similarity(x, s) >= 0.85)) continue;
+      for (const v of searchVariants(s)) {
+        if (await multiselectPick(c, v, { min: 0.75 })) {
+          added++;
+          break;
+        }
+      }
+      await sleep(150);
+    }
+    say(`skills: ${added} added`);
   }
   var AUTH_PAGES = ["signIn", "createAccount", "verifyEmail"];
   var accountNoted = false;
@@ -3886,6 +3950,45 @@ OPTIONS: ${JSON.stringify(options.slice(0, 150))}`
       }
       return false;
     });
+    let skillsKey = "";
+    let skillsState = "";
+    let expSince = 0;
+    const runSkills = async () => {
+      skillsState = "busy";
+      try {
+        await fillSkills();
+      } catch (e) {
+        say(`skills: ${e?.message || e}`);
+      }
+      skillsState = "done";
+    };
+    setInterval(() => {
+      if (engineForms || isActive() || !hasWorkdayApp() || detectPage() !== "myExperience" || !field("skills")) {
+        expSince = 0;
+        return;
+      }
+      const key2 = `${location.pathname}|${activeStepName()}`;
+      if (key2 !== skillsKey) {
+        skillsKey = key2;
+        skillsState = "";
+        expSince = Date.now();
+      }
+      if (!skillsState && Date.now() - expSince > 8e3) void runSkills();
+    }, 1e3);
+    document.addEventListener("click", (ev) => {
+      if (engineForms || skillsState === "done" || !(ev.target instanceof Element)) return;
+      const btn = nextButton();
+      if (!btn || !btn.contains(ev.target) || detectPage() !== "myExperience" || !field("skills")) return;
+      ev.preventDefault();
+      ev.stopImmediatePropagation();
+      const go = skillsState === "busy" ? (async () => {
+        while (skillsState === "busy") await sleep(300);
+      })() : runSkills();
+      void go.then(() => {
+        skillsState = "done";
+        btn.click();
+      });
+    }, true);
     const submitCountdown = (seconds = 5) => {
       if (!document.body) return;
       const host2 = document.createElement("div");
