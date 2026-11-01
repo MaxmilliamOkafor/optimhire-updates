@@ -1150,6 +1150,50 @@ loadHandoff();
   } catch (_) {}
 })();
 
+/* 14b. "Autofill Application" is one job, in the tab you pressed it in. OptimHire runs it as a
+   one-job run (isSingleManualApplication) and, when that job is done or fails, sends the tab to
+   optimhire.com/d/job-apply (or My Jobs / apply-success) — mid-application, as you saw it — and
+   that page then carried on into OptimHire's whole queue (Mastercard, Capital One…). For 30 min
+   after a press, that tab is never sent to optimhire.com by the background: it stays on the job. */
+(function pageAutofillStaysPut() {
+  var tabsApi = chrome.tabs, ev = chrome.runtime && chrome.runtime.onMessage;
+  if (!tabsApi || typeof tabsApi.update !== 'function' || !ev || typeof ev.addListener !== 'function') return;
+  var KEEP_MS = 30 * 60 * 1000;
+  var OH_PAGE_RE = /^https:\/\/(www\.)?optimhire\.com\/d\/(job-apply|my-jobs|apply-success)\b/i;
+  var pressed = {};
+  try {
+    chrome.storage.session.get(['ohPageAutofillTabs'], function (d) {
+      if (d && d.ohPageAutofillTabs) Object.assign(pressed, d.ohPageAutofillTabs);
+    });
+  } catch (_) {}
+  function keep() { try { chrome.storage.session.set({ ohPageAutofillTabs: pressed }); } catch (_) {} }
+  ev.addListener(function (msg, sender) {
+    if (!msg || msg.action !== 'START_PAGE_AUTOFILL') return;
+    var id = (sender && sender.tab && sender.tab.id) || msg.tabId;
+    if (typeof id === 'number') { pressed[id] = Date.now(); keep(); }
+  });
+  // Stop (yours, from the panel) ends the hold.
+  ev.addListener(function (msg) {
+    if (msg && (msg.type === 'AUTO_APPLY_STOP' || msg.type === 'MANUAL_APPLY_STOP') && Object.keys(pressed).length) { pressed = {}; keep(); }
+  });
+  try { tabsApi.onRemoved.addListener(function (id) { if (pressed[id]) { delete pressed[id]; keep(); } }); } catch (_) {}
+  var realUpdate = tabsApi.update.bind(tabsApi);
+  tabsApi.update = function (tabId, props) {
+    try {
+      var url = props && props.url;
+      if (typeof tabId === 'number' && typeof url === 'string' && OH_PAGE_RE.test(url) &&
+          pressed[tabId] && Date.now() - pressed[tabId] < KEEP_MS) {
+        try { console.info('[OH-BG] Autofill Application finished: the tab stays on the job (not sent to ' + url + ')'); } catch (_) {}
+        var cb = arguments[arguments.length - 1];
+        var p = new Promise(function (res) { tabsApi.get(tabId, function (t) { void chrome.runtime.lastError; res(t); }); });
+        if (typeof cb === 'function') { p.then(cb); return undefined; }
+        return p;
+      }
+    } catch (_) {}
+    return realUpdate.apply(null, arguments);
+  };
+})();
+
 /* 15. "Autofill Application" on a Workday job page applies to THAT job.
    OptimHire 2.10.0 draws the button (atsInject → START_PAGE_AUTOFILL).
    Its own handler refuses while its saved "a run is going" flags are set —
