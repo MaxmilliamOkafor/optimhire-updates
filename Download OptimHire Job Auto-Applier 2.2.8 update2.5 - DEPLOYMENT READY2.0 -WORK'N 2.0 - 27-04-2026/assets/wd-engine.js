@@ -3920,12 +3920,12 @@ OPTIONS: ${JSON.stringify(options.slice(0, 150))}`
     }
     if (!skillsFor.length) {
       const p = await within(buildProfile(void 0, await primaryCvUrl()), 2e4).catch(() => null);
-      skillsFor = (p?.skills || []).slice(0, 15);
+      skillsFor = (p?.skills || []).slice(0, SKILLS_MAX);
     }
     return skillsFor;
   }
   async function handOff(mode, profile) {
-    skillsFor = (profile.skills || []).slice(0, 15);
+    skillsFor = (profile.skills || []).slice(0, SKILLS_MAX);
     try {
       sessionStorage.setItem(SKILLS_KEY, JSON.stringify(skillsFor));
     } catch {
@@ -3955,18 +3955,70 @@ OPTIONS: ${JSON.stringify(options.slice(0, 150))}`
     if (!box || !list.length) return;
     const c = box.closest('[data-automation-id^="formField"]') ?? box;
     let added = 0;
-    for (const s of list) {
-      if (detectPage() !== "myExperience") return;
+    for (const s of list.slice(0, SKILLS_MAX)) {
+      if (detectPage() !== "myExperience" || multiselectSelected(c).length >= SKILLS_MAX) break;
       if (multiselectSelected(c).some((x) => similarity(x, s) >= 0.85)) continue;
-      for (const v of searchVariants(s)) {
-        if (await multiselectPick(c, v, { min: 0.75 })) {
-          added++;
-          break;
-        }
-      }
+      if (await multiselectPick(c, s, { min: 0.75 })) added++;
       await sleep(150);
     }
     say(`skills: ${added} added`);
+  }
+  var SKILLS_MAX = 10;
+  var OPTION_SEL = '[data-automation-id="promptOption"], [data-automation-id="promptLeafNode"], [role="option"], [data-automation-id="menuItem"]';
+  function skillsBox() {
+    const f = field("skills");
+    return f ? f.closest('[data-automation-id^="formField"]') ?? f : null;
+  }
+  function optionTicked(o) {
+    const row = o.closest(OPTION_SEL) ?? o;
+    for (const el of [o, row]) {
+      if (el.getAttribute("aria-checked") === "true" || el.getAttribute("aria-selected") === "true") return true;
+      const box = el.querySelector('input[type="checkbox"], [role="checkbox"]');
+      if (box && (box.checked || box.getAttribute("aria-checked") === "true")) return true;
+    }
+    return false;
+  }
+  function installSkillsLimit() {
+    let lastUsedAt = 0;
+    document.addEventListener("focusin", (e) => {
+      const box = skillsBox();
+      if (!box) return;
+      const t = e.composedPath?.()[0] ?? e.target;
+      if (t && box.contains(t)) lastUsedAt = Date.now();
+      else if (t?.closest?.('[data-automation-id^="formField"]')) lastUsedAt = 0;
+    }, true);
+    const guard = (e) => {
+      try {
+        const box = skillsBox();
+        if (!box || multiselectSelected(box).length < SKILLS_MAX) return;
+        const path = e.composedPath ? e.composedPath() : [e.target];
+        const inBox = path.includes(box);
+        if (e.type === "keydown") {
+          if (!inBox || e.key !== "Enter") return;
+        } else {
+          const opt = path.find((n) => n instanceof Element && n.matches(OPTION_SEL));
+          if (!opt || inBox || Date.now() - lastUsedAt > 6e4 || optionTicked(opt)) return;
+        }
+        e.stopImmediatePropagation();
+        e.preventDefault();
+      } catch {
+      }
+    };
+    for (const t of ["pointerdown", "mousedown", "mouseup", "click", "keydown"]) document.addEventListener(t, guard, true);
+    let told = false;
+    setInterval(() => {
+      const box = skillsBox();
+      if (!box) return;
+      const chips = Array.from(box.querySelectorAll('[data-automation-id="selectedItem"]'));
+      if (chips.length <= SKILLS_MAX) return;
+      const last = chips[chips.length - 1];
+      const del = last.querySelector('[data-automation-id="DELETE_charm"], [aria-label*="delete" i], [aria-label*="remove" i], button, [role="button"]') ?? last.parentElement?.querySelector('[data-automation-id="DELETE_charm"]');
+      del?.click();
+      if (!told) {
+        told = true;
+        say(`skills box held to ${SKILLS_MAX} — removing the ${chips.length - SKILLS_MAX} extra`);
+      }
+    }, 700);
   }
   var AUTH_PAGES = ["signIn", "createAccount", "verifyEmail"];
   var accountNoted = false;
@@ -4139,6 +4191,7 @@ OPTIONS: ${JSON.stringify(options.slice(0, 150))}`
     await startRun(null);
   }
   if (TOP && isWorkdayHost()) {
+    installSkillsLimit();
     chrome.runtime.onMessage.addListener((msg, _sender, reply) => {
       if (!msg) return false;
       if (msg.type === "oh:wd:start") {

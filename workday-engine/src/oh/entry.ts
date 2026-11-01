@@ -29,7 +29,7 @@
 import { HANDOFF_PAGES, autoResume, isActive, startRun, stopRun } from "../workday/engine.js";
 import { activeStepName, detectPage, hasWorkdayApp, isWorkdayHost, nextButton, tenantHost } from "../workday/detect.js";
 import { field, similarity, sleep } from "../workday/dom.js";
-import { multiselectPick, multiselectSelected, searchVariants } from "../workday/controls.js";
+import { multiselectPick, multiselectSelected } from "../workday/controls.js";
 import { normalizeLabel, normalizeProfile } from "../workday/store.js";
 import { setHooks, type OpenQuestion, type Outcome } from "../workday/ohHooks.js";
 import type { ControlKind } from "../workday/controls.js";
@@ -775,7 +775,7 @@ async function skillsList(): Promise<string[]> {
   if (!skillsFor.length) {
     // Signed in before this tab's run (no handoff here): your profile, as the engine builds it.
     const p = await within(buildProfile(undefined, await primaryCvUrl()), 20_000).catch(() => null);
-    skillsFor = ((p as Profile | null)?.skills || []).slice(0, 15);
+    skillsFor = ((p as Profile | null)?.skills || []).slice(0, SKILLS_MAX);
   }
   return skillsFor;
 }
@@ -785,7 +785,7 @@ async function skillsList(): Promise<string[]> {
  *  queue job goes back to the queue's own filler. With neither (you clicked Workday's own Apply,
  *  or the panel's "Fill"), the engine fills the application itself: false. */
 async function handOff(mode: Mode, profile: Profile): Promise<boolean> {
-  skillsFor = (profile.skills || []).slice(0, 15);
+  skillsFor = (profile.skills || []).slice(0, SKILLS_MAX);
   try { sessionStorage.setItem(SKILLS_KEY, JSON.stringify(skillsFor)); } catch { /* storage blocked */ }
   const r = (await within(chrome.runtime.sendMessage({ type: "OH_WD_HANDOFF" }), 5000).catch(() => null)) as Any;
   const { ohJobQueueActive } = await ST.get("ohJobQueueActive");
@@ -809,15 +809,77 @@ async function fillSkills(): Promise<void> {
   if (!box || !list.length) return;
   const c = (box.closest('[data-automation-id^="formField"]') as HTMLElement | null) ?? box;
   let added = 0;
-  for (const s of list) {
-    if (detectPage() !== "myExperience") return;
+  for (const s of list.slice(0, SKILLS_MAX)) {
+    if (detectPage() !== "myExperience" || multiselectSelected(c).length >= SKILLS_MAX) break;
     if (multiselectSelected(c).some((x) => similarity(x, s) >= 0.85)) continue;
-    for (const v of searchVariants(s)) {
-      if (await multiselectPick(c, v, { min: 0.75 })) { added++; break; }
-    }
+    // multiselectPick tries other names and shorter forms itself (AWS for "Amazon Web Services (AWS)").
+    if (await multiselectPick(c, s, { min: 0.75 })) added++;
     await sleep(150);
   }
   say(`skills: ${added} added`);
+}
+
+/* 10 IN THE SKILLS BOX, WHOEVER ADDS THEM. OptimHire's own filler (or any other) can type every
+   skill in the profile — 40 on one tenant. Once the box holds 10, picking another result (a click,
+   or Enter in its search box) is refused; unticking one still works. Anything over 10 is removed,
+   newest first. On every Workday page, run or not. */
+const SKILLS_MAX = 10;
+const OPTION_SEL = '[data-automation-id="promptOption"], [data-automation-id="promptLeafNode"], [role="option"], [data-automation-id="menuItem"]';
+function skillsBox(): HTMLElement | null {
+  const f = field("skills");
+  return f ? ((f.closest('[data-automation-id^="formField"]') as HTMLElement | null) ?? f) : null;
+}
+function optionTicked(o: Element): boolean {
+  const row = o.closest(OPTION_SEL) ?? o;
+  for (const el of [o, row]) {
+    if (el.getAttribute("aria-checked") === "true" || el.getAttribute("aria-selected") === "true") return true;
+    const box = el.querySelector<HTMLInputElement>('input[type="checkbox"], [role="checkbox"]');
+    if (box && (box.checked || box.getAttribute("aria-checked") === "true")) return true;
+  }
+  return false;
+}
+function installSkillsLimit() {
+  let lastUsedAt = 0; // the skills search box was the last field used
+  document.addEventListener("focusin", (e) => {
+    const box = skillsBox();
+    if (!box) return;
+    const t = (e.composedPath?.()[0] as Element | undefined) ?? (e.target as Element | null);
+    if (t && box.contains(t)) lastUsedAt = Date.now();
+    else if (t?.closest?.('[data-automation-id^="formField"]')) lastUsedAt = 0; // another question now
+  }, true);
+  const guard = (e: Event) => {
+    try {
+      const box = skillsBox();
+      if (!box || multiselectSelected(box).length < SKILLS_MAX) return;
+      const path = e.composedPath ? e.composedPath() : [e.target as EventTarget];
+      const inBox = path.includes(box);
+      if (e.type === "keydown") {
+        if (!inBox || (e as KeyboardEvent).key !== "Enter") return;
+      } else {
+        const opt = path.find((n): n is Element => n instanceof Element && n.matches(OPTION_SEL));
+        if (!opt || inBox || Date.now() - lastUsedAt > 60_000 || optionTicked(opt)) return;
+      }
+      e.stopImmediatePropagation();
+      e.preventDefault();
+    } catch { /* never break the page */ }
+  };
+  for (const t of ["pointerdown", "mousedown", "mouseup", "click", "keydown"]) document.addEventListener(t, guard, true);
+  let told = false;
+  setInterval(() => {
+    const box = skillsBox();
+    if (!box) return;
+    const chips = Array.from(box.querySelectorAll<HTMLElement>('[data-automation-id="selectedItem"]'));
+    if (chips.length <= SKILLS_MAX) return;
+    const last = chips[chips.length - 1];
+    const del =
+      last.querySelector<HTMLElement>('[data-automation-id="DELETE_charm"], [aria-label*="delete" i], [aria-label*="remove" i], button, [role="button"]') ??
+      last.parentElement?.querySelector<HTMLElement>('[data-automation-id="DELETE_charm"]');
+    del?.click();
+    if (!told) {
+      told = true;
+      say(`skills box held to ${SKILLS_MAX} — removing the ${chips.length - SKILLS_MAX} extra`);
+    }
+  }, 700);
 }
 
 const AUTH_PAGES: PageKind[] = ["signIn", "createAccount", "verifyEmail"];
@@ -994,6 +1056,7 @@ async function startManual(submit: boolean, pageOnly = false): Promise<void> {
 /* ---------------- wiring ---------------- */
 
 if (TOP && isWorkdayHost()) {
+  installSkillsLimit();
   chrome.runtime.onMessage.addListener((msg: Any, _sender, reply) => {
     if (!msg) return false;
     if (msg.type === "oh:wd:start") {
