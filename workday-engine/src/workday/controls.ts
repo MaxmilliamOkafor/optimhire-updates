@@ -138,6 +138,29 @@ export function dropdownValue(target: HTMLElement): string {
   return /^select one$|^select$/i.test(t) ? "" : t;
 }
 
+/** Enter as Workday's search box reads it: Chrome ignores keyCode / which in a
+ *  KeyboardEvent's init, so a handler checking 13 never ran and nothing was searched. */
+function pressEnter(el: HTMLElement) {
+  for (const t of ["keydown", "keypress", "keyup"]) {
+    const ev = new KeyboardEvent(t, { key: "Enter", code: "Enter", bubbles: true, cancelable: true, composed: true });
+    Object.defineProperty(ev, "keyCode", { get: () => 13 });
+    Object.defineProperty(ev, "which", { get: () => 13 });
+    el.dispatchEvent(ev);
+  }
+}
+
+/** A row already ticked (the tick sits beside the option text, so the row is read too):
+ *  clicking it again removes the pick. */
+function ticked(o: HTMLElement): boolean {
+  const row = (o.closest('[role="option"], li, [data-automation-id="menuItem"], [data-automation-id="promptLeafNode"]') as HTMLElement | null) ?? o;
+  for (const el of [o, row]) {
+    if (el.getAttribute("aria-checked") === "true") return true;
+    const box = el.querySelector<HTMLInputElement>('input[type="checkbox"], [role="checkbox"]');
+    if (box && (box.checked === true || box.getAttribute("aria-checked") === "true")) return true;
+  }
+  return false;
+}
+
 /** A key press on `el` (letters and digits get their KeyX / DigitN code). */
 function key(el: HTMLElement, k: string) {
   const code = k.length === 1 ? (/\d/.test(k) ? `Digit${k}` : `Key${k.toUpperCase()}`) : k;
@@ -247,10 +270,56 @@ function visibleOptions(): HTMLElement[] {
   return qa(sel("promptOption")).filter(isVisible);
 }
 
-/** Search results still loading (spinner shown): picking now takes a stale option or nothing. */
-async function searchSettled(): Promise<void> {
-  await waitFor(() => !qa(sel("spinner")).some(isVisible), 6000, 100).catch(() => null);
-  await sleep(120);
+/** Workday's "loading" spinner, shown while a prompt searches. */
+function spinning(): boolean {
+  return qa(sel("spinner")).some(isVisible) || qa('[data-automation-id*="oading"], [aria-busy="true"]').some(isVisible);
+}
+
+/**
+ * Options once the search has finished and the list stopped changing. Picking while the
+ * spinner shows clicks a row that is about to be replaced.
+ */
+async function settledOptions(timeout = 6000): Promise<HTMLElement[]> {
+  const end = Date.now() + timeout;
+  let last = "";
+  let stableSince = Date.now();
+  while (Date.now() < end) {
+    const o = visibleOptions();
+    const sig = o.map(text).join("|");
+    if (sig !== last) {
+      last = sig;
+      stableSince = Date.now();
+    }
+    if (o.length && !spinning() && Date.now() - stableSince >= 200) return o;
+    await sleep(100);
+  }
+  return visibleOptions();
+}
+
+/** Other names a skill / source goes by in Workday's lists. */
+const MULTI_ALIASES: [RegExp, string[]][] = [
+  [/^aws$|amazon web services/i, ["Amazon Web Services (AWS)", "AWS", "Amazon Web Services"]],
+  [/^gcp$|google cloud/i, ["Google Cloud Platform (GCP)", "Google Cloud Platform", "GCP"]],
+  [/^azure$|microsoft azure/i, ["Microsoft Azure", "Azure"]],
+  [/^k8s$|^kubernetes$/i, ["Kubernetes"]],
+  [/^js$|^javascript$/i, ["JavaScript"]],
+  [/^ts$|^typescript$/i, ["TypeScript"]],
+  [/^golang$|^go$/i, ["Go (Programming Language)", "Go", "Golang"]],
+  [/^c#$|^csharp$/i, ["C# (Programming Language)", "C#"]],
+  [/^c\+\+$/i, ["C++ (Programming Language)", "C++"]],
+  [/^ci\/?cd$/i, ["Continuous Integration and Continuous Delivery (CI/CD)", "CI/CD", "Continuous Integration"]],
+  [/^ml$|^machine learning$/i, ["Machine Learning"]],
+  [/^ai$|^artificial intelligence$/i, ["Artificial Intelligence (AI)", "Artificial Intelligence"]],
+  [/^sql$/i, ["SQL (Programming Language)", "SQL"]],
+  [/^linkedin$/i, ["LinkedIn", "LinkedIn Jobs", "LinkedIn.com"]],
+];
+
+/** What to type for `wanted`: itself, its aliases, then the shorter forms (a shorter search finds more). */
+export function searchTerms(wanted: string): string[] {
+  const out = [wanted];
+  for (const [rx, alts] of MULTI_ALIASES) if (rx.test(wanted.trim())) out.push(...alts);
+  out.push(...searchVariants(wanted));
+  return [...new Set(out)].slice(0, 5);
 }
 
 /** Remove chips added since `before` that are not what was asked for (`term`: the search typed). */
@@ -269,48 +338,64 @@ async function dropWrongPicks(target: HTMLElement, before: number, wanted: strin
 /**
  * Multiselect with search (source, skills, phone code, school, field of
  * study, ethnicity). Hierarchical prompts are walked one level at a time.
+ * `path` names the option to take at each level of a folder-style list
+ * ("Social Media" → "LinkedIn"); `fallbackFirst` takes the first row of the
+ * last level when nothing matches; `noRetry` types `wanted` only.
  */
-export async function multiselectPick(target: HTMLElement, wanted: string, opts: { min?: number; fallbackFirst?: boolean } = {}): Promise<boolean> {
+export async function multiselectPick(
+  target: HTMLElement,
+  wanted: string,
+  opts: { min?: number; fallbackFirst?: boolean; path?: string[]; noRetry?: boolean } = {}
+): Promise<boolean> {
   const min = opts.min ?? 0.6;
   if (multiselectSelected(target).some((s) => similarity(wanted, s) >= 0.85)) return true;
   const input = q<HTMLInputElement>(sel("searchBox"), target) ?? q<HTMLInputElement>("input", target);
   if (!input) return false;
-  await humanClick(input);
-  setNativeValue(input, wanted);
+  const path = opts.path?.length ? opts.path : [wanted];
+  const terms = opts.noRetry || opts.path ? [path[0]] : searchTerms(wanted);
   const before = multiselectSelected(target).length;
-  // Workday searches on Enter (typing alone lists nothing); the text has to land first.
-  await sleep(200);
-  for (const t of ["keydown", "keypress", "keyup"])
-    input.dispatchEvent(new KeyboardEvent(t, { key: "Enter", code: "Enter", keyCode: 13, which: 13, bubbles: true }));
-  await sleep(250);
-  // Enter can select whatever row is highlighted (it picked "Accounting" for Field of Study).
-  if (!opts.fallbackFirst) await dropWrongPicks(target, before, wanted, "", min);
-  for (let depth = 0; depth < 3; depth++) {
-    await searchSettled();
-    const options = await waitFor(() => {
-      const o = visibleOptions();
-      return o.length ? o : null;
-    }, 4000).catch(() => [] as HTMLElement[]);
-    if (!options.length) break;
-    let match = bestMatch(options, wanted, min);
-    if (!match && opts.fallbackFirst) match = options[0];
-    if (!match) break;
-    const picked = text(match);
-    await humanClick(match);
-    await sleep(250);
-    if (!opts.fallbackFirst) await dropWrongPicks(target, before, picked, "", 0.85);
-    if (multiselectSelected(target).length > before || multiselectSelected(target).some((x) => similarity(picked, x) >= 0.85)) {
-      blur(input);
-      return true;
+  for (const term of terms) {
+    await humanClick(input);
+    // A folder-style list opens on a click; a search needs the text, then Enter (typing alone lists nothing).
+    setNativeValue(input, opts.path ? "" : term);
+    if (!opts.path) {
+      await sleep(150);
+      pressEnter(input);
     }
-    // Non-leaf: Workday drilled into a sub-list; loop picks again.
+    await sleep(250);
+    // Enter can select whatever row is highlighted (it picked "Accounting" for Field of Study).
+    if (!opts.path && !opts.fallbackFirst) await dropWrongPicks(target, before, wanted, term, min);
+    for (let depth = 0; depth < 3; depth++) {
+      const options = await settledOptions(depth ? 4000 : 6000);
+      if (!options.length) break;
+      const want = opts.path ? path[Math.min(depth, path.length - 1)] : wanted;
+      let match = bestMatch(options, want, min) ?? (term !== wanted ? bestMatch(options, term, Math.max(min, 0.85)) : null);
+      if (!match && opts.fallbackFirst && (!opts.path || depth >= path.length - 1)) match = options[0];
+      if (!match) break;
+      const picked = text(match);
+      if (ticked(match)) {
+        blur(input);
+        return true;
+      }
+      await humanClick(match);
+      await sleep(250);
+      if (spinning()) await settledOptions(3000);
+      if (!opts.path && !opts.fallbackFirst) await dropWrongPicks(target, before, picked, "", 0.85);
+      // A single-choice prompt (phone code) replaces its chip, so the count alone can't tell.
+      if (multiselectSelected(target).length > before || multiselectSelected(target).some((x) => similarity(picked, x) >= 0.85)) {
+        blur(input);
+        return true;
+      }
+      // Non-leaf: Workday drilled into a sub-list; loop picks again.
+    }
+    input.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+    await sleep(80);
   }
-  input.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
   // Leftover search text with no chip made Workday drop the whole entry on save.
   if (input.value) setNativeValue(input, "");
   blur(input);
   await sleep(80);
-  return multiselectSelected(target).some((s) => similarity(wanted, s) >= 0.6);
+  return multiselectSelected(target).length > before || multiselectSelected(target).some((s) => similarity(wanted, s) >= 0.6);
 }
 
 /**
@@ -459,13 +544,39 @@ export async function setDate(target: HTMLElement, ym: string): Promise<boolean>
   if (day && d) ok = (await setSegment(day, d)) && ok;
   if (year && y) ok = (await setSegment(year, y)) && ok;
   if (!month && !year) {
-    // Plain text date field fallback. Workday auto-inserts the slash: typing "12/" gives
-    // "Invalid Date", so digits only first (012023), with slashes only if that doesn't stick.
+    // Plain text date field fallback. A masked box (placeholder MM/YYYY) inserts the slash
+    // itself, so typing "12/" gives "Invalid Date": digits only there, slashes elsewhere,
+    // and the other form if Workday flags the first.
     const parts = [m, d, y].filter(Boolean);
-    return (await setText(target, parts.join(""))) || setText(target, parts.join("/"));
+    const input = target.matches("input") ? (target as HTMLInputElement) : q<HTMLInputElement>("input", target);
+    const masked = !!input && /mm|yyyy|dd/i.test(input.placeholder || input.getAttribute("aria-placeholder") || "");
+    if ((await setText(target, parts.join(masked ? "" : "/"))) && !invalidDate(target)) return true;
+    return (await setText(target, parts.join(masked ? "/" : ""))) && !invalidDate(target);
   }
   if (year) blur(year);
+  if (ok && invalidDate(target)) {
+    // Retype the digits once (Workday's own advice: select all and type the digits again).
+    if (month && m) {
+      setNativeValue(month, "");
+      ok = await setSegment(month, m);
+    }
+    if (year && y) {
+      setNativeValue(year, "");
+      ok = (await setSegment(year, y)) && ok;
+      blur(year);
+    }
+    await sleep(80);
+    ok = ok && !invalidDate(target);
+  }
   return ok;
+}
+
+/** Workday flags a bad date under the field: "Invalid Date", "Ungültiges Datum"… */
+function invalidDate(target: HTMLElement): boolean {
+  const c = target.closest<HTMLElement>('[data-automation-id^="formField-"]') ?? target;
+  return qa(sel("errorMessage"), c)
+    .filter(isVisible)
+    .some((e) => /invalid date|ungültiges datum|date non valide|date invalide|fecha no válida|fecha inválida|data non valida|data inválida|ongeldige datum|nieprawidłowa data/i.test(text(e)));
 }
 
 export function dateValue(target: HTMLElement): string {

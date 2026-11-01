@@ -864,6 +864,23 @@
     const t = text(b);
     return /^select one$|^select$/i.test(t) ? "" : t;
   }
+  function pressEnter(el) {
+    for (const t of ["keydown", "keypress", "keyup"]) {
+      const ev = new KeyboardEvent(t, { key: "Enter", code: "Enter", bubbles: true, cancelable: true, composed: true });
+      Object.defineProperty(ev, "keyCode", { get: () => 13 });
+      Object.defineProperty(ev, "which", { get: () => 13 });
+      el.dispatchEvent(ev);
+    }
+  }
+  function ticked(o) {
+    const row = o.closest('[role="option"], li, [data-automation-id="menuItem"], [data-automation-id="promptLeafNode"]') ?? o;
+    for (const el of [o, row]) {
+      if (el.getAttribute("aria-checked") === "true") return true;
+      const box = el.querySelector('input[type="checkbox"], [role="checkbox"]');
+      if (box && (box.checked === true || box.getAttribute("aria-checked") === "true")) return true;
+    }
+    return false;
+  }
   function key(el, k) {
     const code = k.length === 1 ? /\d/.test(k) ? `Digit${k}` : `Key${k.toUpperCase()}` : k;
     el.dispatchEvent(new KeyboardEvent("keydown", { key: k, code, bubbles: true, cancelable: true }));
@@ -953,9 +970,46 @@
   function visibleOptions() {
     return qa(sel("promptOption")).filter(isVisible);
   }
-  async function searchSettled() {
-    await waitFor(() => !qa(sel("spinner")).some(isVisible), 6e3, 100).catch(() => null);
-    await sleep(120);
+  function spinning() {
+    return qa(sel("spinner")).some(isVisible) || qa('[data-automation-id*="oading"], [aria-busy="true"]').some(isVisible);
+  }
+  async function settledOptions(timeout = 6e3) {
+    const end = Date.now() + timeout;
+    let last = "";
+    let stableSince = Date.now();
+    while (Date.now() < end) {
+      const o = visibleOptions();
+      const sig = o.map(text).join("|");
+      if (sig !== last) {
+        last = sig;
+        stableSince = Date.now();
+      }
+      if (o.length && !spinning() && Date.now() - stableSince >= 200) return o;
+      await sleep(100);
+    }
+    return visibleOptions();
+  }
+  var MULTI_ALIASES = [
+    [/^aws$|amazon web services/i, ["Amazon Web Services (AWS)", "AWS", "Amazon Web Services"]],
+    [/^gcp$|google cloud/i, ["Google Cloud Platform (GCP)", "Google Cloud Platform", "GCP"]],
+    [/^azure$|microsoft azure/i, ["Microsoft Azure", "Azure"]],
+    [/^k8s$|^kubernetes$/i, ["Kubernetes"]],
+    [/^js$|^javascript$/i, ["JavaScript"]],
+    [/^ts$|^typescript$/i, ["TypeScript"]],
+    [/^golang$|^go$/i, ["Go (Programming Language)", "Go", "Golang"]],
+    [/^c#$|^csharp$/i, ["C# (Programming Language)", "C#"]],
+    [/^c\+\+$/i, ["C++ (Programming Language)", "C++"]],
+    [/^ci\/?cd$/i, ["Continuous Integration and Continuous Delivery (CI/CD)", "CI/CD", "Continuous Integration"]],
+    [/^ml$|^machine learning$/i, ["Machine Learning"]],
+    [/^ai$|^artificial intelligence$/i, ["Artificial Intelligence (AI)", "Artificial Intelligence"]],
+    [/^sql$/i, ["SQL (Programming Language)", "SQL"]],
+    [/^linkedin$/i, ["LinkedIn", "LinkedIn Jobs", "LinkedIn.com"]]
+  ];
+  function searchTerms(wanted) {
+    const out = [wanted];
+    for (const [rx2, alts] of MULTI_ALIASES) if (rx2.test(wanted.trim())) out.push(...alts);
+    out.push(...searchVariants(wanted));
+    return [...new Set(out)].slice(0, 5);
   }
   async function dropWrongPicks(target, before, wanted, term, min) {
     const items = qa(sel("selectedItem"), target);
@@ -973,38 +1027,46 @@
     if (multiselectSelected(target).some((s) => similarity(wanted, s) >= 0.85)) return true;
     const input = q(sel("searchBox"), target) ?? q("input", target);
     if (!input) return false;
-    await humanClick(input);
-    setNativeValue(input, wanted);
+    const path = opts.path?.length ? opts.path : [wanted];
+    const terms = opts.noRetry || opts.path ? [path[0]] : searchTerms(wanted);
     const before = multiselectSelected(target).length;
-    await sleep(200);
-    for (const t of ["keydown", "keypress", "keyup"])
-      input.dispatchEvent(new KeyboardEvent(t, { key: "Enter", code: "Enter", keyCode: 13, which: 13, bubbles: true }));
-    await sleep(250);
-    if (!opts.fallbackFirst) await dropWrongPicks(target, before, wanted, "", min);
-    for (let depth = 0; depth < 3; depth++) {
-      await searchSettled();
-      const options = await waitFor(() => {
-        const o = visibleOptions();
-        return o.length ? o : null;
-      }, 4e3).catch(() => []);
-      if (!options.length) break;
-      let match = bestMatch(options, wanted, min);
-      if (!match && opts.fallbackFirst) match = options[0];
-      if (!match) break;
-      const picked = text(match);
-      await humanClick(match);
-      await sleep(250);
-      if (!opts.fallbackFirst) await dropWrongPicks(target, before, picked, "", 0.85);
-      if (multiselectSelected(target).length > before || multiselectSelected(target).some((x) => similarity(picked, x) >= 0.85)) {
-        blur(input);
-        return true;
+    for (const term of terms) {
+      await humanClick(input);
+      setNativeValue(input, opts.path ? "" : term);
+      if (!opts.path) {
+        await sleep(150);
+        pressEnter(input);
       }
+      await sleep(250);
+      if (!opts.path && !opts.fallbackFirst) await dropWrongPicks(target, before, wanted, term, min);
+      for (let depth = 0; depth < 3; depth++) {
+        const options = await settledOptions(depth ? 4e3 : 6e3);
+        if (!options.length) break;
+        const want = opts.path ? path[Math.min(depth, path.length - 1)] : wanted;
+        let match = bestMatch(options, want, min) ?? (term !== wanted ? bestMatch(options, term, Math.max(min, 0.85)) : null);
+        if (!match && opts.fallbackFirst && (!opts.path || depth >= path.length - 1)) match = options[0];
+        if (!match) break;
+        const picked = text(match);
+        if (ticked(match)) {
+          blur(input);
+          return true;
+        }
+        await humanClick(match);
+        await sleep(250);
+        if (spinning()) await settledOptions(3e3);
+        if (!opts.path && !opts.fallbackFirst) await dropWrongPicks(target, before, picked, "", 0.85);
+        if (multiselectSelected(target).length > before || multiselectSelected(target).some((x) => similarity(picked, x) >= 0.85)) {
+          blur(input);
+          return true;
+        }
+      }
+      input.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+      await sleep(80);
     }
-    input.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
     if (input.value) setNativeValue(input, "");
     blur(input);
     await sleep(80);
-    return multiselectSelected(target).some((s) => similarity(wanted, s) >= 0.6);
+    return multiselectSelected(target).length > before || multiselectSelected(target).some((s) => similarity(wanted, s) >= 0.6);
   }
   function searchVariants(value) {
     const out = [value];
@@ -1129,10 +1191,30 @@
     if (year && y) ok = await setSegment(year, y) && ok;
     if (!month && !year) {
       const parts = [m, d, y].filter(Boolean);
-      return await setText(target, parts.join("")) || setText(target, parts.join("/"));
+      const input = target.matches("input") ? target : q("input", target);
+      const masked = !!input && /mm|yyyy|dd/i.test(input.placeholder || input.getAttribute("aria-placeholder") || "");
+      if (await setText(target, parts.join(masked ? "" : "/")) && !invalidDate(target)) return true;
+      return await setText(target, parts.join(masked ? "/" : "")) && !invalidDate(target);
     }
     if (year) blur(year);
+    if (ok && invalidDate(target)) {
+      if (month && m) {
+        setNativeValue(month, "");
+        ok = await setSegment(month, m);
+      }
+      if (year && y) {
+        setNativeValue(year, "");
+        ok = await setSegment(year, y) && ok;
+        blur(year);
+      }
+      await sleep(80);
+      ok = ok && !invalidDate(target);
+    }
     return ok;
+  }
+  function invalidDate(target) {
+    const c = target.closest('[data-automation-id^="formField-"]') ?? target;
+    return qa(sel("errorMessage"), c).filter(isVisible).some((e) => /invalid date|ungültiges datum|date non valide|date invalide|fecha no válida|fecha inválida|data non valida|data inválida|ongeldige datum|nieprawidłowa data/i.test(text(e)));
   }
   function dateValue(target) {
     const y = q(sel("dateYear"), target)?.value ?? "";
@@ -1265,6 +1347,14 @@
     for (const [rx2, kind] of STEP_RX) if (rx2.test(name)) return kind;
     return null;
   }
+  function authEmailInput() {
+    const byId = q(sel("email"));
+    if (byId && isVisible(byId)) return byId;
+    return qa('input[type="email"], input[autocomplete~="email" i], input[autocomplete="username"], input[name*="email" i], input[id*="email" i], input[aria-label*="email" i]').find((i) => isVisible(i) && i.type !== "password" && i.type !== "hidden") ?? null;
+  }
+  function authPasswordInputs() {
+    return qa('input[type="password"]').filter(isVisible);
+  }
   function detectPage() {
     const body = text(document.body).slice(0, 5e3);
     const next = nextButton();
@@ -1274,6 +1364,11 @@
     if (anyAid("verifyPassword") || anyAid("createAccountSubmit")) return "createAccount";
     if (anyAid("signInSubmit") || anyAid("password") && anyAid("email")) return "signIn";
     if (anyAid("signInWithEmail") && !anyAid("progressActive")) return "signIn";
+    if (!anyAid("progressActive")) {
+      const pws = authPasswordInputs();
+      if (pws.length >= 2) return "createAccount";
+      if (pws.length === 1 && authEmailInput()) return "signIn";
+    }
     if (!anyAid("password") && !next && qa('button, [role="button"], a').some((b) => isVisible(b) && SIGN_IN_WITH_EMAIL_RX.test(text(b) || b.getAttribute("aria-label") || "")))
       return "signIn";
     if (VERIFY_EMAIL_RX.test(body) && !anyAid("password") && !next)
@@ -1582,7 +1677,7 @@
     ).some(isVisible);
   }
   function typedEmail() {
-    const v = (byAid("email")?.value || "").trim();
+    const v = ((byAid("email") ?? authEmailInput())?.value || "").trim();
     return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(v) ? v : "";
   }
   function emailFor(ctx, creds) {
@@ -1643,8 +1738,8 @@
     }
     ctx.run.authAttempts++;
     await ctx.save();
-    const email = byAid("email");
-    const pw = byAid("password");
+    const email = byAid("email") ?? authEmailInput();
+    const pw = byAid("password") ?? authPasswordInputs()[0] ?? null;
     if (!email || !pw) throw new NeedsHuman("Sign-in form fields not found.");
     await setText(email, cred.email || emailFor(ctx, creds));
     await pace(ctx);
@@ -1733,9 +1828,10 @@
     }
     ctx.run.createAttempts++;
     await ctx.save();
-    const emailEl = byAid("email");
-    const pw = byAid("password");
-    const verify = byAid("verifyPassword");
+    const pws = authPasswordInputs();
+    const emailEl = byAid("email") ?? authEmailInput();
+    const pw = byAid("password") ?? pws[0] ?? null;
+    const verify = byAid("verifyPassword") ?? (pws[1] && pws[1] !== pw ? pws[1] : null);
     if (!emailEl || !pw) throw new NeedsHuman("Create-account form fields not found.");
     await setText(emailEl, email);
     await pace(ctx);
@@ -1979,13 +2075,29 @@ OPTIONS: ${JSON.stringify(options.slice(0, 150))}`
       return false;
     }
   }
+  var touched = /* @__PURE__ */ new WeakSet();
+  if (typeof document !== "undefined") {
+    const mark = (e) => {
+      if (!e.isTrusted) return;
+      const c = e.target?.closest?.('[data-automation-id^="formField-"]');
+      if (c) touched.add(c);
+    };
+    for (const t of ["keydown", "mousedown", "paste"]) document.addEventListener(t, mark, true);
+  }
+  var TENANT_DEFAULTS = /* @__PURE__ */ new Set(["country", "phoneCode", "phoneType"]);
+  var skillsTried = /* @__PURE__ */ new Set();
+  function caseOnly(a, b) {
+    return a !== b && a.trim().toLowerCase() === b.trim().toLowerCase();
+  }
   async function fill(ctx, key2, value, root2 = document) {
     const el = field(key2, root2);
     if (!el) return false;
     const c = containerOf(el);
     handled.add(c);
     if (!value) return false;
-    if (hooks.keepExisting?.() && readValue(kindOf(c) === "none" ? el : c)) return true;
+    const existing = readValue(kindOf(c) === "none" ? el : c);
+    const keep = existing && (touched.has(c) || !TENANT_DEFAULTS.has(key2) && !caseOnly(existing, value));
+    if (hooks.keepExisting?.() && keep) return true;
     await pace(ctx);
     let ok = await writeValue(kindOf(c) === "none" ? el : c, value).catch((e) => {
       if (e instanceof NeedsHuman) return false;
@@ -2094,6 +2206,73 @@ OPTIONS: ${JSON.stringify(options.slice(0, 150))}`
     const rx2 = which === "start" ? /^(from|start|first year|von|beginn|de$|du|début|desde|inicio|início|da$|dal|inizio|van|begin|od|開始|开始)/iu : /^(to|end|last year|graduation|bis|ende|à$|au|fin|hasta|até|término|a$|al|fine|tot|eind|do|終了|结束)/iu;
     return qa('[data-automation-id^="formField-"]', block).find((c) => isVisible(c) && rx2.test(labelOf(c)) && kindOf(c) === "date") ?? null;
   }
+  function nationalNumber(raw, countryCode = "") {
+    const s = String(raw || "").trim();
+    const cc = countryCode.replace(/\D/g, "");
+    let d = s.replace(/\D/g, "");
+    const international = /^(\+|00)/.test(s);
+    if (international && s.startsWith("00")) d = d.slice(2);
+    if (international && cc && d.startsWith(cc)) d = d.slice(cc.length);
+    else if (international) {
+      const m = s.match(/^\(?(?:\+|00)\s*(\d{1,3})\)?[\s.\-)]/);
+      if (m) d = d.slice(m[1].length);
+    }
+    if (cc !== "39") d = d.replace(/^0+/, "");
+    return d;
+  }
+  async function sourceFallback(ctx, c) {
+    const src = ctx.profile.answers.source;
+    const paths = [
+      [["Social Media", src], false],
+      [["Social Networking", src], false],
+      [["Social Network", src], false],
+      [["Job Board", src], false],
+      [["Online Job Board", src], false],
+      [["Internet", src], false],
+      [["Job Board", "Other"], true],
+      [["Online Job Board", "Other"], true],
+      [["Job Posting", "Other"], true],
+      [["Website", "Other"], true]
+    ];
+    if (kindOf(c) === "multiselect") {
+      for (const [path, fallbackFirst] of paths) {
+        if (await multiselectPick(c, path[path.length - 1], { path, min: 0.75, fallbackFirst })) return true;
+      }
+    }
+    for (const v of ["Job Board", "Online Job Board", "Social Media", "Internet", "Website"]) if (await selectDropdown(c, v, 0.75)) return true;
+    return false;
+  }
+  var SPECIALISED_DEGREE_RX = /\b(m\.?\s?p\.?\s?h|public health|m\.?\s?b\.?\s?a|business admin|m\.?\s?f\.?\s?a|b\.?\s?f\.?\s?a|fine arts|m\.?\s?s\.?\s?w|b\.?\s?s\.?\s?w|social work|m\.?\s?ed\b|b\.?\s?ed\b|of education|m\.?\s?p\.?\s?a|public admin|ll\.?\s?[bm]\b|of laws|m\.?\s?arch|b\.?\s?arch|architecture|m\.?\s?d\b|medicine|m\.?\s?p\.?\s?p|public policy|m\.?\s?div|divinity|m\.?\s?h\.?\s?a|health admin|m\.?\s?s\.?\s?n|b\.?\s?s\.?\s?n|nursing|music|m\.?\s?a\.?\s?t\b|teaching|physical therapy|pharm|dental|veterinar|j\.?\s?d\b|juris)/i;
+  function degreeLevel(t) {
+    const s = t.toLowerCase();
+    if (/\b(ph\.?\s?d|doctor|doctorate|d\.?\s?phil)/.test(s)) return "doctor";
+    if (/\bmaster|\bm\.?\s?sc?\b|\bm\.?\s?a\b|\bm\.?\s?eng\b|\bm\.?\s?res\b|\bmba\b|\bmph\b|\bm\.?\s?s\.?\b/.test(s)) return "master";
+    if (/\bbachelor|\bb\.?\s?sc?\b|\bb\.?\s?a\b|\bb\.?\s?eng\b|\bb\.?\s?s\.?\b|undergraduate/.test(s)) return "bachelor";
+    if (/\bassociate/.test(s)) return "associate";
+    return "";
+  }
+  function pickDegreeOption(options, wanted) {
+    const w = String(wanted || "").trim();
+    const lvl = degreeLevel(w);
+    const generic = /^(master'?s?|masters|bachelor'?s?|bachelors|doctorate|ph\.?\s?d|associate'?s?)(\s+degree)?$/i.test(w) || /^(m\.?\s?sc?|b\.?\s?sc?|m\.?\s?a|b\.?\s?a|m\.?\s?eng|b\.?\s?eng)\.?$/i.test(w);
+    if (!lvl || !generic) return null;
+    const arts = /^(m|b)\.?\s?a\.?$/i.test(w);
+    let best = null;
+    let top = -1;
+    for (const o of options) {
+      if (degreeLevel(o) !== lvl || SPECIALISED_DEGREE_RX.test(o)) continue;
+      const plain = o.replace(/\(.*?\)/g, "").trim();
+      let sc = 0;
+      if (/^(master|bachelor|doctor|associate)'?s?(\s+degree)?$/i.test(plain) || /'?s degree$/i.test(plain)) sc += 3;
+      if (/science|\b[mb]\.?\s?s\.?c?\b/i.test(o)) sc += arts ? 1 : 2;
+      if (/\barts?\b|\b[mb]\.?\s?a\b/i.test(o)) sc += arts ? 2 : 0;
+      if (sc > top) {
+        top = sc;
+        best = o;
+      }
+    }
+    return best;
+  }
   async function myInformation(ctx) {
     const me = ctx.profile.personal;
     const sourceEl = field("source");
@@ -2103,15 +2282,7 @@ OPTIONS: ${JSON.stringify(options.slice(0, 150))}`
       const want = ctx.profile.answers.source;
       if (!readValue(c) && want) {
         await pace(ctx);
-        let ok = await multiselectPick(c, want) || await selectDropdown(c, want);
-        for (const folder of ["Social Media", "Social Network", "Job Board", "Online Job Board", "Internet", "Website"]) {
-          if (ok) break;
-          if (kindOf(c) === "multiselect" && await multiselectPick(c, folder, { min: 0.7 })) {
-            ok = true;
-            break;
-          }
-          ok = await selectDropdown(c, folder, 0.7);
-        }
+        const ok = await multiselectPick(c, want) || await selectDropdown(c, want) || await sourceFallback(ctx, c);
         if (ok) ctx.log(`How did you hear → ${readValue(c) || want}`);
         else if (isRequired(c)) ctx.flag(labelOf(c) || "How did you hear about us", `No option like "${want}"`);
       }
@@ -2159,10 +2330,7 @@ OPTIONS: ${JSON.stringify(options.slice(0, 150))}`
         if (!ok) ctx.flag("Country Phone Code", `No option like "${want}"`);
       }
     }
-    const dial = me.phone.countryCode.replace(/\D/g, "");
-    let national = me.phone.number.replace(/\D/g, "");
-    if (dial && me.phone.number.trim().startsWith("+") && national.startsWith(dial)) national = national.slice(dial.length);
-    await fill(ctx, "phoneNumber", national.replace(/^0+/, ""));
+    await fill(ctx, "phoneNumber", nationalNumber(me.phone.number, me.phone.countryCode));
     const email = field("email");
     if (email && !readValue(containerOf(email))) await fill(ctx, "email", me.email);
   }
@@ -2203,7 +2371,13 @@ OPTIONS: ${JSON.stringify(options.slice(0, 150))}`
       }
       if (!ok) ctx.flag(`School: ${e.school}`, "Not in the tenant's school list");
     }
-    await fill(ctx, "degreeF", e.degree, block);
+    let degree = e.degree;
+    const degEl = field("degreeF", block);
+    if (degEl && degree && kindOf(containerOf(degEl)) === "dropdown") {
+      const pick2 = pickDegreeOption(await optionsOf(containerOf(degEl)).catch(() => []), degree);
+      if (pick2) degree = pick2;
+    }
+    await fill(ctx, "degreeF", degree, block);
     const fos = field("fieldF", block);
     if (fos && e.field) {
       const c = containerOf(fos);
@@ -2328,22 +2502,22 @@ OPTIONS: ${JSON.stringify(options.slice(0, 150))}`
     if (skillsEl) {
       const c = containerOf(skillsEl);
       handled.add(c);
-      const list = (ctx.docs?.tailored?.skills ?? p.skills).slice(0, ctx.settings.maxSkills);
+      const max = Math.min(10, ctx.settings.maxSkills || 10);
+      const list = (ctx.docs?.tailored?.skills ?? p.skills).slice(0, max);
       let added = 0;
       for (const s of list) {
+        if (multiselectSelected(c).length >= max) break;
+        const key2 = location.pathname + "|" + s.toLowerCase();
+        if (skillsTried.has(key2)) continue;
+        skillsTried.add(key2);
         if (multiselectSelected(c).some((x) => similarity(x, s) >= 0.85)) continue;
         await pace(ctx);
-        for (const v of searchVariants(s)) {
-          if (await multiselectPick(c, v, { min: 0.75 })) {
-            added++;
-            break;
-          }
-        }
+        if (await multiselectPick(c, s, { min: 0.75 })) added++;
       }
       ctx.log(`Skills: ${added} added`);
     }
     await uploadDocuments(ctx);
-    const sites = [p.personal.website, p.personal.github].filter(Boolean);
+    const sites = [field("linkedin") ? "" : p.personal.linkedin, p.personal.github, p.personal.website].filter(Boolean);
     const web = section("webSection", /^(websites?|webseiten?|sites? web|sitios web|sites|siti web|websites?|strony)/iu);
     if (web && sites.length) {
       const bs = await ensureBlockCount(ctx, web, "urlF", sites.length);

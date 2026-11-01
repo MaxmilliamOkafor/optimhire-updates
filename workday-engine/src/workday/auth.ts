@@ -14,7 +14,7 @@
  */
 import { NeedsHuman, buttonByText, byAid, humanClick, isVisible, qa, sleep, text, waitStable } from "./dom.js";
 import { setCheckbox, setText } from "./controls.js";
-import { errorMessages } from "./detect.js";
+import { authEmailInput, authPasswordInputs, errorMessages } from "./detect.js";
 import { sel } from "./selectors.js";
 import { pace, type Ctx } from "./context.js";
 import { ACCOUNT_EXISTS_RX, AUTH_FAILED_RX, CREATE_ACCOUNT_TEXT_RX, LOCKED_RX, SIGN_IN_TEXT_RX, SIGN_IN_WITH_EMAIL_RX, VERIFY_EMAIL_RX } from "./i18n.js";
@@ -105,7 +105,7 @@ function captchaPresent(): boolean {
  *  filler). A fresh install has no saved Workday login and, before its first OptimHire job, no
  *  e-mail in its profile — and stopped with "Add your email" while the box showed it. */
 function typedEmail(): string {
-  const v = ((byAid("email") as HTMLInputElement | null)?.value || "").trim();
+  const v = (((byAid("email") ?? authEmailInput()) as HTMLInputElement | null)?.value || "").trim();
   return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(v) ? v : "";
 }
 
@@ -178,8 +178,9 @@ export async function handleSignIn(ctx: Ctx): Promise<void> {
 
   ctx.run.authAttempts++;
   await ctx.save();
-  const email = byAid("email");
-  const pw = byAid("password");
+  // Some tenants' boxes carry no automation ids (NVIDIA, F5, Cisco): the visible email and password boxes.
+  const email = byAid("email") ?? authEmailInput();
+  const pw = byAid("password") ?? authPasswordInputs()[0] ?? null;
   if (!email || !pw) throw new NeedsHuman("Sign-in form fields not found.");
   await setText(email, cred.email || emailFor(ctx, creds));
   await pace(ctx);
@@ -279,9 +280,10 @@ export async function handleCreateAccount(ctx: Ctx): Promise<void> {
 
   ctx.run.createAttempts++;
   await ctx.save();
-  const emailEl = byAid("email");
-  const pw = byAid("password");
-  const verify = byAid("verifyPassword");
+  const pws = authPasswordInputs();
+  const emailEl = byAid("email") ?? authEmailInput();
+  const pw = byAid("password") ?? pws[0] ?? null;
+  const verify = byAid("verifyPassword") ?? (pws[1] && pws[1] !== pw ? pws[1] : null);
   if (!emailEl || !pw) throw new NeedsHuman("Create-account form fields not found.");
   await setText(emailEl, email);
   await pace(ctx);

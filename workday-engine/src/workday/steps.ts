@@ -28,7 +28,6 @@ import {
   optionLabel,
   optionsOf,
   readValue,
-  searchVariants,
   selectDropdown,
   selectRadio,
   setCheckbox,
@@ -79,13 +78,37 @@ async function translateChoice(ctx: Ctx, c: HTMLElement, value: string): Promise
   }
 }
 
+/** Fields a person typed in or picked from (trusted events only): kept as they are. */
+const touched = new WeakSet<HTMLElement>();
+if (typeof document !== "undefined") {
+  const mark = (e: Event) => {
+    if (!e.isTrusted) return;
+    const c = (e.target as HTMLElement | null)?.closest?.<HTMLElement>('[data-automation-id^="formField-"]');
+    if (c) touched.add(c);
+  };
+  for (const t of ["keydown", "mousedown", "paste"]) document.addEventListener(t, mark, true);
+}
+
+/** Values a tenant pre-selects that are wrong for you unless you chose them: Country defaults
+ *  to "United States of America" on some sites, and the phone code and device type follow it. */
+const TENANT_DEFAULTS = new Set<AidKey>(["country", "phoneCode", "phoneType"]);
+/** Skills already tried on this page (path|skill), so no pass repeats them. */
+const skillsTried = new Set<string>();
+
+/** Same text, different case ("MAXMILLIAM" from a CV parse): never what you meant. */
+function caseOnly(a: string, b: string): boolean {
+  return a !== b && a.trim().toLowerCase() === b.trim().toLowerCase();
+}
+
 async function fill(ctx: Ctx, key: AidKey, value: string | undefined, root: ParentNode = document): Promise<boolean> {
   const el = field(key, root);
   if (!el) return false;
   const c = containerOf(el);
   handled.add(c);
   if (!value) return false;
-  if (hooks.keepExisting?.() && readValue(kindOf(c) === "none" ? el : c)) return true; // [oh] yours stays
+  const existing = readValue(kindOf(c) === "none" ? el : c);
+  const keep = existing && (touched.has(c) || (!TENANT_DEFAULTS.has(key) && !caseOnly(existing, value)));
+  if (hooks.keepExisting?.() && keep) return true; // [oh] yours stays
   await pace(ctx);
   let ok = await writeValue(kindOf(c) === "none" ? el : c, value).catch((e) => {
     if (e instanceof NeedsHuman) return false;
@@ -228,6 +251,93 @@ function dateContainer(block: HTMLElement, which: "start" | "end"): HTMLElement 
 
 /* ---------------- My Information ---------------- */
 
+/**
+ * The number as Workday wants it beside a Country Phone Code: digits only, without the
+ * country code or the trunk 0 ("+353 087 426 1508" → "874261508"). Italy (+39) keeps its
+ * leading 0, which is part of the number there.
+ */
+export function nationalNumber(raw: string, countryCode = ""): string {
+  const s = String(raw || "").trim();
+  const cc = countryCode.replace(/\D/g, "");
+  let d = s.replace(/\D/g, "");
+  const international = /^(\+|00)/.test(s);
+  if (international && s.startsWith("00")) d = d.slice(2);
+  if (international && cc && d.startsWith(cc)) d = d.slice(cc.length);
+  else if (international) {
+    // No code to compare with: drop the code written before the first separator ("+44 7700…").
+    const m = s.match(/^\(?(?:\+|00)\s*(\d{1,3})\)?[\s.\-)]/);
+    if (m) d = d.slice(m[1].length);
+  }
+  if (cc !== "39") d = d.replace(/^0+/, "");
+  return d;
+}
+
+/**
+ * "How did you hear about us?" on tenants with a folder-style list (Mastercard, Workday): open
+ * the category your source sits in, then the source; failing that, a job board ("LinkedIn,
+ * else Job Board").
+ */
+async function sourceFallback(ctx: Ctx, c: HTMLElement): Promise<boolean> {
+  const src = ctx.profile.answers.source;
+  const paths: [string[], boolean][] = [
+    [["Social Media", src], false],
+    [["Social Networking", src], false],
+    [["Social Network", src], false],
+    [["Job Board", src], false],
+    [["Online Job Board", src], false],
+    [["Internet", src], false],
+    [["Job Board", "Other"], true],
+    [["Online Job Board", "Other"], true],
+    [["Job Posting", "Other"], true],
+    [["Website", "Other"], true],
+  ];
+  if (kindOf(c) === "multiselect") {
+    for (const [path, fallbackFirst] of paths) {
+      if (await multiselectPick(c, path[path.length - 1], { path, min: 0.75, fallbackFirst })) return true;
+    }
+  }
+  for (const v of ["Job Board", "Online Job Board", "Social Media", "Internet", "Website"]) if (await selectDropdown(c, v, 0.75)) return true;
+  return false;
+}
+
+/* "Masters" picked "M.P.H. (Master's Public Health)": the closest text, and the wrong degree.
+   A generic level ("Masters", "Master's", "MSc", "Bachelors") takes the plain option of that
+   level, or Master/Bachelor of Science, never a specialised one. A specific degree is matched
+   as written. */
+const SPECIALISED_DEGREE_RX = /\b(m\.?\s?p\.?\s?h|public health|m\.?\s?b\.?\s?a|business admin|m\.?\s?f\.?\s?a|b\.?\s?f\.?\s?a|fine arts|m\.?\s?s\.?\s?w|b\.?\s?s\.?\s?w|social work|m\.?\s?ed\b|b\.?\s?ed\b|of education|m\.?\s?p\.?\s?a|public admin|ll\.?\s?[bm]\b|of laws|m\.?\s?arch|b\.?\s?arch|architecture|m\.?\s?d\b|medicine|m\.?\s?p\.?\s?p|public policy|m\.?\s?div|divinity|m\.?\s?h\.?\s?a|health admin|m\.?\s?s\.?\s?n|b\.?\s?s\.?\s?n|nursing|music|m\.?\s?a\.?\s?t\b|teaching|physical therapy|pharm|dental|veterinar|j\.?\s?d\b|juris)/i;
+function degreeLevel(t: string): string {
+  const s = t.toLowerCase();
+  if (/\b(ph\.?\s?d|doctor|doctorate|d\.?\s?phil)/.test(s)) return "doctor";
+  if (/\bmaster|\bm\.?\s?sc?\b|\bm\.?\s?a\b|\bm\.?\s?eng\b|\bm\.?\s?res\b|\bmba\b|\bmph\b|\bm\.?\s?s\.?\b/.test(s)) return "master";
+  if (/\bbachelor|\bb\.?\s?sc?\b|\bb\.?\s?a\b|\bb\.?\s?eng\b|\bb\.?\s?s\.?\b|undergraduate/.test(s)) return "bachelor";
+  if (/\bassociate/.test(s)) return "associate";
+  return "";
+}
+export function pickDegreeOption(options: string[], wanted: string): string | null {
+  const w = String(wanted || "").trim();
+  const lvl = degreeLevel(w);
+  const generic =
+    /^(master'?s?|masters|bachelor'?s?|bachelors|doctorate|ph\.?\s?d|associate'?s?)(\s+degree)?$/i.test(w) ||
+    /^(m\.?\s?sc?|b\.?\s?sc?|m\.?\s?a|b\.?\s?a|m\.?\s?eng|b\.?\s?eng)\.?$/i.test(w);
+  if (!lvl || !generic) return null;
+  const arts = /^(m|b)\.?\s?a\.?$/i.test(w);
+  let best: string | null = null;
+  let top = -1;
+  for (const o of options) {
+    if (degreeLevel(o) !== lvl || SPECIALISED_DEGREE_RX.test(o)) continue;
+    const plain = o.replace(/\(.*?\)/g, "").trim();
+    let sc = 0;
+    if (/^(master|bachelor|doctor|associate)'?s?(\s+degree)?$/i.test(plain) || /'?s degree$/i.test(plain)) sc += 3;
+    if (/science|\b[mb]\.?\s?s\.?c?\b/i.test(o)) sc += arts ? 1 : 2;
+    if (/\barts?\b|\b[mb]\.?\s?a\b/i.test(o)) sc += arts ? 2 : 0;
+    if (sc > top) {
+      top = sc;
+      best = o;
+    }
+  }
+  return best;
+}
+
 export async function myInformation(ctx: Ctx): Promise<void> {
   const me = ctx.profile.personal;
   const sourceEl = field("source");
@@ -237,17 +347,7 @@ export async function myInformation(ctx: Ctx): Promise<void> {
     const want = ctx.profile.answers.source;
     if (!readValue(c) && want) {
       await pace(ctx);
-      let ok = (await multiselectPick(c, want)) || (await selectDropdown(c, want));
-      // Folder-style lists (Mastercard, Workday): the site sits under a category — open it, then
-      // pick the site; else the category itself ("LinkedIn, else Job Board").
-      for (const folder of ["Social Media", "Social Network", "Job Board", "Online Job Board", "Internet", "Website"]) {
-        if (ok) break;
-        if (kindOf(c) === "multiselect" && (await multiselectPick(c, folder, { min: 0.7 }))) {
-          ok = true;
-          break;
-        }
-        ok = await selectDropdown(c, folder, 0.7);
-      }
+      const ok = (await multiselectPick(c, want)) || (await selectDropdown(c, want)) || (await sourceFallback(ctx, c));
       if (ok) ctx.log(`How did you hear → ${readValue(c) || want}`);
       else if (isRequired(c)) ctx.flag(labelOf(c) || "How did you hear about us", `No option like "${want}"`);
     }
@@ -301,10 +401,7 @@ export async function myInformation(ctx: Ctx): Promise<void> {
     }
   }
   // Workday wants the national number: no country code, no spaces, no leading 0 (874261508 with +353).
-  const dial = me.phone.countryCode.replace(/\D/g, "");
-  let national = me.phone.number.replace(/\D/g, "");
-  if (dial && me.phone.number.trim().startsWith("+") && national.startsWith(dial)) national = national.slice(dial.length);
-  await fill(ctx, "phoneNumber", national.replace(/^0+/, ""));
+  await fill(ctx, "phoneNumber", nationalNumber(me.phone.number, me.phone.countryCode));
   const email = field("email");
   if (email && !readValue(containerOf(email))) await fill(ctx, "email", me.email);
 }
@@ -349,7 +446,13 @@ async function fillEducation(ctx: Ctx, block: HTMLElement, e: EducationEntry) {
     }
     if (!ok) ctx.flag(`School: ${e.school}`, "Not in the tenant's school list");
   }
-  await fill(ctx, "degreeF", e.degree, block);
+  let degree = e.degree;
+  const degEl = field("degreeF", block);
+  if (degEl && degree && kindOf(containerOf(degEl)) === "dropdown") {
+    const pick = pickDegreeOption(await optionsOf(containerOf(degEl)).catch(() => [] as string[]), degree);
+    if (pick) degree = pick;
+  }
+  await fill(ctx, "degreeF", degree, block);
   const fos = field("fieldF", block);
   if (fos && e.field) {
     const c = containerOf(fos);
@@ -487,25 +590,28 @@ export async function myExperience(ctx: Ctx): Promise<void> {
   if (skillsEl) {
     const c = containerOf(skillsEl);
     handled.add(c);
-    const list = (ctx.docs?.tailored?.skills ?? p.skills).slice(0, ctx.settings.maxSkills);
+    // Hard stop at 10, counting skills already in the box, and each skill tried once per page:
+    // re-running the list on every pass added skills without end.
+    const max = Math.min(10, ctx.settings.maxSkills || 10);
+    const list = (ctx.docs?.tailored?.skills ?? p.skills).slice(0, max);
     let added = 0;
     for (const s of list) {
+      if (multiselectSelected(c).length >= max) break;
+      const key = location.pathname + "|" + s.toLowerCase();
+      if (skillsTried.has(key)) continue;
+      skillsTried.add(key);
       if (multiselectSelected(c).some((x) => similarity(x, s) >= 0.85)) continue;
       await pace(ctx);
-      // A slow or empty result list: try the shorter forms (AWS for "Amazon Web Services (AWS)").
-      for (const v of searchVariants(s)) {
-        if (await multiselectPick(c, v, { min: 0.75 })) {
-          added++;
-          break;
-        }
-      }
+      // multiselectPick also tries other names and shorter forms (AWS for "Amazon Web Services (AWS)").
+      if (await multiselectPick(c, s, { min: 0.75 })) added++;
     }
     ctx.log(`Skills: ${added} added`);
   }
 
   await uploadDocuments(ctx);
 
-  const sites = [p.personal.website, p.personal.github].filter(Boolean);
+  // No LinkedIn box on this tenant: LinkedIn goes in Websites, first.
+  const sites = [field("linkedin") ? "" : p.personal.linkedin, p.personal.github, p.personal.website].filter(Boolean);
   const web = section("webSection", /^(websites?|webseiten?|sites? web|sitios web|sites|siti web|websites?|strony)/iu);
   if (web && sites.length) {
     const bs = await ensureBlockCount(ctx, web, "urlF", sites.length);
