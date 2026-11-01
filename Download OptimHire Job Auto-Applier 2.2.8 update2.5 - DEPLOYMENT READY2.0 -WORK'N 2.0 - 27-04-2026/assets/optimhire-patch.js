@@ -6145,8 +6145,9 @@
         } catch (_) { /* cross-origin — expected */ }
       } catch (_) {}
 
-      // After 8 seconds, if iframe is still present and we're not actively filling, force-skip
-      await sleep(8000);
+      // After 25 seconds, if iframe is still present and we're not actively filling, force-skip
+      // (was 8 s — OptimHire is often still writing the answers in it by then)
+      await sleep(25000);
       const still = document.getElementById(IFRAME_ID);
       if (still) {
         if (_fillActive || (_submitAttempted && Date.now() - _submitAttemptTs < 30_000)) {
@@ -6154,7 +6155,7 @@
           _skipScheduled = false;
           return;
         }
-        LOG('Missing-details iframe still present after 8s — force-skipping');
+        LOG('Missing-details iframe still present after 25s — force-skipping');
         await requestSkipCurrent('missing-details iframe stuck');
         // Also remove the iframe so the page is unblocked
         try {
@@ -6258,7 +6259,7 @@
        ones were OptimHire's resume screen counting down — now pressed at
        once); Workday's many pages plus signing in get longer. */
     const JOB_CAP_MS = /myworkday(jobs|site)\.com$|workday\.com$/i.test(location.hostname) ? 480_000 : 180_000;
-    let _capKey = '', _capStartTs = 0;
+    let _capKey = '', _capStartTs = 0, _beatTs = 0;
 
     async function checkStuck() {
       let active = false, jobKey = '';
@@ -6301,7 +6302,17 @@
       const sig = formSignature();
       if (sig !== _lastFormSignature) { _lastFormSignature = sig; progressed = true; }
 
-      if (progressed) { _lastProgressTs = now; return; }
+      if (progressed) {
+        _lastProgressTs = now;
+        /* Tell the side panel this job is mid-application, so its own skip
+           timers (auto-skip, 25 s watchdog, missing-details, blocked) hold
+           off. The job cap above still ends a form that loops for ever. */
+        if (window.top === window.self && now - _beatTs >= 5_000) {
+          _beatTs = now;
+          Promise.resolve(ST.set({ ohJobActivity: { ts: now, url: cur } })).catch(() => {});
+        }
+        return;
+      }
 
       /* No progress signal at all — has it been long enough? */
       if (now - _lastProgressTs >= STUCK_TIMEOUT_MS) {
@@ -6878,7 +6889,7 @@
        knockout question with no profile data, etc.) we don't need to
        wait the full window — fire the skip MISSING_SKIP_MS after fill
        completes if required-fields-satisfied is still false. */
-    const MISSING_SKIP_MS = 20_000;
+    const MISSING_SKIP_MS = 45_000;   // was 20 s — skipped jobs the panel was still answering
     let _missingSkipFiredForUrl = '';
     async function tickMissingSkip() {
       if (!await automationActive()) return;

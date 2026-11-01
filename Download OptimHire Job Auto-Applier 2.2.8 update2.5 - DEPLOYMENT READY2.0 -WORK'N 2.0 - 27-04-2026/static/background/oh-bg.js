@@ -1416,9 +1416,11 @@ importScripts('queue-runner.js');
    lives in the bundle's module registry (globalThis.parcelRequire*), found
    by shape so this survives OptimHire updates. */
 (function tuneOptimHireTimers() {
-  /* 3s: long enough to read the reason on the panel. Workday sign-in runs
-     BEFORE OptimHire's login check (7 above), so it needs no wait here. */
-  var AUTO_SKIP_S = 3, LOGIN_WAIT_S = 3;
+  /* Was 3 s each, which skipped jobs mid-application: OptimHire starts this
+     countdown on a missing-details or sign-in pause, and 3 s gave neither
+     its own answers nor the person time to finish. Kept in step with
+     AUTO_SKIP_MAX in sidepanel-patch.js. */
+  var AUTO_SKIP_S = 30, LOGIN_WAIT_S = 45;
   try {
     Object.getOwnPropertyNames(self).forEach(function (name) {
       var req = /^parcelRequire/.test(name) ? self[name] : null;

@@ -954,14 +954,45 @@
    *   - SUBMIT_ATTEMPTED was received (content script just clicked submit)
    *   - The current status is "submitting" (from SIDEBAR_STATUS event)
    * ─────────────────────────────────────────────────────────────────────── */
-  const AUTO_SKIP_MAX = 3;          // seconds (was 15, then 10); OptimHire's own 180s is cut to 3s in oh-bg.js
+  /* Was 3 s: a sign-in or missing-details pause was skipped before the
+     page (or the person) could answer — the "random switch mid
+     application". OptimHire's own countdown is set to match in oh-bg.js 5. */
+  const AUTO_SKIP_MAX = 30;
   let _forceSkipTimer  = null;
   let _forceSkipJobKey = '';
   let _submitAttemptedTs = 0; // timestamp of last SUBMIT_ATTEMPTED message
   const SUBMIT_SUPPRESS_MS = 30_000; // suppress skips for 30s after submit attempted
 
   function isSubmitSuppressed() {
-    return Date.now() - _submitAttemptedTs < SUBMIT_SUPPRESS_MS;
+    return Date.now() - _submitAttemptedTs < SUBMIT_SUPPRESS_MS || isMidApplication();
+  }
+
+  /* The job tab's content script (optimhire-patch.js stuck watchdog) beats
+     ohJobActivity every few seconds while the form is changing, OptimHire
+     is busy, or the Workday engine is applying. While that beat is fresh
+     the job is mid-application and no timer here may skip it; a form that
+     loops for ever is ended by that script's own per-job cap. */
+  var JOB_ACTIVE_MS = 20_000;
+  var _jobActivityTs = 0;
+  try {
+    chrome.storage.local.get('ohJobActivity', function (d) {
+      _jobActivityTs = (d && d.ohJobActivity && d.ohJobActivity.ts) || 0;
+    });
+    chrome.storage.onChanged.addListener(function (ch, area) {
+      if (area === 'local' && ch.ohJobActivity) _jobActivityTs = (ch.ohJobActivity.newValue && ch.ohJobActivity.newValue.ts) || 0;
+    });
+  } catch (_) {}
+  var _lastHoldLogTs = 0;
+  function isMidApplication() {
+    return Date.now() - _jobActivityTs < JOB_ACTIVE_MS;
+  }
+  function holdSkip(reason) {
+    if (!isMidApplication()) return false;
+    if (Date.now() - _lastHoldLogTs > 15_000) {
+      _lastHoldLogTs = Date.now();
+      addLog((reason ? reason + ' — ' : '') + 'not skipping: the application is still being filled', '');
+    }
+    return true;
   }
 
   function clearAllSkipTimers() {
@@ -1042,7 +1073,7 @@
    *   4. Aborted if the warning disappears OR a submit was just
    *      attempted (30-second submit-suppression window).
    * ─────────────────────────────────────────────────────────────────── */
-  var MD_TIMEOUT_MS = 10_000;       // was 15s
+  var MD_TIMEOUT_MS = 25_000;       // was 10 s — too short to answer the missing details
   var _mdStartAt = 0;
   var _mdTimerId = null;
   var _mdCountdownEl = null;
@@ -1206,6 +1237,7 @@
   }
 
   function forceAdvanceSkip(reason) {
+    if (holdSkip(reason)) return false;
     var btn = findVisibleSkipButton();
     if (btn) {
       try {
@@ -1284,6 +1316,7 @@
     var remaining = Math.max(0, Math.round(MD_TIMEOUT_MS / 1000 - elapsed));
     renderCountdown(remaining);
     if (remaining <= 0) {
+      if (holdSkip('Missing-details')) { _mdStartAt = Date.now(); return; }
       clearMdCountdown();
       _lastMdSkipTs = Date.now();   // start cooldown so we don't spam-skip
       /* If we're in a runaway skip-loop on a stuck/broken job, trip the
@@ -1368,9 +1401,17 @@
         resetWatchdog(key + '_retry');
         return;
       }
-      forceAdvanceSkip('Stuck 25s with no progress');
+      /* Same URL for a minute is normal on a multi-step form (Workday keeps
+         one URL across its pages), so a job still showing activity is
+         re-armed, not skipped. */
+      if (isMidApplication()) {
+        _watchdogJobKey = '';
+        resetWatchdog(key + '_busy');
+        return;
+      }
+      forceAdvanceSkip('Stuck 60s with no progress');
       _watchdogJobKey = '';
-    }, 25_000);
+    }, 60_000);   // was 25 s
   }
 
   /* ── Blocked-state FAST skip ──────────────────────────────────────────
@@ -1385,7 +1426,7 @@
    * click the real Skip button to advance immediately. Feeds the same
    * stuck-loop breaker so an unrecoverable job can't loop. */
   (function installBlockedStateFastSkip() {
-    var BLOCKED_STABLE_MS  = 6_000;   // confirm the block is real, not transient
+    var BLOCKED_STABLE_MS  = 15_000;  // confirm the block is real, not transient (was 6 s)
     var SKIP_COOLDOWN_MS   = 8_000;   // min gap between blocked-state skips
     var _blockedSince      = 0;
     var _blockedKey        = '';
@@ -1477,6 +1518,10 @@
       var now = Date.now();
       if (key !== _key) { _key = key; _since = now; return; }
       if (now - _since < STABLE_MS) return;
+      /* "Could not establish connection" also shows when a multi-step form
+         swaps pages under OptimHire's message; the page itself is fine and
+         still being filled, so a retry would restart the job from scratch. */
+      if (holdSkip('Job page did not answer')) { _since = now; return; }
       _key = '';
       var tries = _acted[job] || 0;
       _acted[job] = tries + 1;
@@ -1779,7 +1824,7 @@
       try {
         if (!spinnerVisible()) { _since = 0; _escalated = false; return; }
         var now = Date.now();
-        if (!_since) { _since = now; return; }
+        if (!_since || isMidApplication()) { _since = now; return; }   // the job tab is working: not a stall
         if (now - _since < STALL_MS) return;
         if (now - _lastRecoveryTs < COOLDOWN_MS) return;
         chrome.storage.local.get(
