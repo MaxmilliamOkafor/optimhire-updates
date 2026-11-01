@@ -302,6 +302,7 @@ loadHandoff();
     var host = '';
     try { host = new URL(url).hostname.toLowerCase(); } catch (_) { return 30; }
     if (/(^|\.)reed\.co\.uk$/.test(host)) return 99;
+    if (/(^|\.)efinancialcareers\.[a-z.]+$/.test(host)) return 100;   // your order: Reed, then eFinancialCareers last
     var i;
     for (i = 0; i < RANK_BOARDS.length; i++) if (RANK_BOARDS[i][0].test(host + '.')) return RANK_BOARDS[i][1];
     for (i = 0; i < RANK_RES.length; i++) if (RANK_RES[i][0].test(String(url).toLowerCase())) return RANK_RES[i][1];

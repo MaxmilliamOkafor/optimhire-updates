@@ -67,11 +67,13 @@
     var lu = url.toLowerCase(), i;
     if (host) {
       if (/(^|\.)reed\.co\.uk$/.test(host)) return 99;
+      if (/(^|\.)efinancialcareers\.[a-z.]+$/.test(host)) return 100;   // after Reed, last of all
       if (BOARD_HOST_RE.test(host + '.')) return /(^|\.)linkedin\./.test(host) ? 40 : /(^|\.)indeed\./.test(host) ? 41 : 45;
       for (i = 0; i < ATS_ORDER.length; i++) if (ATS_ORDER[i].test(lu)) return i;
     }
     var n = names(o);
     if (/\breed\b/i.test(n)) return 99;
+    if (/e-?financial ?careers|\befc\b/i.test(n)) return 100;
     if (BOARD_NAME_RE.test(n)) return 45;
     if (ATS_NAME_RE.test(n)) return 22;               // an ATS by name only: after the known ones
     return 30;                                     // a company's own career site

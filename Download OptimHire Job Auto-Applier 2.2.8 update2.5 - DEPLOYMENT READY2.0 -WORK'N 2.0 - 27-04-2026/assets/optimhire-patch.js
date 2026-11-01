@@ -4598,6 +4598,7 @@
   function jobRank(u) {
     let h = ''; try { h = new URL(u).hostname.toLowerCase(); } catch (_) { return 30; }
     if (/(^|\.)reed\.co\.uk$/.test(h)) return 99;
+    if (/(^|\.)efinancialcareers\.[a-z.]+$/.test(h)) return 100;      // after Reed, last of all
     const boards = [[/(^|\.)linkedin\./, 40], [/(^|\.)indeed\./, 41], [/(^|\.)dice\./, 42], [/(^|\.)ziprecruiter\./, 43], [/(^|\.)adzuna\./, 44],
       [JOB_BOARD_RANK_RE, 45]];
     for (const [re, r] of boards) if (re.test(h + '.')) return r;
@@ -8422,7 +8423,47 @@
     return fixed;
   }
 
-  const SF_EMPTY_RE = /^(no selection|select( one)?|please select|choose|--+|\s*)$/i;
+  /* ── Answers typed into the wrong box ───────────────────────────────
+     Seen on Greenhouse: "What are your salary expectations?" read "50000YesYes".
+     A filler answered the Yes/No dropdowns below it by typing "Yes" while the
+     salary box still had the focus, so each answer landed on the end of the
+     salary. Any text box whose value is a real answer with Yes / No stuck to
+     its end (no space) gets the stray words taken off; a box holding only
+     "YesYes" keeps one "Yes". Never the box you are typing in, and each wrong
+     value is fixed once, so nothing is fought over. */
+  const _gluedFixed = new WeakMap();
+  const GLUED_RE = /^(.*?[0-9a-z%).])((?:Yes|No|YES|NO){1,6})$/;
+  const REPEAT_RE = /^(Yes|No)(?:\1)+$/i;
+  function isPickerInput(el) {
+    return el.getAttribute('role') === 'combobox' || el.hasAttribute('aria-autocomplete') ||
+      !!el.closest('[role="listbox"],[class*="select__control"],[class*="-control"][class*="css-"],.select2-container,[data-automation-id*="multiselect" i]');
+  }
+  function fixGluedAnswers() {
+    let fixed = 0;
+    for (const el of $$('input[type="text"],input:not([type]),textarea')) {
+      if (el === document.activeElement || el.disabled || el.readOnly || !isVisible(el) || isPickerInput(el)) continue;
+      const cur = String(el.value || '');
+      if (!cur || _gluedFixed.get(el) === cur) continue;
+      let want = null;
+      const rep = cur.trim().match(REPEAT_RE);
+      if (rep) want = rep[1];
+      else {
+        const m = cur.match(GLUED_RE);
+        if (m && m[1].trim()) want = m[1];
+      }
+      if (want == null || want === cur) continue;
+      _gluedFixed.set(el, want);
+      if (nativeSet(el, want)) {
+        fixed++;
+        const label = String(getLabel(el) || el.getAttribute('aria-label') || el.name || '').replace(/\s+/g, ' ').trim();
+        LOG(`Fixed an answer typed into the wrong box: "${label.slice(0, 50)}" was "${cur.slice(0, 40)}", now "${want.slice(0, 40)}"`);
+      }
+    }
+    return fixed;
+  }
+  if (CURRENT_ATS && !_IS_OH_PAGE) setInterval(() => { try { fixGluedAnswers(); } catch (_) {} }, 1500);
+
+  const SF_EMPTY_RE =/^(no selection|select( one)?|please select|choose|--+|\s*)$/i;
   function sfLabel(el) { return String(getLabel(el) || '').replace(/[*:]/g, ' ').replace(/\s+/g, ' ').trim(); }
   function sfSelectEmpty(sel) {
     const o = sel.options[sel.selectedIndex];
