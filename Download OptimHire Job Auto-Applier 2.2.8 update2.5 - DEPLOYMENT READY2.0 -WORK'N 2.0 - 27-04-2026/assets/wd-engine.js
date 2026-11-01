@@ -1274,6 +1274,8 @@
     if (anyAid("verifyPassword") || anyAid("createAccountSubmit")) return "createAccount";
     if (anyAid("signInSubmit") || anyAid("password") && anyAid("email")) return "signIn";
     if (anyAid("signInWithEmail") && !anyAid("progressActive")) return "signIn";
+    if (!anyAid("password") && !next && qa('button, [role="button"], a').some((b) => isVisible(b) && SIGN_IN_WITH_EMAIL_RX.test(text(b) || b.getAttribute("aria-label") || "")))
+      return "signIn";
     if (VERIFY_EMAIL_RX.test(body) && !anyAid("password") && !next)
       return "verifyEmail";
     if (anyAid("autofillWithResume") || anyAid("applyManually")) return "applyMethod";
@@ -1595,8 +1597,20 @@
     }
     return false;
   }
+  function onScreen(key2, label) {
+    const shown = (b) => {
+      const r = b.getBoundingClientRect();
+      const cs = getComputedStyle(b);
+      return r.width > 0 && r.height > 0 && cs.visibility !== "hidden" && cs.display !== "none";
+    };
+    const all = [
+      ...qa(sel(key2)),
+      ...qa('button, [role="button"]').filter((b) => label.test(text(b) || b.getAttribute("aria-label") || ""))
+    ].filter(shown);
+    return all.find((b) => b.closest('[role="dialog"], [aria-modal="true"]')) ?? all[0] ?? null;
+  }
   async function submit(key2, label) {
-    const btn = byAid(key2) ?? buttonByText(label);
+    const btn = byAid(key2) ?? buttonByText(label) ?? onScreen(key2, label);
     if (!btn) throw new NeedsHuman("Couldn't find the submit button on the sign-in form.");
     await humanClick(btn);
     await sleep(400);
@@ -3031,16 +3045,27 @@ OPTIONS: ${JSON.stringify(options.slice(0, 150))}`
   var ASSIST_KEYS = ["ohAutoTrigger", "ohWdEngineOff", "ohAutomationDisabled", "isAutoProcessStartJob", "isManuallyStartJob", "ohJobQueueActive", "ohWdEngineForms"];
   var assistOn = false;
   var engineForms = false;
+  var acctAssistOn = false;
   function readAssist() {
     ST.get(ASSIST_KEYS).then((d) => {
       const running = !!(d.isAutoProcessStartJob || d.isManuallyStartJob || d.ohJobQueueActive);
       engineForms = d.ohWdEngineForms === true;
-      assistOn = engineForms && d.ohAutoTrigger !== false && d.ohWdEngineOff !== true && d.ohAutomationDisabled !== true && !running;
+      const allowed = d.ohAutoTrigger !== false && d.ohWdEngineOff !== true && d.ohAutomationDisabled !== true && !running;
+      assistOn = engineForms && allowed;
+      acctAssistOn = !engineForms && allowed;
     }, () => {
     });
   }
+  var SELF_FILL_KEY = "ohWdSelfFill";
+  function selfFill() {
+    try {
+      return sessionStorage.getItem(SELF_FILL_KEY) === "1";
+    } catch {
+      return false;
+    }
+  }
   function formsToOptimHire() {
-    return !engineForms && hasWorkdayApp() && HANDOFF_PAGES.includes(detectPage());
+    return !engineForms && !selfFill() && hasWorkdayApp() && HANDOFF_PAGES.includes(detectPage());
   }
   readAssist();
   chrome.storage.onChanged.addListener((c, area) => {
@@ -3726,15 +3751,27 @@ OPTIONS: ${JSON.stringify(options.slice(0, 150))}`
     return skillsFor;
   }
   async function handOff(mode, profile) {
-    clearMode();
     skillsFor = (profile.skills || []).slice(0, 15);
     try {
       sessionStorage.setItem(SKILLS_KEY, JSON.stringify(skillsFor));
     } catch {
     }
-    say("signed in — OptimHire's own Workday autofill fills the application from here");
     const r = await within(chrome.runtime.sendMessage({ type: "OH_WD_HANDOFF" }), 5e3).catch(() => null);
-    say(`handed to OptimHire (${r?.via || "its page filler"})`);
+    const { ohJobQueueActive } = await ST.get("ohJobQueueActive");
+    if (r?.via !== "fill" && !ohJobQueueActive) {
+      if (!selfFill()) say("signed in — nothing from OptimHire to hand over, so the engine fills the application");
+      try {
+        sessionStorage.setItem(SELF_FILL_KEY, "1");
+      } catch {
+      }
+      return false;
+    }
+    try {
+      sessionStorage.removeItem(SELF_FILL_KEY);
+    } catch {
+    }
+    clearMode();
+    say(`signed in — OptimHire's own Workday autofill fills the application (${r?.via === "fill" ? "its job" : "the queue"})`);
     if (mode.auto && r?.via !== "fill") send({ type: "COMPLEX_FORM_PROGRESS", progress: 75, message: "Workday: OptimHire fills the application" });
     return true;
   }
@@ -3932,6 +3969,10 @@ OPTIONS: ${JSON.stringify(options.slice(0, 150))}`
       if (!msg) return false;
       if (msg.type === "oh:wd:start") {
         reply({ acknowledged: true });
+        try {
+          sessionStorage.removeItem(SELF_FILL_KEY);
+        } catch {
+        }
         say(`applying (job ${msg.applicationDetails?.copilot_job_id ?? "?"})`);
         startFromOptimHire(msg).catch((e) => {
           clearMode();
@@ -4045,6 +4086,17 @@ OPTIONS: ${JSON.stringify(options.slice(0, 150))}`
       const mode = { auto: false, submit: false, assist: true, startedAt: Date.now(), jobId: "" };
       void installHooks(mode).then(() => startRun(null));
     }, 900);
+    const ACCT_PAGES = ["applyMethod", "signIn", "createAccount"];
+    const acctStarted = /* @__PURE__ */ new Set();
+    setInterval(() => {
+      if (!acctAssistOn || readMode() || isActive() || !hasWorkdayApp() || otherAutomationOnPage()) return;
+      const page = detectPage();
+      if (!ACCT_PAGES.includes(page)) return;
+      const key2 = `${location.host}|${Math.floor(Date.now() / 6e5)}`;
+      if (acctStarted.has(key2)) return;
+      acctStarted.add(key2);
+      void startManual(false, false);
+    }, 400);
     const warmCv = (tries = 0) => {
       if (!hasWorkdayApp()) {
         if (tries < 40) setTimeout(() => warmCv(tries + 1), 500);

@@ -15,6 +15,7 @@
 import { NeedsHuman, buttonByText, byAid, humanClick, isVisible, qa, sleep, text, waitStable } from "./dom.js";
 import { setCheckbox, setText } from "./controls.js";
 import { errorMessages } from "./detect.js";
+import { sel } from "./selectors.js";
 import { pace, type Ctx } from "./context.js";
 import { ACCOUNT_EXISTS_RX, AUTH_FAILED_RX, CREATE_ACCOUNT_TEXT_RX, LOCKED_RX, SIGN_IN_TEXT_RX, SIGN_IN_WITH_EMAIL_RX, VERIFY_EMAIL_RX } from "./i18n.js";
 
@@ -123,8 +124,23 @@ async function chooseEmailSignIn(): Promise<boolean> {
   return false;
 }
 
+/* A sign-in shown as a pop-up (NVIDIA) can sit under an aria-hidden layer, which isVisible skips:
+   the submit button that is actually on screen, the one in the dialog first. */
+function onScreen(key: "signInSubmit" | "createAccountSubmit", label: RegExp): HTMLElement | null {
+  const shown = (b: HTMLElement) => {
+    const r = b.getBoundingClientRect();
+    const cs = getComputedStyle(b);
+    return r.width > 0 && r.height > 0 && cs.visibility !== "hidden" && cs.display !== "none";
+  };
+  const all = [
+    ...qa(sel(key)),
+    ...qa('button, [role="button"]').filter((b) => label.test(text(b) || b.getAttribute("aria-label") || "")),
+  ].filter(shown);
+  return all.find((b) => b.closest('[role="dialog"], [aria-modal="true"]')) ?? all[0] ?? null;
+}
+
 async function submit(key: "signInSubmit" | "createAccountSubmit", label: RegExp): Promise<void> {
-  const btn = byAid(key) ?? buttonByText(label);
+  const btn = byAid(key) ?? buttonByText(label) ?? onScreen(key, label);
   if (!btn) throw new NeedsHuman("Couldn't find the submit button on the sign-in form.");
   await humanClick(btn);
   await sleep(400);

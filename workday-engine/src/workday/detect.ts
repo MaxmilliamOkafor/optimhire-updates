@@ -5,7 +5,7 @@
 import { anyAid, byAid, isVisible, q, qa, text } from "./dom.js";
 import { sel, type AidKey } from "./selectors.js";
 import type { JobPosting, PageKind } from "./types.js";
-import { NEXT_TEXT_RX, SOMETHING_WRONG_RX, STEP_PATTERNS, SUBMIT_RX, SUBMITTED_RX, VERIFY_EMAIL_RX, detectLanguage, urlLanguage } from "./i18n.js";
+import { NEXT_TEXT_RX, SIGN_IN_WITH_EMAIL_RX, SOMETHING_WRONG_RX, STEP_PATTERNS, SUBMIT_RX, SUBMITTED_RX, VERIFY_EMAIL_RX, detectLanguage, urlLanguage } from "./i18n.js";
 
 const WORKDAY_HOST_RX = /(^|\.)(myworkdayjobs|myworkdaysite|myworkday|workdayjobs)\.com$/i;
 
@@ -85,6 +85,9 @@ export function detectPage(): PageKind {
   if (anyAid("verifyPassword") || anyAid("createAccountSubmit")) return "createAccount";
   if (anyAid("signInSubmit") || (anyAid("password") && anyAid("email"))) return "signIn";
   if (anyAid("signInWithEmail") && !anyAid("progressActive")) return "signIn";
+  // Tenants whose "Sign in with Google / LinkedIn / email" chooser has no automation id (NVIDIA).
+  if (!anyAid("password") && !next && qa('button, [role="button"], a').some((b) => isVisible(b) && SIGN_IN_WITH_EMAIL_RX.test(text(b) || b.getAttribute("aria-label") || "")))
+    return "signIn";
   if (VERIFY_EMAIL_RX.test(body) && !anyAid("password") && !next)
     return "verifyEmail";
   if (anyAid("autofillWithResume") || anyAid("applyManually")) return "applyMethod";

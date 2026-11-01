@@ -82,16 +82,26 @@ let assistOn = false;
    Review — are OptimHire's original Workday autofill's. ohWdEngineForms: true in storage gives
    them back to the engine (the old way). */
 let engineForms = false;
+/* You click Workday's own Apply: the engine carries on at once through "how to apply", sign-in and
+   create account, then hands the application to OptimHire's filler. */
+let acctAssistOn = false;
 function readAssist() {
   ST.get(ASSIST_KEYS).then((d) => {
     const running = !!(d.isAutoProcessStartJob || d.isManuallyStartJob || d.ohJobQueueActive);
     engineForms = d.ohWdEngineForms === true;
-    assistOn = engineForms && d.ohAutoTrigger !== false && d.ohWdEngineOff !== true && d.ohAutomationDisabled !== true && !running;
+    const allowed = d.ohAutoTrigger !== false && d.ohWdEngineOff !== true && d.ohAutomationDisabled !== true && !running;
+    assistOn = engineForms && allowed;
+    acctAssistOn = !engineForms && allowed;
   }, () => {});
+}
+/* This tab's application had nothing from OptimHire to hand over: the engine fills it (handOff). */
+const SELF_FILL_KEY = "ohWdSelfFill";
+function selfFill(): boolean {
+  try { return sessionStorage.getItem(SELF_FILL_KEY) === "1"; } catch { return false; }
 }
 /** An application page OptimHire's own filler has (not the engine). */
 function formsToOptimHire(): boolean {
-  return !engineForms && hasWorkdayApp() && HANDOFF_PAGES.includes(detectPage());
+  return !engineForms && !selfFill() && hasWorkdayApp() && HANDOFF_PAGES.includes(detectPage());
 }
 readAssist();
 chrome.storage.onChanged.addListener((c, area) => {
@@ -771,15 +781,22 @@ async function skillsList(): Promise<string[]> {
 }
 
 /** Signed in (or no sign-in needed): OptimHire's original Workday autofill takes the application.
- *  The background gives it the job the engine was handed (OptimHire's run, or the page's
- *  "Autofill Application" press); a CSV queue job goes back to the queue's own filler. */
+ *  The background gives it the job OptimHire sent the engine (its FILL_COMPLEX_FORM); a CSV
+ *  queue job goes back to the queue's own filler. With neither (you clicked Workday's own Apply,
+ *  or the panel's "Fill"), the engine fills the application itself: false. */
 async function handOff(mode: Mode, profile: Profile): Promise<boolean> {
-  clearMode();
   skillsFor = (profile.skills || []).slice(0, 15);
   try { sessionStorage.setItem(SKILLS_KEY, JSON.stringify(skillsFor)); } catch { /* storage blocked */ }
-  say("signed in — OptimHire's own Workday autofill fills the application from here");
   const r = (await within(chrome.runtime.sendMessage({ type: "OH_WD_HANDOFF" }), 5000).catch(() => null)) as Any;
-  say(`handed to OptimHire (${r?.via || "its page filler"})`);
+  const { ohJobQueueActive } = await ST.get("ohJobQueueActive");
+  if (r?.via !== "fill" && !ohJobQueueActive) {
+    if (!selfFill()) say("signed in — nothing from OptimHire to hand over, so the engine fills the application");
+    try { sessionStorage.setItem(SELF_FILL_KEY, "1"); } catch { /* storage blocked */ }
+    return false;
+  }
+  try { sessionStorage.removeItem(SELF_FILL_KEY); } catch { /* storage blocked */ }
+  clearMode();
+  say(`signed in — OptimHire's own Workday autofill fills the application (${r?.via === "fill" ? "its job" : "the queue"})`);
   if (mode.auto && r?.via !== "fill") send({ type: "COMPLEX_FORM_PROGRESS", progress: 75, message: "Workday: OptimHire fills the application" });
   return true;
 }
@@ -981,6 +998,7 @@ if (TOP && isWorkdayHost()) {
     if (!msg) return false;
     if (msg.type === "oh:wd:start") {
       reply({ acknowledged: true });
+      try { sessionStorage.removeItem(SELF_FILL_KEY); } catch { /* storage blocked */ }
       say(`applying (job ${msg.applicationDetails?.copilot_job_id ?? "?"})`);
       startFromOptimHire(msg).catch((e) => {
         clearMode();
@@ -1081,6 +1099,18 @@ if (TOP && isWorkdayHost()) {
     const mode: Mode = { auto: false, submit: false, assist: true, startedAt: Date.now(), jobId: "" };
     void installHooks(mode).then(() => startRun(null));
   }, 900);
+
+  const ACCT_PAGES: PageKind[] = ["applyMethod", "signIn", "createAccount"];
+  const acctStarted = new Set<string>();
+  setInterval(() => {
+    if (!acctAssistOn || readMode() || isActive() || !hasWorkdayApp() || otherAutomationOnPage()) return;
+    const page = detectPage();
+    if (!ACCT_PAGES.includes(page)) return;
+    const key = `${location.host}|${Math.floor(Date.now() / 600000)}`;
+    if (acctStarted.has(key)) return;
+    acctStarted.add(key);
+    void startManual(false, false);
+  }, 400);
 
   /* Read your CV as soon as a Workday page with the app opens (assist on), so
      your roles are ready by My Experience. Once per CV; kept after that. */

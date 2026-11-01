@@ -1202,14 +1202,11 @@ loadHandoff();
         reply({ via: 'fill' });
         return;
       }
-      if (press) {
-        try { console.info('[OH-BG] Workday: signed in — OptimHire\'s own Autofill Application fills the page'); } catch (_) {}
-        h.ohListeners.forEach(function (fn) {
-          try { fn(press.msg, press.sender, function () {}); } catch (e) { try { console.warn('[OH-BG] page autofill hand-over:', e); } catch (_) {} }
-        });
-        reply({ via: 'button' });
-        return;
-      }
+      /* No FILL_COMPLEX_FORM from OptimHire for this tab: its press is never replayed here —
+         that starts OptimHire's whole job over (it re-opens the job, "Loading your Job", and its
+         reset sends the tab to optimhire.com/d/job-apply mid-application). The engine fills on. */
+      delete h.done[tabId];
+      saveHandoff();
       reply({ via: 'none' });
     });
     return true;
@@ -1222,9 +1219,18 @@ loadHandoff();
     h.presses[tabId] = { msg: msg, sender: { id: sender.id, tab: sender.tab, frameId: sender.frameId, url: sender.url, origin: sender.origin }, at: Date.now() };
     delete h.fills[tabId];
     saveHandoff();
-    try { console.info('[OH-BG] Autofill Application on a Workday job — the Workday engine applies on this page'); } catch (_) {}
-    chrome.tabs.sendMessage(tabId, { type: 'OH_AUTOFILL_THIS_PAGE', submit: true, pageOnly: false }, { frameId: 0 }, function () {
+    /* OptimHire runs this job itself (it opens it and sends FILL_COMPLEX_FORM, which 9 gives the
+       engine for the sign-in and 9b hands back to OptimHire's filler). Its stale "a run is going"
+       flags are cleared first, so it doesn't refuse or resume an old run; its in-memory copy
+       follows storage, so the press goes to it once that change has landed. */
+    try { console.info('[OH-BG] Autofill Application on a Workday job — OptimHire applies; the Workday engine signs in'); } catch (_) {}
+    chrome.storage.local.set({ isManuallyStartJob: false, isAutoProcessStartJob: false }, function () {
       void chrome.runtime.lastError;
+      setTimeout(function () {
+        h.ohListeners.forEach(function (fn) {
+          try { fn(msg, sender, function () {}); } catch (e) { try { console.warn('[OH-BG] Autofill Application:', e); } catch (_) {} }
+        });
+      }, 150);
     });
     try { reply({ success: true, jobRunning: false }); } catch (_) {}
   });
