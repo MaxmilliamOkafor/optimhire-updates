@@ -3062,19 +3062,14 @@
         } catch (_) {}
       }
       var masterBtn = document.getElementById('oh-qc-master');
+      /* The same switch as the bar at the top of the panel (it also stops a run that is going). */
       if (masterBtn) masterBtn.addEventListener('click', function () {
         chrome.storage.local.get(['ohAutomationDisabled'], function (d) {
-          var off = !(d && d.ohAutomationDisabled === true);   // toggle
-          var patch = { ohAutomationDisabled: off };
-          if (off) {                                           // turning OFF: stop everything
-            patch.ohAutoApplyEngaged = false;
-            patch.ohAutoApplyEngagedTs = 0;
-            patch.ohJobQueueActive = false;
-          }
-          chrome.storage.local.set(patch, function () {
-            addLog(off ? 'Automation DISABLED — extension is now inert'
-                       : 'Automation ENABLED — press Start to run', off ? '' : 'success');
-          });
+          var turnOff = !(d && d.ohAutomationDisabled === true);   // toggle
+          if (window.__ohSetAutofillOff) { window.__ohSetAutofillOff(turnOff); return; }
+          var patch = { ohAutomationDisabled: turnOff };
+          if (turnOff) { patch.ohAutoApplyEngaged = false; patch.ohAutoApplyEngagedTs = 0; patch.ohJobQueueActive = false; }
+          chrome.storage.local.set(patch);
         });
       });
 
@@ -3397,6 +3392,94 @@
     }
     if (document.body) startup();
     else document.addEventListener('DOMContentLoaded', startup);
+  })();
+
+  /* ── Autofill ON / OFF: one bar across the top of the panel ─────────────
+   * Always in view, above OptimHire's own screen: green "Autofill ON", red
+   * "Autofill OFF". One tap switches. Off stops everything at once (oh-bg.js 18):
+   * a run that is going is stopped, nothing fills, clicks, opens tabs or pops up
+   * on pages, and the toolbar icon says OFF. The same switch is on the toolbar
+   * icon's right-click menu and Alt+Shift+O; the Job Queue card's "Automation"
+   * row is this switch too. */
+  (function installAutofillBar() {
+    var BAR_H = 46;
+    var off = false, busy = false, noteTimer = null;
+    var css = document.createElement('style');
+    css.textContent =
+      '#oh-autofill-bar{position:fixed;top:0;left:0;right:0;height:' + BAR_H + 'px;z-index:2147483647;display:flex;align-items:center;' +
+      'gap:10px;padding:0 12px;box-sizing:border-box;cursor:pointer;user-select:none;border:0;width:100%;text-align:left;' +
+      'font:600 14px/1.2 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;color:#fff;transition:background .2s}' +
+      '#oh-autofill-bar.on{background:#047857}#oh-autofill-bar.off{background:#b91c1c}' +
+      '#oh-autofill-bar:focus-visible{outline:3px solid #fde047;outline-offset:-3px}' +
+      '#oh-autofill-bar .oh-ab-text{flex:1;min-width:0}#oh-autofill-bar b{font-size:15px;letter-spacing:.02em}' +
+      '#oh-autofill-bar small{display:block;font-weight:500;font-size:11.5px;opacity:.92;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}' +
+      '#oh-autofill-bar .oh-ab-sw{flex:none;width:46px;height:26px;border-radius:13px;background:rgba(255,255,255,.35);position:relative}' +
+      '#oh-autofill-bar .oh-ab-sw::after{content:"";position:absolute;top:3px;left:3px;width:20px;height:20px;border-radius:50%;background:#fff;transition:left .2s}' +
+      '#oh-autofill-bar.on .oh-ab-sw{background:rgba(255,255,255,.45)}#oh-autofill-bar.on .oh-ab-sw::after{left:23px}' +
+      'body{padding-top:' + BAR_H + 'px!important}' +
+      '.h-screen,[style*="height: 100vh"]{height:calc(100vh - ' + BAR_H + 'px)!important}' +
+      /* The Job Queue card (docked at the bottom) grows up to just below the bar, never over it. */
+      '#oh-queue-card{max-height:calc(100vh - 20px - ' + BAR_H + 'px)!important}';
+    (document.head || document.documentElement).appendChild(css);
+
+    var bar = document.createElement('button');
+    bar.id = 'oh-autofill-bar';
+    bar.type = 'button';
+    bar.setAttribute('role', 'switch');
+    bar.innerHTML = '<span class="oh-ab-text"><b id="oh-ab-title"></b><small id="oh-ab-sub"></small></span><span class="oh-ab-sw" aria-hidden="true"></span>';
+
+    function paint(note) {
+      bar.className = off ? 'off' : 'on';
+      bar.setAttribute('aria-checked', off ? 'false' : 'true');
+      bar.title = off ? 'Autofill is off. Click to turn it on (also: right-click the toolbar icon, or Alt+Shift+O).'
+                      : 'Autofill is on. Click to turn it off — everything stops at once.';
+      document.getElementById('oh-ab-title').textContent = off ? 'Autofill OFF' : 'Autofill ON';
+      document.getElementById('oh-ab-sub').textContent = note ||
+        (off ? 'Nothing fills, clicks or pops up · tap to turn on' : 'Fills and applies for you · tap to turn off');
+    }
+    function setOff(want) {
+      if (busy) return;
+      busy = true;
+      var done = false;
+      var finish = function (r) {
+        if (done) return; done = true; busy = false;
+        addLog(want ? 'Autofill OFF — everything stopped' + (r && r.stopped ? ' (the run was stopped)' : '') : 'Autofill ON', want ? '' : 'success');
+      };
+      try {
+        chrome.runtime.sendMessage({ type: 'OH_SET_AUTOMATION', off: want }, function (r) { void chrome.runtime.lastError; finish(r); });
+      } catch (_) {}
+      /* The service worker did not answer: set it here (the background still stops what it sees). */
+      setTimeout(function () {
+        if (done) return;
+        var patch = { ohAutomationDisabled: want };
+        if (want) { patch.ohAutoApplyEngaged = false; patch.ohAutoApplyEngagedTs = 0; patch.ohJobQueueActive = false; }
+        chrome.storage.local.set(patch, function () { finish(null); });
+      }, 1500);
+    }
+    bar.addEventListener('click', function () { setOff(!off); });
+    window.__ohSetAutofillOff = setOff;
+
+    function mount() {
+      if (!document.body) return;
+      if (!document.getElementById('oh-autofill-bar')) document.body.insertBefore(bar, document.body.firstChild);
+      paint();
+    }
+    chrome.storage.local.get(['ohAutomationDisabled'], function (d) {
+      off = !!(d && d.ohAutomationDisabled === true);
+      if (document.body) mount(); else document.addEventListener('DOMContentLoaded', mount);
+    });
+    chrome.storage.onChanged.addListener(function (c, area) {
+      if (area !== 'local') return;
+      if (c.ohAutomationDisabled) { off = c.ohAutomationDisabled.newValue === true; paint(); }
+      /* Start pressed while off: say why nothing happens. */
+      var n = c.ohOffNote && c.ohOffNote.newValue;
+      if (n && off) {
+        paint('Turn autofill on first — then press Start');
+        addLog('Autofill is off — turn it on (top bar) to start', 'error');
+        clearTimeout(noteTimer);
+        noteTimer = setTimeout(function () { paint(); }, 6000);
+      }
+    });
   })();
 
   /* ── MutationObserver fallback to kill referral cards React renders ── */

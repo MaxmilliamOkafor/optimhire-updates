@@ -220,7 +220,9 @@ loadHandoff();
     var text = '', title = DEFAULT_TITLE;
     var rs = d.ohRunStats && d.ohRunStats.summary;
     if (d.ohAutomationDisabled === true) {
-      /* nothing runs */
+      /* Autofill is off (18): nothing runs, and the icon says so. */
+      text = 'OFF';
+      title = 'Autofill is OFF — nothing fills, clicks or pops up.\nTurn it on: the bar at the top of the side panel, right-click this icon, or Alt+Shift+O.';
     } else if (d.ohJobQueueActive && Array.isArray(d.ohJobQueue)) {
       var left = 0, applied = 0, failed = 0;
       d.ohJobQueue.forEach(function (j) {
@@ -242,7 +244,7 @@ loadHandoff();
     if (sig === _badge) return;
     _badge = sig;
     try {
-      chrome.action.setBadgeBackgroundColor({ color: '#6366f1' });
+      chrome.action.setBadgeBackgroundColor({ color: d.ohAutomationDisabled === true ? '#dc2626' : '#6366f1' });
       chrome.action.setBadgeText({ text: text });
       chrome.action.setTitle({ title: title });
     } catch (_) {}
@@ -1325,6 +1327,18 @@ loadHandoff();
     return prevAdd.apply(ev, arguments);
   };
   self.__ohEndListenerCapture = function () { capturing = false; };
+  /* Hand a message to OptimHire's handlers as if the side panel sent it (18: Stop when autofill goes off). */
+  self.__ohDispatch = function (msg) {
+    var sender = { id: rt.id, url: rt.getURL('sidepanel.html') };
+    ohListeners.forEach(function (fn) { try { fn.call(null, msg, sender, function () {}); } catch (_) {} });
+  };
+  var switchedOff = false;
+  try {
+    chrome.storage.local.get(['ohAutomationDisabled'], function (d) { switchedOff = !!(d && d.ohAutomationDisabled === true); });
+    chrome.storage.onChanged.addListener(function (c, area) {
+      if (area === 'local' && c.ohAutomationDisabled) switchedOff = c.ohAutomationDisabled.newValue === true;
+    });
+  } catch (_) {}
 
   var realSend = rt.sendMessage;
   rt.sendMessage = function (msg) {
@@ -1377,6 +1391,7 @@ loadHandoff();
   }
   setInterval(function () {
     var w = watch, now = Date.now();
+    if (w && switchedOff) { watch = null; return; }                  // autofill is off: nothing is restarted
     if (!w || now - w.since < STALL_MS || inflight > 0 || now - lastApiTs < QUIET_MS) return;
     watch = null;
     chrome.storage.local.get(['autoApplyState', 'isManuallyStartJob'], function (d) {
@@ -1402,6 +1417,109 @@ loadHandoff();
       });
     });
   }, 2000);
+})();
+
+/* 18. Autofill OFF — one switch that stops everything (ohAutomationDisabled). Turned on / off
+   from the bar at the top of the side panel, the toolbar icon's right-click menu, or Alt+Shift+O
+   (OH_SET_AUTOMATION from the panel). Turning it off stops a run that is going (OptimHire's own
+   Stop: the run's state is cleared and every tab told to stop; no tab is moved) and the CSV
+   queue. While it is off: OptimHire's start / fill / open-the-panel requests are refused,
+   nothing is sent to a page to fill, no desktop notifications; pages hide OptimHire's on-page
+   card and pop-ups (oh-off.js) and our own helpers type and click nothing (optimhire-patch.js).
+   The toolbar icon says OFF in red. */
+(function autofillSwitch() {
+  var rt = chrome.runtime, ev = rt && rt.onMessage;
+  if (!ev || typeof ev.addListener !== 'function') return;
+  var off = false;
+  var MENU_ID = 'oh-autofill-switch';
+  var REFUSED = { START_PAGE_AUTOFILL: 1, START_JOB_APPLICATION_VIA_WEB: 1, START_SINGLE_MANUAL_APPLICATION: 1,
+                  START_TEST_AUTO_APPLICATION: 1, START_COPILOT_WEB: 1, OPEN_MANUAL_APPLICATION: 1, AUTO_APPLY_RETRY: 1,
+                  OPEN_TAILOR_RESUME: 1, ENSURE_AUTOFILL_CONTENT_SCRIPT: 1, OPEN_SIDE_PANEL: 1 };
+  var FILLS = { FILL_COMPLEX_FORM: 1, MANUALLY_FORM_SUBMIT: 1, 'oh:wd:start': 1, OH_AUTOFILL_THIS_PAGE: 1, OH_WORKDAY_SIGN_IN: 1 };
+  function refused(msg) { return !!msg && !!(REFUSED[msg.action] || REFUSED[msg.type]); }
+
+  function menuTitle() { return off ? 'Turn autofill ON' : 'Turn autofill OFF (stop everything)'; }
+  function paintMenu() {
+    try {
+      chrome.contextMenus.create({ id: MENU_ID, title: menuTitle(), contexts: ['action'] }, function () {
+        void chrome.runtime.lastError;                                    // already there after a restart
+        chrome.contextMenus.update(MENU_ID, { title: menuTitle() }, function () { void chrome.runtime.lastError; });
+      });
+    } catch (_) {}
+  }
+  function setAutomation(turnOff, cb) {
+    turnOff = !!turnOff;
+    chrome.storage.local.get(['isAutoProcessStartJob', 'isManuallyStartJob', 'autoApplyState'], function (d) {
+      d = d || {};
+      var live = !!(d.isAutoProcessStartJob || d.isManuallyStartJob || (d.autoApplyState && d.autoApplyState.isActive));
+      var patch = { ohAutomationDisabled: turnOff };
+      if (turnOff) { patch.ohAutoApplyEngaged = false; patch.ohAutoApplyEngagedTs = 0; patch.ohJobQueueActive = false; }
+      chrome.storage.local.set(patch, function () {
+        off = turnOff;
+        paintMenu();
+        if (turnOff && live && typeof self.__ohDispatch === 'function') self.__ohDispatch({ type: 'AUTO_APPLY_STOP' });
+        try { console.info('[OH-BG] Autofill ' + (turnOff ? 'OFF — everything stopped' : 'ON')); } catch (_) {}
+        if (cb) cb({ off: turnOff, stopped: turnOff && live });
+      });
+    });
+  }
+  self.ohSetAutomation = setAutomation;
+  try {
+    chrome.storage.local.get(['ohAutomationDisabled'], function (d) { off = !!(d && d.ohAutomationDisabled === true); paintMenu(); });
+    chrome.storage.onChanged.addListener(function (c, area) {
+      if (area === 'local' && c.ohAutomationDisabled) { off = c.ohAutomationDisabled.newValue === true; paintMenu(); }
+    });
+    chrome.runtime.onInstalled.addListener(paintMenu);
+    chrome.contextMenus.onClicked.addListener(function (info) { if (info && info.menuItemId === MENU_ID) setAutomation(!off); });
+    if (chrome.commands && chrome.commands.onCommand) {
+      chrome.commands.onCommand.addListener(function (cmd) { if (cmd === 'toggle-autofill') setAutomation(!off); });
+    }
+  } catch (_) {}
+
+  /* Ours, first: the panel's switch, and the answer to a refused request. */
+  ev.addListener(function (msg, sender, reply) {
+    if (msg && msg.type === 'OH_SET_AUTOMATION') { setAutomation(msg.off, reply); return true; }
+    if (!off || !refused(msg)) return;
+    try { console.info('[OH-BG] Autofill is off — ' + (msg.action || msg.type) + ' refused'); } catch (_) {}
+    try { chrome.storage.local.set({ ohOffNote: { ts: Date.now(), what: msg.action || msg.type } }); } catch (_) {}
+    try { reply({ success: false, disabled: true, message: 'Autofill is off — turn it on at the top of the side panel' }); } catch (_) {}
+    /* The panel shows "Loading your Job" as soon as Start is pressed: put it back. */
+    if (!(sender && sender.tab) && /^START_/.test(msg.action || msg.type || '')) {
+      setTimeout(function () { try { Promise.resolve(rt.sendMessage({ type: 'RELOAD_SIDE' })).catch(function () {}); } catch (_) {} }, 400);
+    }
+  });
+  /* Every handler added after this one (OptimHire's) skips a refused request while off. */
+  var prevAdd = ev.addListener;
+  ev.addListener = function (fn) {
+    if (typeof fn !== 'function') return prevAdd.apply(ev, arguments);
+    return prevAdd.call(ev, function (msg) {
+      if (off && refused(msg)) return false;
+      return fn.apply(this, arguments);
+    });
+  };
+  /* Nothing sent to a page to fill, and no desktop notifications, while off. */
+  var tabsApi = chrome.tabs, realTabSend = tabsApi && tabsApi.sendMessage;
+  if (typeof realTabSend === 'function') {
+    tabsApi.sendMessage = function (tabId, msg) {
+      if (off && msg && FILLS[msg.type]) {
+        var cb = arguments[arguments.length - 1];
+        if (typeof cb === 'function') { setTimeout(function () { cb(undefined); }, 0); return undefined; }
+        return Promise.resolve(undefined);
+      }
+      return realTabSend.apply(tabsApi, arguments);
+    };
+  }
+  var notes = chrome.notifications, realNotify = notes && notes.create;
+  if (typeof realNotify === 'function') {
+    notes.create = function () {
+      if (off) {
+        var cb = arguments[arguments.length - 1];
+        if (typeof cb === 'function') setTimeout(function () { cb(''); }, 0);
+        return typeof cb === 'function' ? undefined : Promise.resolve('');
+      }
+      return realNotify.apply(notes, arguments);
+    };
+  }
 })();
 
 importScripts('index.js');

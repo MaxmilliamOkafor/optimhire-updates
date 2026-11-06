@@ -1070,7 +1070,10 @@ if (TOP && isWorkdayHost()) {
       return false;
     }
     if (msg.type === "OH_AUTOFILL_THIS_PAGE" && hasWorkdayApp()) {
-      void startManual(!!msg.submit, !!msg.pageOnly);
+      void ST.get("ohAutomationDisabled").then(({ ohAutomationDisabled }) => {
+        if (ohAutomationDisabled === true) { say("Autofill is off — not filling this page"); return; }
+        void startManual(!!msg.submit, !!msg.pageOnly);
+      });
       return false;
     }
     // OptimHire's run stopped: its job stops too (a manual "Autofill this page" carries on).
@@ -1202,7 +1205,20 @@ if (TOP && isWorkdayHost()) {
       fresh = sessionStorage.getItem("ohWdStartAfterLoad") === "1";
       sessionStorage.removeItem("ohWdStartAfterLoad");
     } catch { /* storage blocked */ }
-    void installHooks(mode).then(async () => { if (fresh) await startRun(null); else await autoResume(); });
+    void installHooks(mode).then(async () => {
+      // Autofill switched off (the side panel's top bar, the toolbar icon, Alt+Shift+O): no run starts or resumes.
+      const { ohAutomationDisabled } = await ST.get("ohAutomationDisabled");
+      if (ohAutomationDisabled === true) return;
+      if (fresh) await startRun(null); else await autoResume();
+    });
   };
   boot();
+  // Switched off mid-run: the engine stops where it is (it starts again only when you turn autofill on and start).
+  chrome.storage.onChanged.addListener((c, area) => {
+    if (area !== "local" || !c.ohAutomationDisabled || c.ohAutomationDisabled.newValue !== true) return;
+    if (!isActive()) return;
+    say("Autofill switched off — stopped");
+    clearMode();
+    void stopRun();
+  });
 }

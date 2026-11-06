@@ -4208,7 +4208,13 @@ OPTIONS: ${JSON.stringify(options.slice(0, 150))}`
         return false;
       }
       if (msg.type === "OH_AUTOFILL_THIS_PAGE" && hasWorkdayApp()) {
-        void startManual(!!msg.submit, !!msg.pageOnly);
+        void ST.get("ohAutomationDisabled").then(({ ohAutomationDisabled }) => {
+          if (ohAutomationDisabled === true) {
+            say("Autofill is off — not filling this page");
+            return;
+          }
+          void startManual(!!msg.submit, !!msg.pageOnly);
+        });
         return false;
       }
       if (msg.type === "STOP_ALL_PROCESSES" && readMode()?.auto) {
@@ -4352,10 +4358,19 @@ OPTIONS: ${JSON.stringify(options.slice(0, 150))}`
       } catch {
       }
       void installHooks(mode).then(async () => {
+        const { ohAutomationDisabled } = await ST.get("ohAutomationDisabled");
+        if (ohAutomationDisabled === true) return;
         if (fresh) await startRun(null);
         else await autoResume();
       });
     };
     boot();
+    chrome.storage.onChanged.addListener((c, area) => {
+      if (area !== "local" || !c.ohAutomationDisabled || c.ohAutomationDisabled.newValue !== true) return;
+      if (!isActive()) return;
+      say("Autofill switched off — stopped");
+      clearMode();
+      void stopRun();
+    });
   }
 })();

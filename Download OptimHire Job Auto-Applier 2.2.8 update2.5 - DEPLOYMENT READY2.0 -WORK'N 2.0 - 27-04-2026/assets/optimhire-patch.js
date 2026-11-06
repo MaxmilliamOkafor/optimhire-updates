@@ -164,6 +164,18 @@
   };
   const ST  = chrome.storage.local;
 
+  /* Autofill switched OFF (ohAutomationDisabled — the bar at the top of the side panel, the
+     toolbar icon's right-click menu, Alt+Shift+O): this script types, picks and clicks
+     nothing, on any page, whatever asks it to (a timer, a page watcher, a message). Read
+     once at load and kept current, so the check costs nothing. */
+  let _masterOff = false;
+  try {
+    ST.get(['ohAutomationDisabled']).then(d => { _masterOff = !!(d && d.ohAutomationDisabled === true); }, () => {});
+    chrome.storage.onChanged.addListener((c, area) => {
+      if (area === 'local' && c.ohAutomationDisabled) _masterOff = c.ohAutomationDisabled.newValue === true;
+    });
+  } catch (_) {}
+
   /* ── Engagement freshness + master kill switch ───────────────────────
    * ohAutoApplyEngaged was a PERMANENT flag: set the first time the user
    * pressed "Start Auto-Applying" and never cleared unless they pressed
@@ -362,6 +374,7 @@
    * didn't take, fall back to the native prototype value setter → then
    * dispatch the full keyboard/input/change event sequence either way. */
   function _protoValueSet(el, val) {
+    if (_masterOff) return;
     try {
       const proto = el.tagName === 'TEXTAREA'
         ? window.HTMLTextAreaElement.prototype
@@ -477,7 +490,7 @@
   }
 
   function nativeSet(el, val) {
-    if (!el) return false;
+    if (!el || _masterOff) return false;
     val = (val == null) ? '' : String(val);
     val = phoneValueFor(el, val);
     if (val && isTrapField(el)) {
@@ -524,7 +537,7 @@
 
   /** Real pointer-events click sequence (unchanged proven behaviour). */
   function realClick(el) {
-    if (!el) return;
+    if (!el || _masterOff) return;
     el.dispatchEvent(new MouseEvent('mouseover', { bubbles: true }));
     el.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
     el.dispatchEvent(new MouseEvent('mouseup',   { bubbles: true }));
@@ -1176,6 +1189,7 @@
         msg.action === 'autofill' || msg.action === 'startAutofill' ||
         msg.type === 'OH_AUTOFILL_THIS_PAGE') {
       if (msg.type === 'OH_AUTOFILL_THIS_PAGE' && window.__ohWdEngine && window.__ohWdEngine.takesManual()) return;   // Workday: the engine fills it
+      if (_masterOff) { LOG('Autofill is off — not filling this page (turn it on at the top of the side panel)'); return; }
       _manualTriggerTs = Date.now();
       _automationCache = { active: true, ts: Date.now() };
       /* Only the top frame drives the fill so we don't run once per iframe. */
@@ -9179,6 +9193,7 @@
 
   /** Inject/update the "Autofill in progress" banner */
   function showAutofillBanner(status, atsName) {
+    if (_masterOff) return;
     let banner = document.getElementById('oh-autofill-banner');
     if (!banner) {
       banner = document.createElement('div');
@@ -9241,6 +9256,9 @@
   let _foreignNoted = false;
   async function autoTriggerAutofill() {
     /* Guards */
+    /* Autofill off: no fill when a page opens, even with "Auto-fill on ATS pages" on —
+       it used to fill pages you opened yourself, open the side panel and show its banner. */
+    if (_masterOff || (await ST.get(['ohAutomationDisabled'])).ohAutomationDisabled === true) return;
     if (wdEngineOwns()) return;
     if (_autoTriggerRunning) return;
     if (_autoTriggered)      return;
