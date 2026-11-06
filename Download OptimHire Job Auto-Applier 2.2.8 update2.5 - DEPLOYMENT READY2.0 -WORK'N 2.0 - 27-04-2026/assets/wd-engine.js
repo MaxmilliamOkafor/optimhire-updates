@@ -113,6 +113,17 @@
     "申请已提交",
     "感谢您的申请"
   ]);
+  var SOMETHING_WRONG_RX = rx([
+    "something went wrong\\.? please refresh",
+    "something went wrong\\.? please try again",
+    "etwas ist schiefgelaufen",
+    "une erreur s'est produite\\.? veuillez actualiser",
+    "algo salió mal",
+    "algo deu errado",
+    "qualcosa è andato storto",
+    "er is iets misgegaan",
+    "coś poszło nie tak"
+  ]);
   var ALREADY_APPLIED_RX = rx([
     "(you'?ve|you have) already applied",
     "already applied (for|to) this (job|position|role)",
@@ -557,8 +568,8 @@
     pageSelfId: ["applyFlowSelfIdentifyPage", "selfIdentificationPage"],
     pageReview: ["applyFlowReviewPage", "reviewJobApplicationPage"]
   };
-  function sel(key) {
-    return AID[key].map((id) => `[data-automation-id="${id}"]`).join(",");
+  function sel(key2) {
+    return AID[key2].map((id) => `[data-automation-id="${id}"]`).join(",");
   }
   var LABELS = {
     firstName: Q.firstName,
@@ -628,15 +639,15 @@
   function q(selector, root2 = document) {
     return root2.querySelector(selector);
   }
-  function byAid(key, root2 = document) {
-    for (const id of AID[key]) {
+  function byAid(key2, root2 = document) {
+    for (const id of AID[key2]) {
       const hit = qa(`[data-automation-id="${id}"]`, root2).find(isVisible);
       if (hit) return hit;
     }
     return null;
   }
-  function anyAid(key, root2 = document) {
-    return qa(sel(key), root2).some(isVisible);
+  function anyAid(key2, root2 = document) {
+    return qa(sel(key2), root2).some(isVisible);
   }
   async function waitFor(fn, timeoutMs = 8e3, everyMs = 100) {
     const start = Date.now();
@@ -686,10 +697,10 @@
     if (/\*/.test(text(container.querySelector("legend, label")))) return true;
     return !!container.querySelector('[aria-required="true"], [required]');
   }
-  function field(key, root2 = document) {
-    const hit = byAid(key, root2);
+  function field(key2, root2 = document) {
+    const hit = byAid(key2, root2);
     if (hit) return hit;
-    const rx2 = LABELS[key];
+    const rx2 = LABELS[key2];
     if (!rx2) return null;
     for (const c of qa('[data-automation-id^="formField-"]', root2)) {
       if (!isVisible(c)) continue;
@@ -700,7 +711,7 @@
   async function humanClick(el) {
     checkAbort();
     el.scrollIntoView({ block: "center", inline: "nearest" });
-    await sleep(60);
+    await sleep(25);
     const r = el.getBoundingClientRect();
     const x = r.left + r.width / 2;
     const y = r.top + r.height / 2;
@@ -756,7 +767,7 @@
     let score = 0;
     for (const el of els) {
       const s = similarity(wanted, text(el));
-      if (s > score) {
+      if (s > score || s === score && best && s > 0 && text(el).length < text(best).length) {
         score = s;
         best = el;
       }
@@ -853,38 +864,92 @@
     const t = text(b);
     return /^select one$|^select$/i.test(t) ? "" : t;
   }
+  function pressEnter(el) {
+    for (const t of ["keydown", "keypress", "keyup"]) {
+      const ev = new KeyboardEvent(t, { key: "Enter", code: "Enter", bubbles: true, cancelable: true, composed: true });
+      Object.defineProperty(ev, "keyCode", { get: () => 13 });
+      Object.defineProperty(ev, "which", { get: () => 13 });
+      el.dispatchEvent(ev);
+    }
+  }
+  function ticked(o) {
+    const row = o.closest('[role="option"], li, [data-automation-id="menuItem"], [data-automation-id="promptLeafNode"]') ?? o;
+    for (const el of [o, row]) {
+      if (el.getAttribute("aria-checked") === "true") return true;
+      const box = el.querySelector('input[type="checkbox"], [role="checkbox"]');
+      if (box && (box.checked === true || box.getAttribute("aria-checked") === "true")) return true;
+    }
+    return false;
+  }
+  function key(el, k) {
+    const code = k.length === 1 ? /\d/.test(k) ? `Digit${k}` : `Key${k.toUpperCase()}` : k;
+    el.dispatchEvent(new KeyboardEvent("keydown", { key: k, code, bubbles: true, cancelable: true }));
+    el.dispatchEvent(new KeyboardEvent("keyup", { key: k, code, bubbles: true }));
+  }
+  function optionIn(list, wanted, min) {
+    const opts = qa('[role="option"]', list).filter((o) => text(o) && !/^select one$/i.test(text(o)));
+    return wanted === "decline" ? opts.find((o) => DECLINE_RX2.test(text(o))) ?? null : bestMatch(opts, wanted, min);
+  }
+  async function findInLongList(btn, wanted, min) {
+    let list = openListbox(btn);
+    if (!list || wanted === "decline") return null;
+    const typed = norm(wanted).replace(/[^a-z0-9 ]/g, "").slice(0, 4);
+    for (const ch of typed) key(list, ch);
+    await sleep(250);
+    list = openListbox(btn) ?? list;
+    let m = optionIn(list, wanted, min);
+    for (let i = 0; !m && i < 40 && list.scrollHeight > list.clientHeight; i++) {
+      const before = list.scrollTop;
+      list.scrollTop = before + Math.max(120, list.clientHeight - 20);
+      list.dispatchEvent(new Event("scroll", { bubbles: true }));
+      await sleep(60);
+      m = optionIn(list, wanted, min);
+      if (list.scrollTop === before) break;
+    }
+    return m;
+  }
   async function selectDropdown(target, wanted, min = 0.6) {
     const btn = dropdownButton(target);
     if (!btn) return false;
     const current = dropdownValue(target);
     if (current && (wanted === "decline" ? DECLINE_RX2.test(current) : similarity(wanted, current) >= 0.92)) return true;
     if (!openListbox(btn)) await humanClick(btn);
-    const list = await waitFor(() => openListbox(btn), 4e3).catch(() => null);
+    let list = await waitFor(() => openListbox(btn), 4e3).catch(() => null);
+    if (!list) {
+      btn.focus();
+      key(btn, "ArrowDown");
+      list = await waitFor(() => openListbox(btn), 2e3).catch(() => null);
+    }
     if (!list) return false;
-    const opts = qa('[role="option"]', list).filter((o) => text(o) && !/^select one$/i.test(text(o)));
-    const match = wanted === "decline" ? opts.find((o) => DECLINE_RX2.test(text(o))) ?? null : bestMatch(opts, wanted, min);
+    const match = optionIn(list, wanted, min) ?? await findInLongList(btn, wanted, min);
     if (!match) {
       await closeListbox(btn);
       return false;
     }
+    const wantText = text(match);
+    match.scrollIntoView?.({ block: "nearest" });
     await humanClick(match);
     await sleep(120);
     await waitStable(250, 4e3);
-    if (dropdownValue(target)) return true;
-    const idx = opts.indexOf(match);
-    btn.focus();
-    if (!openListbox(btn)) btn.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowDown", code: "ArrowDown", keyCode: 40, bubbles: true }));
-    await sleep(150);
-    const list2 = openListbox(btn);
-    if (!list2) return false;
-    for (let i = 0; i <= idx; i++) {
-      (document.activeElement ?? btn).dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowDown", code: "ArrowDown", keyCode: 40, bubbles: true }));
-      await sleep(30);
+    if (dropdownValue(target) && similarity(wantText, dropdownValue(target)) >= 0.85) return true;
+    if (!openListbox(btn)) {
+      btn.focus();
+      key(btn, "ArrowDown");
+      await waitFor(() => openListbox(btn), 2e3).catch(() => null);
     }
-    (document.activeElement ?? btn).dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", code: "Enter", keyCode: 13, bubbles: true }));
-    await sleep(150);
-    await waitStable(250, 4e3);
-    return !!dropdownValue(target);
+    const l2 = openListbox(btn);
+    if (l2) {
+      const opts = qa('[role="option"]', l2);
+      const idx = opts.findIndex((o) => text(o) === wantText);
+      if (idx >= 0) {
+        opts[idx].focus?.();
+        for (let i = 0; i <= idx; i++) key(document.activeElement instanceof HTMLElement ? document.activeElement : l2, "ArrowDown");
+        key(document.activeElement instanceof HTMLElement ? document.activeElement : opts[idx], "Enter");
+        await sleep(150);
+        await waitStable(250, 4e3);
+      } else await closeListbox(btn);
+    }
+    return !!dropdownValue(target) && similarity(wantText, dropdownValue(target)) >= 0.85;
   }
   function dropdownOptions(btn) {
     const list = openListbox(btn);
@@ -905,40 +970,103 @@
   function visibleOptions() {
     return qa(sel("promptOption")).filter(isVisible);
   }
-  async function searchSettled() {
-    await waitFor(() => !qa(sel("spinner")).some(isVisible), 6e3, 100).catch(() => null);
-    await sleep(120);
+  function spinning() {
+    return qa(sel("spinner")).some(isVisible) || qa('[data-automation-id*="oading"], [aria-busy="true"]').some(isVisible);
+  }
+  async function settledOptions(timeout = 6e3) {
+    const end = Date.now() + timeout;
+    let last = "";
+    let stableSince = Date.now();
+    while (Date.now() < end) {
+      const o = visibleOptions();
+      const sig = o.map(text).join("|");
+      if (sig !== last) {
+        last = sig;
+        stableSince = Date.now();
+      }
+      if (o.length && !spinning() && Date.now() - stableSince >= 200) return o;
+      await sleep(100);
+    }
+    return visibleOptions();
+  }
+  var MULTI_ALIASES = [
+    [/^aws$|amazon web services/i, ["Amazon Web Services (AWS)", "AWS", "Amazon Web Services"]],
+    [/^gcp$|google cloud/i, ["Google Cloud Platform (GCP)", "Google Cloud Platform", "GCP"]],
+    [/^azure$|microsoft azure/i, ["Microsoft Azure", "Azure"]],
+    [/^k8s$|^kubernetes$/i, ["Kubernetes"]],
+    [/^js$|^javascript$/i, ["JavaScript"]],
+    [/^ts$|^typescript$/i, ["TypeScript"]],
+    [/^golang$|^go$/i, ["Go (Programming Language)", "Go", "Golang"]],
+    [/^c#$|^csharp$/i, ["C# (Programming Language)", "C#"]],
+    [/^c\+\+$/i, ["C++ (Programming Language)", "C++"]],
+    [/^ci\/?cd$/i, ["Continuous Integration and Continuous Delivery (CI/CD)", "CI/CD", "Continuous Integration"]],
+    [/^ml$|^machine learning$/i, ["Machine Learning"]],
+    [/^ai$|^artificial intelligence$/i, ["Artificial Intelligence (AI)", "Artificial Intelligence"]],
+    [/^sql$/i, ["SQL (Programming Language)", "SQL"]],
+    [/^linkedin$/i, ["LinkedIn", "LinkedIn Jobs", "LinkedIn.com"]]
+  ];
+  function searchTerms(wanted) {
+    const out = [wanted];
+    for (const [rx2, alts] of MULTI_ALIASES) if (rx2.test(wanted.trim())) out.push(...alts);
+    out.push(...searchVariants(wanted));
+    return [...new Set(out)].slice(0, 5);
+  }
+  async function dropWrongPicks(target, before, wanted, term, min) {
+    const items = qa(sel("selectedItem"), target);
+    for (const it of items.slice(before).reverse()) {
+      const t = text(it);
+      if (similarity(wanted, t) >= min || term && similarity(term, t) >= Math.max(min, 0.85)) continue;
+      const del = q('[data-automation-id="DELETE_charm"]', it) ?? q('[aria-label*="remove" i], [aria-label*="delete" i]', it);
+      if (!del) continue;
+      await humanClick(del);
+      await sleep(150);
+    }
   }
   async function multiselectPick(target, wanted, opts = {}) {
     const min = opts.min ?? 0.6;
     if (multiselectSelected(target).some((s) => similarity(wanted, s) >= 0.85)) return true;
     const input = q(sel("searchBox"), target) ?? q("input", target);
     if (!input) return false;
-    await humanClick(input);
-    setNativeValue(input, wanted);
-    input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", code: "Enter", keyCode: 13, bubbles: true }));
-    await sleep(250);
-    for (let depth = 0; depth < 3; depth++) {
-      await searchSettled();
-      const options = await waitFor(() => {
-        const o = visibleOptions();
-        return o.length ? o : null;
-      }, 4e3).catch(() => []);
-      if (!options.length) break;
-      let match = bestMatch(options, wanted, min);
-      if (!match && opts.fallbackFirst) match = options[0];
-      if (!match) break;
-      await humanClick(match);
-      await sleep(250);
-      if (multiselectSelected(target).length) {
-        blur(input);
-        return true;
+    const path = opts.path?.length ? opts.path : [wanted];
+    const terms = opts.noRetry || opts.path ? [path[0]] : searchTerms(wanted);
+    const before = multiselectSelected(target).length;
+    for (const term of terms) {
+      await humanClick(input);
+      setNativeValue(input, opts.path ? "" : term);
+      if (!opts.path) {
+        await sleep(150);
+        pressEnter(input);
       }
+      await sleep(250);
+      if (!opts.path && !opts.fallbackFirst) await dropWrongPicks(target, before, wanted, term, min);
+      for (let depth = 0; depth < 3; depth++) {
+        const options = await settledOptions(depth ? 4e3 : 6e3);
+        if (!options.length) break;
+        const want = opts.path ? path[Math.min(depth, path.length - 1)] : wanted;
+        let match = bestMatch(options, want, min) ?? (term !== wanted ? bestMatch(options, term, Math.max(min, 0.85)) : null);
+        if (!match && opts.fallbackFirst && (!opts.path || depth >= path.length - 1)) match = options[0];
+        if (!match) break;
+        const picked = text(match);
+        if (ticked(match)) {
+          blur(input);
+          return true;
+        }
+        await humanClick(match);
+        await sleep(250);
+        if (spinning()) await settledOptions(3e3);
+        if (!opts.path && !opts.fallbackFirst) await dropWrongPicks(target, before, picked, "", 0.85);
+        if (multiselectSelected(target).length > before || multiselectSelected(target).some((x) => similarity(picked, x) >= 0.85)) {
+          blur(input);
+          return true;
+        }
+      }
+      input.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+      await sleep(80);
     }
-    input.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+    if (input.value) setNativeValue(input, "");
     blur(input);
     await sleep(80);
-    return multiselectSelected(target).some((s) => similarity(wanted, s) >= 0.6);
+    return multiselectSelected(target).length > before || multiselectSelected(target).some((s) => similarity(wanted, s) >= 0.6);
   }
   function searchVariants(value) {
     const out = [value];
@@ -1022,6 +1150,34 @@
       await chrome.runtime.sendMessage({ type: "wd:trustedType", text: value });
       await sleep(80);
     }
+    const target = Number(want);
+    if (Number.isFinite(target) && target > 0) {
+      const arrow = (up) => {
+        const k = up ? "ArrowUp" : "ArrowDown", kc = up ? 38 : 40;
+        for (const t of ["keydown", "keyup"]) {
+          const e = new KeyboardEvent(t, { key: k, code: k, bubbles: true, cancelable: true });
+          Object.defineProperty(e, "keyCode", { get: () => kc });
+          Object.defineProperty(e, "which", { get: () => kc });
+          seg.dispatchEvent(e);
+        }
+      };
+      seg.focus();
+      if (clean() === want) {
+        arrow(true);
+        await sleep(15);
+        arrow(false);
+        await sleep(15);
+      }
+      if (!clean()) {
+        arrow(true);
+        await sleep(20);
+      }
+      for (let i = 0; i < 120 && clean() !== want; i++) {
+        const cur = Number(clean() || 0);
+        arrow(cur < target);
+        await sleep(12);
+      }
+    }
     return clean() === want;
   }
   async function setDate(target, ym2) {
@@ -1035,10 +1191,30 @@
     if (year && y) ok = await setSegment(year, y) && ok;
     if (!month && !year) {
       const parts = [m, d, y].filter(Boolean);
-      return await setText(target, parts.join("")) || setText(target, parts.join("/"));
+      const input = target.matches("input") ? target : q("input", target);
+      const masked = !!input && /mm|yyyy|dd/i.test(input.placeholder || input.getAttribute("aria-placeholder") || "");
+      if (await setText(target, parts.join(masked ? "" : "/")) && !invalidDate(target)) return true;
+      return await setText(target, parts.join(masked ? "/" : "")) && !invalidDate(target);
     }
     if (year) blur(year);
+    if (ok && invalidDate(target)) {
+      if (month && m) {
+        setNativeValue(month, "");
+        ok = await setSegment(month, m);
+      }
+      if (year && y) {
+        setNativeValue(year, "");
+        ok = await setSegment(year, y) && ok;
+        blur(year);
+      }
+      await sleep(80);
+      ok = ok && !invalidDate(target);
+    }
     return ok;
+  }
+  function invalidDate(target) {
+    const c = target.closest('[data-automation-id^="formField-"]') ?? target;
+    return qa(sel("errorMessage"), c).filter(isVisible).some((e) => /invalid date|ungültiges datum|date non valide|date invalide|fecha no válida|fecha inválida|data non valida|data inválida|ongeldige datum|nieprawidłowa data/i.test(text(e)));
   }
   function dateValue(target) {
     const y = q(sel("dateYear"), target)?.value ?? "";
@@ -1171,14 +1347,30 @@
     for (const [rx2, kind] of STEP_RX) if (rx2.test(name)) return kind;
     return null;
   }
+  function authEmailInput() {
+    const byId = q(sel("email"));
+    if (byId && isVisible(byId)) return byId;
+    return qa('input[type="email"], input[autocomplete~="email" i], input[autocomplete="username"], input[name*="email" i], input[id*="email" i], input[aria-label*="email" i]').find((i) => isVisible(i) && i.type !== "password" && i.type !== "hidden") ?? null;
+  }
+  function authPasswordInputs() {
+    return qa('input[type="password"]').filter(isVisible);
+  }
   function detectPage() {
     const body = text(document.body).slice(0, 5e3);
     const next = nextButton();
+    if (SOMETHING_WRONG_RX.test(body) && !qa('[data-automation-id^="formField-"]').some(isVisible)) return "somethingWrong";
     if (SUBMITTED_RX.test(body) && !next)
       return "submitted";
     if (anyAid("verifyPassword") || anyAid("createAccountSubmit")) return "createAccount";
     if (anyAid("signInSubmit") || anyAid("password") && anyAid("email")) return "signIn";
     if (anyAid("signInWithEmail") && !anyAid("progressActive")) return "signIn";
+    if (!anyAid("progressActive")) {
+      const pws = authPasswordInputs();
+      if (pws.length >= 2) return "createAccount";
+      if (pws.length === 1 && authEmailInput()) return "signIn";
+    }
+    if (!anyAid("password") && !next && qa('button, [role="button"], a').some((b) => isVisible(b) && SIGN_IN_WITH_EMAIL_RX.test(text(b) || b.getAttribute("aria-label") || "")))
+      return "signIn";
     if (VERIFY_EMAIL_RX.test(body) && !anyAid("password") && !next)
       return "verifyEmail";
     if (anyAid("autofillWithResume") || anyAid("applyManually")) return "applyMethod";
@@ -1191,7 +1383,7 @@
       ["pageMyInfo", "myInformation"],
       ["pageAutofill", "resumeUpload"]
     ];
-    for (const [key, kind] of PAGES) if (anyAid(key)) return kind;
+    for (const [key2, kind] of PAGES) if (anyAid(key2)) return kind;
     const step = activeStepName();
     if (step) {
       if (isSubmitButton(next)) return "review";
@@ -1281,17 +1473,17 @@
     masterCoverLetter: "wd:masterCoverLetter",
     answers: "wd:answerBank",
     apps: "wd:applications",
-    job: (key) => `wd:job:${key}`,
+    job: (key2) => `wd:job:${key2}`,
     lastJob: (host2) => `wd:lastJob:${host2}`,
-    docs: (key) => `wd:docs:${key}`,
+    docs: (key2) => `wd:docs:${key2}`,
     run: (host2) => `wd:run:${host2}`
   };
-  async function get(key) {
-    const out = await chrome.storage.local.get(key);
-    return out?.[key];
+  async function get(key2) {
+    const out = await chrome.storage.local.get(key2);
+    return out?.[key2];
   }
-  async function set(key, value) {
-    await chrome.storage.local.set({ [key]: value });
+  async function set(key2, value) {
+    await chrome.storage.local.set({ [key2]: value });
   }
   function emptyProfile() {
     return {
@@ -1367,8 +1559,8 @@
     await set(K.job(job.key), job);
     await set(K.lastJob(job.tenantHost), job.key);
   }
-  async function getJob(key) {
-    return get(K.job(key));
+  async function getJob(key2) {
+    return get(K.job(key2));
   }
   async function getLastJobKey(host2) {
     return get(K.lastJob(host2));
@@ -1416,7 +1608,7 @@
 
   // src/workday/context.ts
   async function pace(ctx) {
-    await sleep(ctx.settings.fieldDelayMs + Math.floor(Math.random() * 60));
+    await sleep(ctx.settings.fieldDelayMs + Math.floor(Math.random() * 15));
   }
   function addFlag(run, f) {
     if (!run.flags.some((x) => x.label === f.label && x.page === f.page)) run.flags.push(f);
@@ -1446,10 +1638,10 @@
       return null;
     }
   }
-  async function resetByEmail(ctx, email) {
+  async function resetByEmail(ctx, email, why = "This employer already has an account with another password (or it is locked)") {
     const link = byAid("forgotPassword") ?? buttonByText(FORGOT_RX);
     if (!link || !email) return 'no "Forgot your password?" link here';
-    ctx.log("This employer already has an account with another password (or it is locked) — resetting it by email");
+    ctx.log(`${why} — resetting the password by email`);
     await humanClick(link);
     await waitStable(600);
     const em = byAid("email") ?? qa('input[type="email"]').find(isVisible) ?? null;
@@ -1480,10 +1672,16 @@
     return await chrome.runtime.sendMessage({ type: "wd:cred:get", tenantHost: host2 });
   }
   function captchaPresent() {
-    return qa('iframe[src*="recaptcha"], iframe[src*="hcaptcha"], iframe[title*="captcha" i], [data-automation-id*="captcha" i]').some(isVisible);
+    return qa(
+      'iframe[src*="recaptcha"], iframe[src*="hcaptcha"], iframe[src*="challenges.cloudflare"], iframe[title*="captcha" i], [data-automation-id*="captcha" i] iframe'
+    ).some(isVisible);
+  }
+  function typedEmail() {
+    const v = ((byAid("email") ?? authEmailInput())?.value || "").trim();
+    return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(v) ? v : "";
   }
   function emailFor(ctx, creds) {
-    return creds.cred?.email || ctx.profile.personal.email || creds.master?.email || "";
+    return creds.cred?.email || ctx.profile.personal.email || creds.master?.email || typedEmail();
   }
   async function chooseEmailSignIn() {
     const btn = byAid("signInWithEmail") ?? buttonByText(SIGN_IN_WITH_EMAIL_RX);
@@ -1494,8 +1692,20 @@
     }
     return false;
   }
-  async function submit(key, label) {
-    const btn = byAid(key) ?? buttonByText(label);
+  function onScreen(key2, label) {
+    const shown = (b) => {
+      const r = b.getBoundingClientRect();
+      const cs = getComputedStyle(b);
+      return r.width > 0 && r.height > 0 && cs.visibility !== "hidden" && cs.display !== "none";
+    };
+    const all = [
+      ...qa(sel(key2)),
+      ...qa('button, [role="button"]').filter((b) => label.test(text(b) || b.getAttribute("aria-label") || ""))
+    ].filter(shown);
+    return all.find((b) => b.closest('[role="dialog"], [aria-modal="true"]')) ?? all[0] ?? null;
+  }
+  async function submit(key2, label) {
+    const btn = byAid(key2) ?? buttonByText(label) ?? onScreen(key2, label);
     if (!btn) throw new NeedsHuman("Couldn't find the submit button on the sign-in form.");
     await humanClick(btn);
     await sleep(400);
@@ -1528,8 +1738,8 @@
     }
     ctx.run.authAttempts++;
     await ctx.save();
-    const email = byAid("email");
-    const pw = byAid("password");
+    const email = byAid("email") ?? authEmailInput();
+    const pw = byAid("password") ?? authPasswordInputs()[0] ?? null;
     if (!email || !pw) throw new NeedsHuman("Sign-in form fields not found.");
     await setText(email, cred.email || emailFor(ctx, creds));
     await pace(ctx);
@@ -1559,8 +1769,35 @@
       }
       throw new NeedsHuman("Sign-in was rejected. Check the saved password (Workday settings) or use 'Forgot password', then click Resume.");
     }
-    if (VERIFY_EMAIL_RX.test(text(document.body).slice(0, 3e3)) && !byAid("next")) {
-      throw new NeedsHuman("Workday wants you to verify your email. Click the link in the email it sent, sign in again if asked, then click Resume.");
+    if (VERIFY_EMAIL_RX.test(errs + " " + text(document.body).slice(0, 3e3)) && !byAid("next")) {
+      const em = cred.email || emailFor(ctx, creds);
+      ctx.log("Workday wants the e-mail verified — looking for its verification email");
+      const r = await askHost({
+        type: "wd:auth:mailVerify",
+        tenantHost: host2,
+        email: em,
+        since: Date.now() - 30 * 6e4,
+        wait: 25e3
+      });
+      if (r?.ok) {
+        ctx.log("Email verified from the link Workday sent — signing in again");
+        ctx.run.authAttempts = Math.max(0, ctx.run.authAttempts - 1);
+        await waitStable(600, 8e3);
+        return;
+      }
+      if (!r?.off && !ctx.run.verifyReset) {
+        ctx.run.verifyReset = true;
+        ctx.run.authAttempts = Math.max(0, ctx.run.authAttempts - 1);
+        await ctx.save();
+        const why = await resetByEmail(ctx, em, `No verification email found${r?.reason ? ` (${r.reason})` : ""}`);
+        if (!why) return;
+        throw new NeedsHuman(
+          `Workday wants you to verify your email, and the password reset by email didn't work either (${why}). Click the link in the email Workday sent, then click Resume.`
+        );
+      }
+      throw new NeedsHuman(
+        `Workday wants you to verify your email${r?.reason ? ` (${r.reason})` : ""}. Click the link in the email it sent — or turn on "Read verification emails" in the side panel — then click Resume.`
+      );
     }
     ctx.log("Signed in");
   }
@@ -1579,8 +1816,8 @@
       }
     }
     if (ctx.run.createAttempts >= 2) throw new NeedsHuman("Account creation failed twice. Finish it yourself, then click Resume.");
-    const email = ctx.profile.personal.email || creds.master?.email;
-    if (!email) throw new NeedsHuman("Add your email to the Workday profile (Settings) first.");
+    const email = ctx.profile.personal.email || creds.master?.email || typedEmail();
+    if (!email) throw new NeedsHuman('No e-mail to create the account with: open the side panel → Job Queue card → Applications Account, untick "Use profile email", type your e-mail (it saves when you leave the box), then click Resume.');
     let password;
     if (ctx.settings.useMasterPassword && creds.master) {
       password = creds.master.password;
@@ -1591,9 +1828,10 @@
     }
     ctx.run.createAttempts++;
     await ctx.save();
-    const emailEl = byAid("email");
-    const pw = byAid("password");
-    const verify = byAid("verifyPassword");
+    const pws = authPasswordInputs();
+    const emailEl = byAid("email") ?? authEmailInput();
+    const pw = byAid("password") ?? pws[0] ?? null;
+    const verify = byAid("verifyPassword") ?? (pws[1] && pws[1] !== pw ? pws[1] : null);
     if (!emailEl || !pw) throw new NeedsHuman("Create-account form fields not found.");
     await setText(emailEl, email);
     await pace(ctx);
@@ -1837,13 +2075,29 @@ OPTIONS: ${JSON.stringify(options.slice(0, 150))}`
       return false;
     }
   }
-  async function fill(ctx, key, value, root2 = document) {
-    const el = field(key, root2);
+  var touched = /* @__PURE__ */ new WeakSet();
+  if (typeof document !== "undefined") {
+    const mark = (e) => {
+      if (!e.isTrusted) return;
+      const c = e.target?.closest?.('[data-automation-id^="formField-"]');
+      if (c) touched.add(c);
+    };
+    for (const t of ["keydown", "mousedown", "paste"]) document.addEventListener(t, mark, true);
+  }
+  var TENANT_DEFAULTS = /* @__PURE__ */ new Set(["country", "phoneCode", "phoneType"]);
+  var skillsTried = /* @__PURE__ */ new Set();
+  function caseOnly(a, b) {
+    return a !== b && a.trim().toLowerCase() === b.trim().toLowerCase();
+  }
+  async function fill(ctx, key2, value, root2 = document) {
+    const el = field(key2, root2);
     if (!el) return false;
     const c = containerOf(el);
     handled.add(c);
     if (!value) return false;
-    if (hooks.keepExisting?.() && readValue(kindOf(c) === "none" ? el : c)) return true;
+    const existing = readValue(kindOf(c) === "none" ? el : c);
+    const keep = existing && (touched.has(c) || !TENANT_DEFAULTS.has(key2) && !caseOnly(existing, value));
+    if (hooks.keepExisting?.() && keep) return true;
     await pace(ctx);
     let ok = await writeValue(kindOf(c) === "none" ? el : c, value).catch((e) => {
       if (e instanceof NeedsHuman) return false;
@@ -1851,7 +2105,7 @@ OPTIONS: ${JSON.stringify(options.slice(0, 150))}`
     });
     if (!ok && ["dropdown", "radio", "checkboxGroup"].includes(kindOf(c))) ok = await translateChoice(ctx, c, value);
     if (!ok) {
-      const label = labelOf(c) || key;
+      const label = labelOf(c) || key2;
       if (isRequired(c)) ctx.flag(label, `Couldn't set "${value}"`);
       else ctx.log(`Skipped optional "${label}" (couldn't set "${value}")`, "warn");
     }
@@ -1860,8 +2114,8 @@ OPTIONS: ${JSON.stringify(options.slice(0, 150))}`
   function bulletsText(bullets) {
     return bullets.map((b) => `• ${b.replace(/^[•\-*]\s*/, "")}`).join("\n");
   }
-  function section(key, heading2) {
-    const byId = byAid(key);
+  function section(key2, heading2) {
+    const byId = byAid(key2);
     if (byId) return byId;
     const h = qa("h2, h3, h4, legend, [role='heading']").find((e) => isVisible(e) && heading2.test(text(e)));
     return h ? h.closest("section, fieldset, [role='group'], div[data-automation-id]") ?? h.parentElement : null;
@@ -1900,8 +2154,18 @@ OPTIONS: ${JSON.stringify(options.slice(0, 150))}`
       }
       const before = bs.length;
       await humanClick(add);
-      await waitFor(() => blocks(sectionEl, anchor).length > before, 6e3).catch(() => null);
-      await waitStable(300, 5e3);
+      const grew = () => blocks(sectionEl, anchor).length > before;
+      let ok = await waitFor(grew, 2500).then(() => true, () => false);
+      for (let attempt = 0; !ok && attempt < 3; attempt++) {
+        await waitStable(200, 4e3);
+        const fresh = addButton(sectionEl);
+        if (!fresh) break;
+        fresh.scrollIntoView({ block: "center" });
+        await sleep(120);
+        fresh.click();
+        ok = await waitFor(grew, 3500).then(() => true, () => false);
+      }
+      await waitStable(200, 3e3);
       bs = blocks(sectionEl, anchor);
     }
     return bs;
@@ -1942,6 +2206,73 @@ OPTIONS: ${JSON.stringify(options.slice(0, 150))}`
     const rx2 = which === "start" ? /^(from|start|first year|von|beginn|de$|du|début|desde|inicio|início|da$|dal|inizio|van|begin|od|開始|开始)/iu : /^(to|end|last year|graduation|bis|ende|à$|au|fin|hasta|até|término|a$|al|fine|tot|eind|do|終了|结束)/iu;
     return qa('[data-automation-id^="formField-"]', block).find((c) => isVisible(c) && rx2.test(labelOf(c)) && kindOf(c) === "date") ?? null;
   }
+  function nationalNumber(raw, countryCode = "") {
+    const s = String(raw || "").trim();
+    const cc = countryCode.replace(/\D/g, "");
+    let d = s.replace(/\D/g, "");
+    const international = /^(\+|00)/.test(s);
+    if (international && s.startsWith("00")) d = d.slice(2);
+    if (international && cc && d.startsWith(cc)) d = d.slice(cc.length);
+    else if (international) {
+      const m = s.match(/^\(?(?:\+|00)\s*(\d{1,3})\)?[\s.\-)]/);
+      if (m) d = d.slice(m[1].length);
+    }
+    if (cc !== "39") d = d.replace(/^0+/, "");
+    return d;
+  }
+  async function sourceFallback(ctx, c) {
+    const src = ctx.profile.answers.source;
+    const paths = [
+      [["Social Media", src], false],
+      [["Social Networking", src], false],
+      [["Social Network", src], false],
+      [["Job Board", src], false],
+      [["Online Job Board", src], false],
+      [["Internet", src], false],
+      [["Job Board", "Other"], true],
+      [["Online Job Board", "Other"], true],
+      [["Job Posting", "Other"], true],
+      [["Website", "Other"], true]
+    ];
+    if (kindOf(c) === "multiselect") {
+      for (const [path, fallbackFirst] of paths) {
+        if (await multiselectPick(c, path[path.length - 1], { path, min: 0.75, fallbackFirst })) return true;
+      }
+    }
+    for (const v of ["Job Board", "Online Job Board", "Social Media", "Internet", "Website"]) if (await selectDropdown(c, v, 0.75)) return true;
+    return false;
+  }
+  var SPECIALISED_DEGREE_RX = /\b(m\.?\s?p\.?\s?h|public health|m\.?\s?b\.?\s?a|business admin|m\.?\s?f\.?\s?a|b\.?\s?f\.?\s?a|fine arts|m\.?\s?s\.?\s?w|b\.?\s?s\.?\s?w|social work|m\.?\s?ed\b|b\.?\s?ed\b|of education|m\.?\s?p\.?\s?a|public admin|ll\.?\s?[bm]\b|of laws|m\.?\s?arch|b\.?\s?arch|architecture|m\.?\s?d\b|medicine|m\.?\s?p\.?\s?p|public policy|m\.?\s?div|divinity|m\.?\s?h\.?\s?a|health admin|m\.?\s?s\.?\s?n|b\.?\s?s\.?\s?n|nursing|music|m\.?\s?a\.?\s?t\b|teaching|physical therapy|pharm|dental|veterinar|j\.?\s?d\b|juris)/i;
+  function degreeLevel(t) {
+    const s = t.toLowerCase();
+    if (/\b(ph\.?\s?d|doctor|doctorate|d\.?\s?phil)/.test(s)) return "doctor";
+    if (/\bmaster|\bm\.?\s?sc?\b|\bm\.?\s?a\b|\bm\.?\s?eng\b|\bm\.?\s?res\b|\bmba\b|\bmph\b|\bm\.?\s?s\.?\b/.test(s)) return "master";
+    if (/\bbachelor|\bb\.?\s?sc?\b|\bb\.?\s?a\b|\bb\.?\s?eng\b|\bb\.?\s?s\.?\b|undergraduate/.test(s)) return "bachelor";
+    if (/\bassociate/.test(s)) return "associate";
+    return "";
+  }
+  function pickDegreeOption(options, wanted) {
+    const w = String(wanted || "").trim();
+    const lvl = degreeLevel(w);
+    const generic = /^(master'?s?|masters|bachelor'?s?|bachelors|doctorate|ph\.?\s?d|associate'?s?)(\s+degree)?$/i.test(w) || /^(m\.?\s?sc?|b\.?\s?sc?|m\.?\s?a|b\.?\s?a|m\.?\s?eng|b\.?\s?eng)\.?$/i.test(w);
+    if (!lvl || !generic) return null;
+    const arts = /^(m|b)\.?\s?a\.?$/i.test(w);
+    let best = null;
+    let top = -1;
+    for (const o of options) {
+      if (degreeLevel(o) !== lvl || SPECIALISED_DEGREE_RX.test(o)) continue;
+      const plain = o.replace(/\(.*?\)/g, "").trim();
+      let sc = 0;
+      if (/^(master|bachelor|doctor|associate)'?s?(\s+degree)?$/i.test(plain) || /'?s degree$/i.test(plain)) sc += 3;
+      if (/science|\b[mb]\.?\s?s\.?c?\b/i.test(o)) sc += arts ? 1 : 2;
+      if (/\barts?\b|\b[mb]\.?\s?a\b/i.test(o)) sc += arts ? 2 : 0;
+      if (sc > top) {
+        top = sc;
+        best = o;
+      }
+    }
+    return best;
+  }
   async function myInformation(ctx) {
     const me = ctx.profile.personal;
     const sourceEl = field("source");
@@ -1951,15 +2282,7 @@ OPTIONS: ${JSON.stringify(options.slice(0, 150))}`
       const want = ctx.profile.answers.source;
       if (!readValue(c) && want) {
         await pace(ctx);
-        let ok = await multiselectPick(c, want) || await selectDropdown(c, want);
-        for (const folder of ["Social Media", "Social Network", "Job Board", "Online Job Board", "Internet", "Website"]) {
-          if (ok) break;
-          if (kindOf(c) === "multiselect" && await multiselectPick(c, folder, { min: 0.7 })) {
-            ok = true;
-            break;
-          }
-          ok = await selectDropdown(c, folder, 0.7);
-        }
+        const ok = await multiselectPick(c, want) || await selectDropdown(c, want) || await sourceFallback(ctx, c);
         if (ok) ctx.log(`How did you hear → ${readValue(c) || want}`);
         else if (isRequired(c)) ctx.flag(labelOf(c) || "How did you hear about us", `No option like "${want}"`);
       }
@@ -2007,10 +2330,7 @@ OPTIONS: ${JSON.stringify(options.slice(0, 150))}`
         if (!ok) ctx.flag("Country Phone Code", `No option like "${want}"`);
       }
     }
-    const dial = me.phone.countryCode.replace(/\D/g, "");
-    let national = me.phone.number.replace(/\D/g, "");
-    if (dial && me.phone.number.trim().startsWith("+") && national.startsWith(dial)) national = national.slice(dial.length);
-    await fill(ctx, "phoneNumber", national.replace(/^0+/, ""));
+    await fill(ctx, "phoneNumber", nationalNumber(me.phone.number, me.phone.countryCode));
     const email = field("email");
     if (email && !readValue(containerOf(email))) await fill(ctx, "email", me.email);
   }
@@ -2051,7 +2371,13 @@ OPTIONS: ${JSON.stringify(options.slice(0, 150))}`
       }
       if (!ok) ctx.flag(`School: ${e.school}`, "Not in the tenant's school list");
     }
-    await fill(ctx, "degreeF", e.degree, block);
+    let degree = e.degree;
+    const degEl = field("degreeF", block);
+    if (degEl && degree && kindOf(containerOf(degEl)) === "dropdown") {
+      const pick2 = pickDegreeOption(await optionsOf(containerOf(degEl)).catch(() => []), degree);
+      if (pick2) degree = pick2;
+    }
+    await fill(ctx, "degreeF", degree, block);
     const fos = field("fieldF", block);
     if (fos && e.field) {
       const c = containerOf(fos);
@@ -2107,6 +2433,21 @@ OPTIONS: ${JSON.stringify(options.slice(0, 150))}`
       }
     }
   }
+  async function verifyBlocks(ctx, sectionEl, anchor, items, fillFn) {
+    for (let pass = 0; pass < 2; pass++) {
+      await waitStable(150, 2e3);
+      const bs = await ensureBlockCount(ctx, sectionEl, anchor, items.length);
+      let fixed = 0;
+      for (let i = 0; i < Math.min(bs.length, items.length); i++) {
+        const a = field(anchor, bs[i]);
+        if (a && readValue(containerOf(a))) continue;
+        await fillFn(ctx, bs[i], items[i]);
+        fixed++;
+      }
+      if (!fixed) return;
+      ctx.log(`Re-filled ${fixed} ${anchor === "jobTitleF" ? "work" : "education"} entr(ies) that came back empty`, "warn");
+    }
+  }
   async function myExperience(ctx) {
     await hooks.beforeExperience?.();
     const p = ctx.profile;
@@ -2114,6 +2455,7 @@ OPTIONS: ${JSON.stringify(options.slice(0, 150))}`
     if (work && p.work.length) {
       const bs = await ensureBlockCount(ctx, work, "jobTitleF", p.work.length);
       for (let i = 0; i < Math.min(bs.length, p.work.length); i++) await fillWork(ctx, bs[i], p.work[i]);
+      await verifyBlocks(ctx, work, "jobTitleF", p.work, fillWork);
       ctx.log(`Work experience: ${p.work.length} role(s) filled`);
       await markCurrentRole(ctx, work);
     } else if (work) {
@@ -2125,6 +2467,7 @@ OPTIONS: ${JSON.stringify(options.slice(0, 150))}`
       const anchor = q(sel("schoolF"), edu) ? "schoolF" : "degreeF";
       const bs = await ensureBlockCount(ctx, edu, anchor, p.education.length);
       for (let i = 0; i < Math.min(bs.length, p.education.length); i++) await fillEducation(ctx, bs[i], p.education[i]);
+      await verifyBlocks(ctx, edu, anchor, p.education, fillEducation);
       ctx.log(`Education: ${p.education.length} entr(ies) filled`);
     } else if (edu && hooks.autoSubmit?.()) {
       await pruneIncomplete(ctx, edu, q(sel("schoolF"), edu) ? "schoolF" : "degreeF");
@@ -2159,22 +2502,22 @@ OPTIONS: ${JSON.stringify(options.slice(0, 150))}`
     if (skillsEl) {
       const c = containerOf(skillsEl);
       handled.add(c);
-      const list = (ctx.docs?.tailored?.skills ?? p.skills).slice(0, ctx.settings.maxSkills);
+      const max = Math.min(10, ctx.settings.maxSkills || 10);
+      const list = (ctx.docs?.tailored?.skills ?? p.skills).slice(0, max);
       let added = 0;
       for (const s of list) {
+        if (multiselectSelected(c).length >= max) break;
+        const key2 = location.pathname + "|" + s.toLowerCase();
+        if (skillsTried.has(key2)) continue;
+        skillsTried.add(key2);
         if (multiselectSelected(c).some((x) => similarity(x, s) >= 0.85)) continue;
         await pace(ctx);
-        for (const v of searchVariants(s)) {
-          if (await multiselectPick(c, v, { min: 0.75 })) {
-            added++;
-            break;
-          }
-        }
+        if (await multiselectPick(c, s, { min: 0.75 })) added++;
       }
       ctx.log(`Skills: ${added} added`);
     }
     await uploadDocuments(ctx);
-    const sites = [p.personal.website, p.personal.github].filter(Boolean);
+    const sites = [field("linkedin") ? "" : p.personal.linkedin, p.personal.github, p.personal.website].filter(Boolean);
     const web = section("webSection", /^(websites?|webseiten?|sites? web|sitios web|sites|siti web|websites?|strony)/iu);
     if (web && sites.length) {
       const bs = await ensureBlockCount(ctx, web, "urlF", sites.length);
@@ -2193,8 +2536,8 @@ OPTIONS: ${JSON.stringify(options.slice(0, 150))}`
     }
     await waitStable(1200, 3e4);
   }
-  async function eeo(ctx, key, pref, label) {
-    const el = field(key);
+  async function eeo(ctx, key2, pref, label) {
+    const el = field(key2);
     if (!el) return;
     const c = containerOf(el);
     handled.add(c);
@@ -2242,20 +2585,30 @@ OPTIONS: ${JSON.stringify(options.slice(0, 150))}`
   async function selfIdentify(ctx) {
     const name = `${ctx.profile.personal.firstName} ${ctx.profile.personal.lastName}`.trim();
     await fill(ctx, "selfIdName", name);
-    const dateEl = field("selfIdDate");
+    const dateEl = field("selfIdDate") ?? q('[id$="dateSignedOn-dateSectionMonth-input"], [id$="dateSignedOn-dateSectionYear-input"]');
     if (dateEl) {
       const c = containerOf(dateEl);
       handled.add(c);
       const d = /* @__PURE__ */ new Date();
-      const iso = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
-      if (!readValue(c)) await setDate(c, iso);
+      const mm = String(d.getMonth() + 1).padStart(2, "0"), dd = String(d.getDate()).padStart(2, "0"), yyyy = String(d.getFullYear());
+      const iso = `${yyyy}-${mm}-${dd}`;
+      const seg = (s) => (q(sel(s), c)?.value || "").replace(/^0+/, "");
+      const isToday = () => seg("dateMonth") === String(+mm) && (!q(sel("dateDay"), c) || seg("dateDay") === String(+dd)) && seg("dateYear") === yyyy;
+      for (let i = 0; i < 2 && !isToday(); i++) await setDate(c, iso);
+      if (!isToday()) ctx.flag("Self-identification date", `Couldn't set today's date (${mm}/${dd}/${yyyy})`);
     }
     const dis = field("disability");
     if (dis) {
       const c = containerOf(dis);
       handled.add(c);
       const pref = ctx.profile.eeo.disability;
-      const wanted = pref === "yes" ? "Yes, I have a disability" : pref === "no" ? "No, I do not have a disability" : "decline";
+      const wanted = pref === "yes" ? "Yes, I have a disability, or have had one in the past" : pref === "no" ? "No, I do not have a disability and have not had one in the past" : "decline";
+      for (const b of qa('input[type="checkbox"], [role="checkbox"]', c)) {
+        const on = b.checked || b.getAttribute("aria-checked") === "true";
+        const l = optionLabel(b);
+        const right = wanted === "decline" ? DECLINE_RX2.test(l) : similarity(wanted, l) >= 0.85;
+        if (on && !right) await setCheckbox(b, false);
+      }
       const ok = await checkInGroup(c, wanted) || await selectRadio(c, wanted);
       if (!ok) ctx.flag("Disability status", "Couldn't select your saved choice");
     }
@@ -2566,7 +2919,15 @@ OPTIONS: ${JSON.stringify(options.slice(0, 150))}`
     ctx.log("Tailoring tool didn't respond in 90 s — continuing with the fallback CV", "warn");
   }
   var ASSIST_PAGES = ["resumeUpload", "myInformation", "myExperience", "questions", "voluntaryDisclosures", "selfIdentify"];
+  var HANDOFF_PAGES = [...ASSIST_PAGES, "review"];
   async function handlePage(ctx, page) {
+    if (hooks.handOff && HANDOFF_PAGES.includes(page) && await hooks.handOff(ctx.run)) {
+      ctx.run.status = "idle";
+      ctx.run.pauseReason = void 0;
+      ctx.log("Signed in — OptimHire's own autofill fills the application from here");
+      await ctx.save();
+      return "stop";
+    }
     if (hooks.advance && !hooks.advance() && !ASSIST_PAGES.includes(page)) return "stop";
     if (["jobPosting", "applyMethod", "candidateHome", "unknown"].includes(page) && ALREADY_APPLIED_RX.test(text(document.body).slice(0, 6e3))) {
       throw new NeedsHuman("You have already applied to this job (Workday allows one application per job).");
@@ -2643,6 +3004,23 @@ OPTIONS: ${JSON.stringify(options.slice(0, 150))}`
         return "stop";
       case "candidateHome":
         throw new NeedsHuman("You're on your candidate home page. Open the job (or the draft under My Applications), then click Resume.");
+      case "somethingWrong": {
+        const k = `ua-wd-refresh|${location.pathname}`;
+        const n = Number(sessionStorage.getItem(k) || 0);
+        if (n >= 2) throw new Error('Workday kept saying "Something went wrong" — skipping this job');
+        sessionStorage.setItem(k, String(n + 1));
+        await ctx.save();
+        const posting = location.href.replace(/\/apply(\/.*)?(\?.*)?$/, "");
+        if (n === 1 && posting !== location.href) {
+          ctx.log('Workday still says "Something went wrong" — reopening the job posting', "warn");
+          location.href = posting;
+        } else {
+          ctx.log('Workday said "Something went wrong" — refreshing the page', "warn");
+          location.reload();
+        }
+        await sleep(1e4);
+        return "stop";
+      }
       default:
         ctx.run.attempts++;
         if (ctx.run.attempts > 5) throw new NeedsHuman("Unrecognised page. Move to the next step yourself, then click Resume.");
@@ -2700,6 +3078,15 @@ OPTIONS: ${JSON.stringify(options.slice(0, 150))}`
     ctx.log("Submitting the application");
     await humanClick(btn);
     await sleep(500);
+    const moved = () => detectPage() !== "review" || errorMessages().length > 0;
+    if (!await waitFor(moved, 3e3, 200).then(() => true, () => false)) {
+      const again = nextButton();
+      if (again && isSubmitButton(again)) {
+        ctx.log("Submit click didn't register — retrying with a native click", "warn");
+        again.click();
+        await sleep(500);
+      }
+    }
     const outcome = await waitFor(() => detectPage() === "submitted" ? "done" : errorMessages().length ? "error" : null, 3e4, 250).catch(
       () => "timeout"
     );
@@ -2829,14 +3216,30 @@ OPTIONS: ${JSON.stringify(options.slice(0, 150))}`
     } catch {
     }
   }
-  var ASSIST_KEYS = ["ohAutoTrigger", "ohWdEngineOff", "ohAutomationDisabled", "isAutoProcessStartJob", "isManuallyStartJob", "ohJobQueueActive"];
+  var ASSIST_KEYS = ["ohAutoTrigger", "ohWdEngineOff", "ohAutomationDisabled", "isAutoProcessStartJob", "isManuallyStartJob", "ohJobQueueActive", "ohWdEngineForms"];
   var assistOn = false;
+  var engineForms = false;
+  var acctAssistOn = false;
   function readAssist() {
     ST.get(ASSIST_KEYS).then((d) => {
       const running = !!(d.isAutoProcessStartJob || d.isManuallyStartJob || d.ohJobQueueActive);
-      assistOn = d.ohAutoTrigger !== false && d.ohWdEngineOff !== true && d.ohAutomationDisabled !== true && !running;
+      engineForms = d.ohWdEngineForms === true;
+      const allowed = d.ohAutoTrigger !== false && d.ohWdEngineOff !== true && d.ohAutomationDisabled !== true && !running;
+      assistOn = engineForms && allowed;
+      acctAssistOn = !engineForms && allowed;
     }, () => {
     });
+  }
+  var SELF_FILL_KEY = "ohWdSelfFill";
+  function selfFill() {
+    try {
+      return sessionStorage.getItem(SELF_FILL_KEY) === "1";
+    } catch {
+      return false;
+    }
+  }
+  function formsToOptimHire() {
+    return !engineForms && !selfFill() && hasWorkdayApp() && HANDOFF_PAGES.includes(detectPage());
   }
   readAssist();
   chrome.storage.onChanged.addListener((c, area) => {
@@ -2853,8 +3256,10 @@ OPTIONS: ${JSON.stringify(options.slice(0, 150))}`
   }
   window.__ohWdEngine = {
     // …and the pages of Workday's emailed links, which the background fills in its own tab.
-    owns: () => TOP && (!!readMode() || isActive() || assistOn && hasWorkdayApp() || /passwordreset|resetpassword|\/activate\b|verifyemail|verifyaccount/i.test(location.pathname)),
+    owns: () => TOP && !formsToOptimHire() && (!!readMode() || isActive() || assistOn && hasWorkdayApp() || /passwordreset|resetpassword|\/activate\b|verifyemail|verifyaccount/i.test(location.pathname)),
     takesManual: () => TOP && hasWorkdayApp(),
+    // The CSV queue fills these pages the way it fills every other ATS.
+    formsToOptimHire: () => TOP && formsToOptimHire(),
     isWorkday: () => TOP && isWorkdayHost(),
     startQueueJob: (job) => void startQueueJob(job),
     queueResult
@@ -2895,6 +3300,19 @@ OPTIONS: ${JSON.stringify(options.slice(0, 150))}`
     const r = crypto.getRandomValues(new Uint32Array(12));
     return "Oh" + Array.from(r, (n) => abc[n % abc.length]).join("") + "!7q";
   }
+  function anyEmail(o, depth = 0) {
+    if (!o || typeof o !== "object" || depth > 3) return "";
+    const keys = Object.keys(o).sort((a, b) => Number(/email/i.test(b)) - Number(/email/i.test(a)));
+    for (const k of keys) {
+      const v = o[k];
+      if (typeof v === "string" && /email/i.test(k) && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(v.trim())) return v.trim();
+      if (v && typeof v === "object") {
+        const f = anyEmail(v, depth + 1);
+        if (f) return f;
+      }
+    }
+    return "";
+  }
   async function workdayLogin() {
     const d = await ST.get([LOGIN_KEY, "appAccountEmail", "appAccountPassword", "ohGmailCodes"]);
     const login = Object.assign({ sites: {} }, d[LOGIN_KEY] || {});
@@ -2902,7 +3320,18 @@ OPTIONS: ${JSON.stringify(options.slice(0, 150))}`
       login.password = d.appAccountPassword || makePassword();
       await ST.set({ [LOGIN_KEY]: login });
     }
-    const email = login.email || d.appAccountEmail || (await profileSources()).email || "";
+    const src = await profileSources();
+    let email = login.email || d.appAccountEmail || src.email || anyEmail(src) || "";
+    if (!email) {
+      const box = document.querySelector('[data-automation-id="email"], input[type="email"]');
+      const typed = (box?.value || "").trim();
+      if (/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(typed)) email = typed;
+    }
+    if (email && !login.email) {
+      login.email = email;
+      await ST.set({ [LOGIN_KEY]: login });
+      say(`Workday sign-in e-mail saved: ${email}`);
+    }
     return { email, password: login.password, login, d };
   }
   async function noteSite(state, extra = {}, host2 = tenantHost()) {
@@ -2940,15 +3369,20 @@ OPTIONS: ${JSON.stringify(options.slice(0, 150))}`
     const r = resetsToday(site);
     return d.ohGmailCodes === true && login.resetByEmail !== false && !!email && r.length < 2 && !(r.length && Date.now() - Math.max(...r) < RESET_EVERY);
   }
-  function mailLink(kind, host2, email, since, password) {
+  function mailLink(kind, host2, email, since, password, wait = 15e4) {
     return new Promise((resolve) => {
+      const t = setTimeout(() => resolve({ ok: false, reason: "timed out waiting for the email" }), wait + 3e4);
+      const done = (r) => {
+        clearTimeout(t);
+        resolve(r);
+      };
       try {
-        chrome.runtime.sendMessage({ type: "OH_WD_MAIL_LINK", kind, host: host2, email, since, password }, (r) => {
+        chrome.runtime.sendMessage({ type: "OH_WD_MAIL_LINK", kind, host: host2, email, since, password, wait }, (r) => {
           void chrome.runtime.lastError;
-          resolve(r || { ok: false, reason: "no answer" });
+          done(r || { ok: false, reason: "no answer" });
         });
       } catch {
-        resolve({ ok: false, reason: "extension reloaded" });
+        done({ ok: false, reason: "extension reloaded" });
       }
     });
   }
@@ -3011,9 +3445,10 @@ OPTIONS: ${JSON.stringify(options.slice(0, 150))}`
       case "wd:auth:mailVerify": {
         const { email } = await workdayLogin();
         const host2 = String(msg.tenantHost || tenantHost());
-        const r = await mailLink("verify", host2, String(msg.email || email), Number(msg.since) || Date.now() - 6e5);
+        const wait = Math.max(1e4, Math.min(15e4, Number(msg.wait) || 15e4));
+        const r = await mailLink("verify", host2, String(msg.email || email), Number(msg.since) || Date.now() - 6e5, void 0, wait);
         if (r.ok) await noteSite("account", {}, host2);
-        return { ok: !!r.ok, reason: r.reason };
+        return { ok: !!r.ok, reason: r.reason, off: /codes are off|not signed in/i.test(String(r.reason || "")) };
       }
       case "wd:cred:set":
         await noteSite("account", { password: String(msg.password || "") || void 0 });
@@ -3125,20 +3560,73 @@ OPTIONS: ${JSON.stringify(options.slice(0, 150))}`
     }
     return v && typeof v === "object" ? v : {};
   }
+  var PLACE_PART = /* @__PURE__ */ new Set([
+    "location",
+    "city",
+    "state",
+    "province",
+    "region",
+    "country",
+    "county",
+    "zip",
+    "zipcode",
+    "postal",
+    "postcode",
+    "address",
+    "street",
+    "lat",
+    "lng",
+    "latitude",
+    "longitude",
+    "timezone"
+  ]);
+  function isPlaceKey(k) {
+    return /post_?code/i.test(k) || k.split(/[_\W]+|(?=[A-Z])/).some((p) => PLACE_PART.has(p.toLowerCase()));
+  }
   async function profileSources(ad) {
-    const d = await ST.get(["candidateDetails", "cachedSeekerInfo", "seekerDetails", "userDetails", "complexFormData", "autoApplyState", "manualApplicationDetail", SEEKER_KEY]);
+    const d = await ST.get([
+      "candidateDetails",
+      "cachedSeekerInfo",
+      "seekerDetails",
+      "userDetails",
+      "complexFormData",
+      "autoApplyState",
+      "manualApplicationDetail",
+      SEEKER_KEY,
+      "ohMyPhone",
+      "ohCvProfile",
+      "appAccountEmail"
+    ]);
     const merged = Object.assign({}, parse(d[SEEKER_KEY]));
+    const jobs = [];
     for (const k of ["manualApplicationDetail", "autoApplyState", "complexFormData"]) {
       const v = parse(d[k]);
       const s = (v.applicationDetails || v).seeker;
-      if (s && typeof s === "object") Object.assign(merged, s);
+      if (s && typeof s === "object") jobs.push(s);
     }
+    const current = jobs.concat(ad && ad.seeker && typeof ad.seeker === "object" ? [ad.seeker] : []);
+    if (current.some((s) => Object.keys(s).some((k) => isPlaceKey(k) && s[k] != null && s[k] !== "" && typeof s[k] !== "object"))) {
+      for (const k of Object.keys(merged)) if (isPlaceKey(k)) delete merged[k];
+    }
+    for (const s of jobs) Object.assign(merged, s);
     for (const k of ["userDetails", "seekerDetails", "cachedSeekerInfo", "candidateDetails"]) {
       const v = parse(d[k]);
       for (const [kk, vv] of Object.entries({ ...v, ...v.seeker && typeof v.seeker === "object" ? v.seeker : {} }))
         if (vv !== "" && vv != null) merged[kk] = vv;
     }
     for (const [k, v] of Object.entries(ad && ad.seeker || {})) if (v !== "" && v != null) merged[k] = v;
+    const mine = String(d.ohMyPhone || "").trim();
+    if (mine) {
+      const m = mine.match(/^\+\s*(\d{1,3})\s*(.*)$/);
+      if (m) merged.mobile_code = m[1];
+      merged.mobile_num = (m ? m[2] : mine).replace(/\D/g, "");
+      merged.phone = mine;
+    }
+    const cvc = (parse(d.ohCvProfile).profile || {}).contact || {};
+    if (!merged.mobile_num && !merged.phone && cvc.phone) merged.phone = cvc.phone;
+    if (!merged.email && cvc.email) merged.email = cvc.email;
+    if (!merged.linkedin_profile_url && cvc.linkedin) merged.linkedin_profile_url = cvc.linkedin;
+    if (!merged.email && d.appAccountEmail) merged.email = String(d.appAccountEmail);
     return merged;
   }
   function ym(v) {
@@ -3177,7 +3665,7 @@ OPTIONS: ${JSON.stringify(options.slice(0, 150))}`
         current: !!(w.is_current ?? w.current ?? w.currently_working ?? w.currently_work_here) || !end && /present|current|now/i.test(String(endRaw)),
         bullets: String(w.description ?? w.summary ?? w.responsibilities ?? "").split(/\n+|•/).map((x) => x.replace(/^[\s\-*]+/, "").trim()).filter(Boolean).slice(0, 6)
       };
-    }).filter((w) => w.title && w.company && w.start);
+    }).filter((w) => w.title && w.company);
     const education = listOf(s, ["education", "educations", "education_history", "academics", "qualifications"]).map((e, i) => ({
       id: `e${i + 1}`,
       school: pick(e, "school", "school_name", "institution", "institute", "university", "college"),
@@ -3234,7 +3722,7 @@ OPTIONS: ${JSON.stringify(options.slice(0, 150))}`
         firstName: pick(s, "first_name", "firstName", "given_name"),
         lastName: pick(s, "last_name", "lastName", "family_name", "surname"),
         preferredName: "",
-        email: pick(s, "email", "email_address", "emailAddress"),
+        email: pick(s, "email", "email_address", "emailAddress") || anyEmail(s),
         phone: { countryName: DIAL[code] || country, countryCode: code ? `+${code}` : "", number: num, deviceType: "Mobile" },
         address: {
           line1: pick(s, "street", "address_line1", "address1", "street_address") || pick(s, "address").split(",")[0] || "",
@@ -3264,6 +3752,27 @@ OPTIONS: ${JSON.stringify(options.slice(0, 150))}`
         previouslyWorkedHere: false
       }
     });
+    {
+      const pk = (...k) => pick(s, ...k);
+      const yn = (v) => {
+        const t = String(v || "").trim().toLowerCase();
+        if (!t || /prefer not|decline|wish/.test(t)) return "decline";
+        if (/^(no|i do not|i don'?t|not a|none)/.test(t)) return "no";
+        if (/^(yes|i have|i am)/.test(t)) return "yes";
+        return "decline";
+      };
+      const dc = (v) => {
+        const t = String(v || "").trim();
+        return !t || /prefer not|decline|do not wish|don'?t wish|not to say/i.test(t) ? "decline" : t;
+      };
+      base.eeo = {
+        gender: dc(pk("gender", "sex")),
+        hispanicOrLatino: yn(pk("hispanic_latino", "hispanicOrLatino", "hispanic", "latino")),
+        ethnicity: dc(pk("ethnicity", "race", "race_ethnicity")),
+        veteran: dc(pk("veteran", "veteran_status", "veteranStatus")),
+        disability: yn(pk("disability", "disability_status", "disabilityStatus", "has_disability"))
+      };
+    }
     const withCv = async (prof) => {
       if (prof.work.length || !cvUrl) {
         cvReady = Promise.resolve();
@@ -3284,13 +3793,13 @@ OPTIONS: ${JSON.stringify(options.slice(0, 150))}`
     const fillIn = (a, b) => {
       for (const k of Object.keys(b)) {
         if (b[k] && typeof b[k] === "object" && !Array.isArray(b[k])) fillIn(a[k] ??= {}, b[k]);
-        else if (a[k] === "" || a[k] == null || Array.isArray(a[k]) && !a[k].length) a[k] = b[k];
+        else if (a[k] === "" || a[k] == null || Array.isArray(a[k]) && !a[k].length || a[k] === "decline" && b[k] && b[k] !== "decline") a[k] = b[k];
       }
     };
     fillIn(p, base);
     return withCv(p);
   }
-  var ASSIST_SETTINGS = () => ({ ...SETTINGS, fieldDelayMs: 10 });
+  var ASSIST_SETTINGS = () => ({ ...SETTINGS, fieldDelayMs: 5 });
   var SETTINGS = {
     ...DEFAULT_WD_SETTINGS,
     consentCreateAccountTerms: true,
@@ -3302,7 +3811,7 @@ OPTIONS: ${JSON.stringify(options.slice(0, 150))}`
     llmAnswers: false,
     // answers come from OptimHire (hooks.answer) instead
     trustedInputFallback: false,
-    fieldDelayMs: 40,
+    fieldDelayMs: 15,
     fallbackToMasterCv: true,
     externalAutoRequest: false
   };
@@ -3397,8 +3906,119 @@ OPTIONS: ${JSON.stringify(options.slice(0, 150))}`
       answer: hostAnswer,
       onPage: (run) => onPage(mode, run),
       beforeExperience: () => within(cvReady, 3e4).then(() => void 0),
-      onFinish: (run, outcome) => void finish(mode, run, outcome)
+      onFinish: (run, outcome) => void finish(mode, run, outcome),
+      ...engineForms || mode.assist ? {} : { handOff: () => handOff(mode, profile) }
     });
+  }
+  var SKILLS_KEY = "ohWdSkills";
+  var skillsFor = [];
+  async function skillsList() {
+    if (skillsFor.length) return skillsFor;
+    try {
+      skillsFor = JSON.parse(sessionStorage.getItem(SKILLS_KEY) || "[]");
+    } catch {
+    }
+    if (!skillsFor.length) {
+      const p = await within(buildProfile(void 0, await primaryCvUrl()), 2e4).catch(() => null);
+      skillsFor = (p?.skills || []).slice(0, SKILLS_MAX);
+    }
+    return skillsFor;
+  }
+  async function handOff(mode, profile) {
+    skillsFor = (profile.skills || []).slice(0, SKILLS_MAX);
+    try {
+      sessionStorage.setItem(SKILLS_KEY, JSON.stringify(skillsFor));
+    } catch {
+    }
+    const r = await within(chrome.runtime.sendMessage({ type: "OH_WD_HANDOFF" }), 5e3).catch(() => null);
+    const { ohJobQueueActive } = await ST.get("ohJobQueueActive");
+    if (r?.via !== "fill" && !ohJobQueueActive) {
+      if (!selfFill()) say("signed in — nothing from OptimHire to hand over, so the engine fills the application");
+      try {
+        sessionStorage.setItem(SELF_FILL_KEY, "1");
+      } catch {
+      }
+      return false;
+    }
+    try {
+      sessionStorage.removeItem(SELF_FILL_KEY);
+    } catch {
+    }
+    clearMode();
+    say(`signed in — OptimHire's own Workday autofill fills the application (${r?.via === "fill" ? "its job" : "the queue"})`);
+    if (mode.auto && r?.via !== "fill") send({ type: "COMPLEX_FORM_PROGRESS", progress: 75, message: "Workday: OptimHire fills the application" });
+    return true;
+  }
+  async function fillSkills() {
+    const box = field("skills");
+    const list = box ? await skillsList() : [];
+    if (!box || !list.length) return;
+    const c = box.closest('[data-automation-id^="formField"]') ?? box;
+    let added = 0;
+    for (const s of list.slice(0, SKILLS_MAX)) {
+      if (detectPage() !== "myExperience" || multiselectSelected(c).length >= SKILLS_MAX) break;
+      if (multiselectSelected(c).some((x) => similarity(x, s) >= 0.85)) continue;
+      if (await multiselectPick(c, s, { min: 0.75 })) added++;
+      await sleep(150);
+    }
+    say(`skills: ${added} added`);
+  }
+  var SKILLS_MAX = 10;
+  var OPTION_SEL = '[data-automation-id="promptOption"], [data-automation-id="promptLeafNode"], [role="option"], [data-automation-id="menuItem"]';
+  function skillsBox() {
+    const f = field("skills");
+    return f ? f.closest('[data-automation-id^="formField"]') ?? f : null;
+  }
+  function optionTicked(o) {
+    const row = o.closest(OPTION_SEL) ?? o;
+    for (const el of [o, row]) {
+      if (el.getAttribute("aria-checked") === "true" || el.getAttribute("aria-selected") === "true") return true;
+      const box = el.querySelector('input[type="checkbox"], [role="checkbox"]');
+      if (box && (box.checked || box.getAttribute("aria-checked") === "true")) return true;
+    }
+    return false;
+  }
+  function installSkillsLimit() {
+    let lastUsedAt = 0;
+    document.addEventListener("focusin", (e) => {
+      const box = skillsBox();
+      if (!box) return;
+      const t = e.composedPath?.()[0] ?? e.target;
+      if (t && box.contains(t)) lastUsedAt = Date.now();
+      else if (t?.closest?.('[data-automation-id^="formField"]')) lastUsedAt = 0;
+    }, true);
+    const guard = (e) => {
+      try {
+        const box = skillsBox();
+        if (!box || multiselectSelected(box).length < SKILLS_MAX) return;
+        const path = e.composedPath ? e.composedPath() : [e.target];
+        const inBox = path.includes(box);
+        if (e.type === "keydown") {
+          if (!inBox || e.key !== "Enter") return;
+        } else {
+          const opt = path.find((n) => n instanceof Element && n.matches(OPTION_SEL));
+          if (!opt || inBox || Date.now() - lastUsedAt > 6e4 || optionTicked(opt)) return;
+        }
+        e.stopImmediatePropagation();
+        e.preventDefault();
+      } catch {
+      }
+    };
+    for (const t of ["pointerdown", "mousedown", "mouseup", "click", "keydown"]) document.addEventListener(t, guard, true);
+    let told = false;
+    setInterval(() => {
+      const box = skillsBox();
+      if (!box) return;
+      const chips = Array.from(box.querySelectorAll('[data-automation-id="selectedItem"]'));
+      if (chips.length <= SKILLS_MAX) return;
+      const last = chips[chips.length - 1];
+      const del = last.querySelector('[data-automation-id="DELETE_charm"], [aria-label*="delete" i], [aria-label*="remove" i], button, [role="button"]') ?? last.parentElement?.querySelector('[data-automation-id="DELETE_charm"]');
+      del?.click();
+      if (!told) {
+        told = true;
+        say(`skills box held to ${SKILLS_MAX} — removing the ${chips.length - SKILLS_MAX} extra`);
+      }
+    }, 700);
   }
   var AUTH_PAGES = ["signIn", "createAccount", "verifyEmail"];
   var accountNoted = false;
@@ -3487,7 +4107,10 @@ OPTIONS: ${JSON.stringify(options.slice(0, 150))}`
     const ad = msg.applicationDetails || {};
     let ci = msg.complexInstructions;
     if (typeof ci === "string") ci = parse(ci);
-    const mode = { auto: true, submit: true, startedAt: Date.now(), jobId: String(ad.copilot_job_id || ad.application_id || "") };
+    const { pageAutofillApplicationId: pageFill } = await ST.get("pageAutofillApplicationId");
+    const pageOnly = !!pageFill && String(pageFill) === String(ad.application_id ?? "");
+    if (pageOnly) say("page autofill: filling this job and stopping on Review for you");
+    const mode = { auto: true, submit: !pageOnly, startedAt: Date.now(), jobId: String(ad.copilot_job_id || ad.application_id || "") };
     writeMode(mode);
     answerCache.clear();
     for (let i = 0; i < 40 && !hasWorkdayApp(); i++) await new Promise((r) => setTimeout(r, 500));
@@ -3510,6 +4133,21 @@ OPTIONS: ${JSON.stringify(options.slice(0, 150))}`
     if (toApplyManually()) return;
     await installHooks(mode);
     await startRun(null);
+  }
+  var FOREIGN_RUN_RE = /automation in progress|auto-?applying|auto-?filling|autofilling|applying to (this )?job|filling (the |your )?(application|form)/i;
+  function otherAutomationOnPage() {
+    try {
+      if (document.getElementById("ua-ctrl")) return true;
+      const roots = [...Array.from(document.documentElement.children), ...document.body ? Array.from(document.body.children) : []];
+      for (const el of roots) {
+        if (el === document.body || el === document.head || /^(oh-|wd-)|optimhire/i.test(el.id || "")) continue;
+        const cs = getComputedStyle(el);
+        if (cs.position !== "fixed" || cs.display === "none" || cs.visibility === "hidden") continue;
+        if (FOREIGN_RUN_RE.test((el.innerText || "").slice(0, 400))) return true;
+      }
+    } catch {
+    }
+    return false;
   }
   function toApplyManually() {
     const rx2 = /\/apply\/(autofillWithResume|useMyLastApplication)\b/i;
@@ -3553,10 +4191,15 @@ OPTIONS: ${JSON.stringify(options.slice(0, 150))}`
     await startRun(null);
   }
   if (TOP && isWorkdayHost()) {
+    installSkillsLimit();
     chrome.runtime.onMessage.addListener((msg, _sender, reply) => {
       if (!msg) return false;
       if (msg.type === "oh:wd:start") {
         reply({ acknowledged: true });
+        try {
+          sessionStorage.removeItem(SELF_FILL_KEY);
+        } catch {
+        }
         say(`applying (job ${msg.applicationDetails?.copilot_job_id ?? "?"})`);
         startFromOptimHire(msg).catch((e) => {
           clearMode();
@@ -3575,6 +4218,45 @@ OPTIONS: ${JSON.stringify(options.slice(0, 150))}`
       }
       return false;
     });
+    let skillsKey = "";
+    let skillsState = "";
+    let expSince = 0;
+    const runSkills = async () => {
+      skillsState = "busy";
+      try {
+        await fillSkills();
+      } catch (e) {
+        say(`skills: ${e?.message || e}`);
+      }
+      skillsState = "done";
+    };
+    setInterval(() => {
+      if (engineForms || isActive() || !hasWorkdayApp() || detectPage() !== "myExperience" || !field("skills")) {
+        expSince = 0;
+        return;
+      }
+      const key2 = `${location.pathname}|${activeStepName()}`;
+      if (key2 !== skillsKey) {
+        skillsKey = key2;
+        skillsState = "";
+        expSince = Date.now();
+      }
+      if (!skillsState && Date.now() - expSince > 8e3) void runSkills();
+    }, 1e3);
+    document.addEventListener("click", (ev) => {
+      if (engineForms || skillsState === "done" || !(ev.target instanceof Element)) return;
+      const btn = nextButton();
+      if (!btn || !btn.contains(ev.target) || detectPage() !== "myExperience" || !field("skills")) return;
+      ev.preventDefault();
+      ev.stopImmediatePropagation();
+      const go = skillsState === "busy" ? (async () => {
+        while (skillsState === "busy") await sleep(300);
+      })() : runSkills();
+      void go.then(() => {
+        skillsState = "done";
+        btn.click();
+      });
+    }, true);
     const submitCountdown = (seconds = 5) => {
       if (!document.body) return;
       const host2 = document.createElement("div");
@@ -3614,7 +4296,7 @@ OPTIONS: ${JSON.stringify(options.slice(0, 150))}`
     const ASSIST_PAGES2 = ["resumeUpload", "myInformation", "myExperience", "questions", "voluntaryDisclosures", "selfIdentify"];
     const assisted = /* @__PURE__ */ new Set();
     setInterval(() => {
-      if (!assistOn || readMode() || isActive() || !hasWorkdayApp()) return;
+      if (!assistOn || readMode() || isActive() || !hasWorkdayApp() || otherAutomationOnPage()) return;
       const page = detectPage();
       if (page === "review") {
         const rk = `review|${location.pathname}`;
@@ -3625,12 +4307,23 @@ OPTIONS: ${JSON.stringify(options.slice(0, 150))}`
         return;
       }
       if (!ASSIST_PAGES2.includes(page)) return;
-      const key = `${page}|${activeStepName()}|${location.pathname}`;
-      if (assisted.has(key)) return;
-      assisted.add(key);
+      const key2 = `${page}|${activeStepName()}|${location.pathname}`;
+      if (assisted.has(key2)) return;
+      assisted.add(key2);
       const mode = { auto: false, submit: false, assist: true, startedAt: Date.now(), jobId: "" };
       void installHooks(mode).then(() => startRun(null));
     }, 900);
+    const ACCT_PAGES = ["applyMethod", "signIn", "createAccount"];
+    const acctStarted = /* @__PURE__ */ new Set();
+    setInterval(() => {
+      if (!acctAssistOn || readMode() || isActive() || !hasWorkdayApp() || otherAutomationOnPage()) return;
+      const page = detectPage();
+      if (!ACCT_PAGES.includes(page)) return;
+      const key2 = `${location.host}|${Math.floor(Date.now() / 6e5)}`;
+      if (acctStarted.has(key2)) return;
+      acctStarted.add(key2);
+      void startManual(false, false);
+    }, 400);
     const warmCv = (tries = 0) => {
       if (!hasWorkdayApp()) {
         if (tries < 40) setTimeout(() => warmCv(tries + 1), 500);

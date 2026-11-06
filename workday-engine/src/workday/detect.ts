@@ -5,7 +5,7 @@
 import { anyAid, byAid, isVisible, q, qa, text } from "./dom.js";
 import { sel, type AidKey } from "./selectors.js";
 import type { JobPosting, PageKind } from "./types.js";
-import { NEXT_TEXT_RX, STEP_PATTERNS, SUBMIT_RX, SUBMITTED_RX, VERIFY_EMAIL_RX, detectLanguage, urlLanguage } from "./i18n.js";
+import { NEXT_TEXT_RX, SIGN_IN_WITH_EMAIL_RX, SOMETHING_WRONG_RX, STEP_PATTERNS, SUBMIT_RX, SUBMITTED_RX, VERIFY_EMAIL_RX, detectLanguage, urlLanguage } from "./i18n.js";
 
 const WORKDAY_HOST_RX = /(^|\.)(myworkdayjobs|myworkdaysite|myworkday|workdayjobs)\.com$/i;
 
@@ -73,9 +73,25 @@ function classifyStep(name: string): PageKind | null {
   return null;
 }
 
+/* Sign-in and create-account screens whose inputs carry no automation ids (NVIDIA, F5, Clario,
+   VSP, Cisco…): an email box and one password box, or two password boxes. */
+export function authEmailInput(): HTMLInputElement | null {
+  const byId = q<HTMLInputElement>(sel("email"));
+  if (byId && isVisible(byId)) return byId;
+  return (
+    qa<HTMLInputElement>('input[type="email"], input[autocomplete~="email" i], input[autocomplete="username"], input[name*="email" i], input[id*="email" i], input[aria-label*="email" i]')
+      .find((i) => isVisible(i) && i.type !== "password" && i.type !== "hidden") ?? null
+  );
+}
+export function authPasswordInputs(): HTMLInputElement[] {
+  return qa<HTMLInputElement>('input[type="password"]').filter(isVisible);
+}
+
 export function detectPage(): PageKind {
   const body = text(document.body).slice(0, 5000);
   const next = nextButton();
+  // Workday's error page, with no form on it: a reload usually brings the step back.
+  if (SOMETHING_WRONG_RX.test(body) && !qa('[data-automation-id^="formField-"]').some(isVisible)) return "somethingWrong";
 
   if (SUBMITTED_RX.test(body) && !next)
     return "submitted";
@@ -83,6 +99,14 @@ export function detectPage(): PageKind {
   if (anyAid("verifyPassword") || anyAid("createAccountSubmit")) return "createAccount";
   if (anyAid("signInSubmit") || (anyAid("password") && anyAid("email"))) return "signIn";
   if (anyAid("signInWithEmail") && !anyAid("progressActive")) return "signIn";
+  if (!anyAid("progressActive")) {
+    const pws = authPasswordInputs();
+    if (pws.length >= 2) return "createAccount";
+    if (pws.length === 1 && authEmailInput()) return "signIn";
+  }
+  // Tenants whose "Sign in with Google / LinkedIn / email" chooser has no automation id (NVIDIA).
+  if (!anyAid("password") && !next && qa('button, [role="button"], a').some((b) => isVisible(b) && SIGN_IN_WITH_EMAIL_RX.test(text(b) || b.getAttribute("aria-label") || "")))
+    return "signIn";
   if (VERIFY_EMAIL_RX.test(body) && !anyAid("password") && !next)
     return "verifyEmail";
   if (anyAid("autofillWithResume") || anyAid("applyManually")) return "applyMethod";

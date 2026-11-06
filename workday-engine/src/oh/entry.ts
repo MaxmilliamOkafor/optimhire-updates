@@ -26,9 +26,10 @@
  * The engine's own messages (wd:cred:*, wd:progress …) are answered here, in
  * the page, from chrome.storage.local — the service worker never sees them.
  */
-import { autoResume, isActive, startRun, stopRun } from "../workday/engine.js";
-import { activeStepName, detectPage, hasWorkdayApp, isWorkdayHost, tenantHost } from "../workday/detect.js";
-import { similarity } from "../workday/dom.js";
+import { HANDOFF_PAGES, autoResume, isActive, startRun, stopRun } from "../workday/engine.js";
+import { activeStepName, detectPage, hasWorkdayApp, isWorkdayHost, nextButton, tenantHost } from "../workday/detect.js";
+import { field, similarity, sleep } from "../workday/dom.js";
+import { multiselectPick, multiselectSelected } from "../workday/controls.js";
 import { normalizeLabel, normalizeProfile } from "../workday/store.js";
 import { setHooks, type OpenQuestion, type Outcome } from "../workday/ohHooks.js";
 import type { ControlKind } from "../workday/controls.js";
@@ -74,13 +75,33 @@ function clearMode() {
 
 /* Assist is on unless auto-fill, the engine or automation is switched off —
    and never while a run (OptimHire's or the CSV queue) is going. */
-const ASSIST_KEYS = ["ohAutoTrigger", "ohWdEngineOff", "ohAutomationDisabled", "isAutoProcessStartJob", "isManuallyStartJob", "ohJobQueueActive"];
+const ASSIST_KEYS = ["ohAutoTrigger", "ohWdEngineOff", "ohAutomationDisabled", "isAutoProcessStartJob", "isManuallyStartJob", "ohJobQueueActive", "ohWdEngineForms"];
 let assistOn = false;
+/* The engine does Apply, the sign-in and the account (sign in, create account, verify, reset);
+   the application's own pages — CV, My Information, My Experience, questions, disclosures,
+   Review — are OptimHire's original Workday autofill's. ohWdEngineForms: true in storage gives
+   them back to the engine (the old way). */
+let engineForms = false;
+/* You click Workday's own Apply: the engine carries on at once through "how to apply", sign-in and
+   create account, then hands the application to OptimHire's filler. */
+let acctAssistOn = false;
 function readAssist() {
   ST.get(ASSIST_KEYS).then((d) => {
     const running = !!(d.isAutoProcessStartJob || d.isManuallyStartJob || d.ohJobQueueActive);
-    assistOn = d.ohAutoTrigger !== false && d.ohWdEngineOff !== true && d.ohAutomationDisabled !== true && !running;
+    engineForms = d.ohWdEngineForms === true;
+    const allowed = d.ohAutoTrigger !== false && d.ohWdEngineOff !== true && d.ohAutomationDisabled !== true && !running;
+    assistOn = engineForms && allowed;
+    acctAssistOn = !engineForms && allowed;
   }, () => {});
+}
+/* This tab's application had nothing from OptimHire to hand over: the engine fills it (handOff). */
+const SELF_FILL_KEY = "ohWdSelfFill";
+function selfFill(): boolean {
+  try { return sessionStorage.getItem(SELF_FILL_KEY) === "1"; } catch { return false; }
+}
+/** An application page OptimHire's own filler has (not the engine). */
+function formsToOptimHire(): boolean {
+  return !engineForms && !selfFill() && hasWorkdayApp() && HANDOFF_PAGES.includes(detectPage());
 }
 readAssist();
 chrome.storage.onChanged.addListener((c, area) => {
@@ -104,8 +125,10 @@ function queueResult(jobId: string): Any | null {
    result (queueResult). */
 (window as Any).__ohWdEngine = {
   // …and the pages of Workday's emailed links, which the background fills in its own tab.
-  owns: () => TOP && (!!readMode() || isActive() || (assistOn && hasWorkdayApp()) || /passwordreset|resetpassword|\/activate\b|verifyemail|verifyaccount/i.test(location.pathname)),
+  owns: () => TOP && !formsToOptimHire() && (!!readMode() || isActive() || (assistOn && hasWorkdayApp()) || /passwordreset|resetpassword|\/activate\b|verifyemail|verifyaccount/i.test(location.pathname)),
   takesManual: () => TOP && hasWorkdayApp(),
+  // The CSV queue fills these pages the way it fills every other ATS.
+  formsToOptimHire: () => TOP && formsToOptimHire(),
   isWorkday: () => TOP && isWorkdayHost(),
   startQueueJob: (job: Any) => void startQueueJob(job),
   queueResult,
@@ -140,6 +163,21 @@ function makePassword(): string {
   return "Oh" + Array.from(r, (n) => abc[n % abc.length]).join("") + "!7q";
 }
 
+/** Your e-mail wherever OptimHire keeps it: any field named "…email…" holding an address. */
+function anyEmail(o: Any, depth = 0): string {
+  if (!o || typeof o !== "object" || depth > 3) return "";
+  const keys = Object.keys(o).sort((a, b) => Number(/email/i.test(b)) - Number(/email/i.test(a)));
+  for (const k of keys) {
+    const v = o[k];
+    if (typeof v === "string" && /email/i.test(k) && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(v.trim())) return v.trim();
+    if (v && typeof v === "object") {
+      const f = anyEmail(v, depth + 1);
+      if (f) return f;
+    }
+  }
+  return "";
+}
+
 /** One e-mail + password for every Workday site (ohWorkdayLogin), made once and kept. */
 async function workdayLogin(): Promise<{ email: string; password: string; login: Any; d: Any }> {
   const d = await ST.get([LOGIN_KEY, "appAccountEmail", "appAccountPassword", "ohGmailCodes"]);
@@ -148,7 +186,20 @@ async function workdayLogin(): Promise<{ email: string; password: string; login:
     login.password = d.appAccountPassword || makePassword();
     await ST.set({ [LOGIN_KEY]: login });
   }
-  const email = login.email || d.appAccountEmail || (await profileSources()).email || "";
+  const src = await profileSources();
+  let email = login.email || d.appAccountEmail || src.email || anyEmail(src) || "";
+  // A fresh install has no saved login e-mail yet: the address in the form's email box becomes it,
+  // and is SAVED, so every later job and employer signs in with it.
+  if (!email) {
+    const box = document.querySelector<HTMLInputElement>('[data-automation-id="email"], input[type="email"]');
+    const typed = (box?.value || "").trim();
+    if (/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(typed)) email = typed;
+  }
+  if (email && !login.email) {
+    login.email = email;
+    await ST.set({ [LOGIN_KEY]: login });
+    say(`Workday sign-in e-mail saved: ${email}`);
+  }
   return { email, password: login.password, login, d };
 }
 
@@ -198,15 +249,23 @@ function mayReset(login: Any, d: Any, site: Any, email: string): boolean {
   const r = resetsToday(site);
   return d.ohGmailCodes === true && login.resetByEmail !== false && !!email && r.length < 2 && !(r.length && Date.now() - Math.max(...r) < RESET_EVERY);
 }
-function mailLink(kind: "reset" | "verify", host: string, email: string, since: number, password?: string): Promise<Any> {
+/** `wait`: how long the background may look for the email. The answer is given up on 30 s after
+ *  that (a stuck Gmail tab or a sleeping service worker used to leave the run on "Filling…" with
+ *  no end). */
+function mailLink(kind: "reset" | "verify", host: string, email: string, since: number, password?: string, wait = 150_000): Promise<Any> {
   return new Promise((resolve) => {
+    const t = setTimeout(() => resolve({ ok: false, reason: "timed out waiting for the email" }), wait + 30_000);
+    const done = (r: Any) => {
+      clearTimeout(t);
+      resolve(r);
+    };
     try {
-      chrome.runtime.sendMessage({ type: "OH_WD_MAIL_LINK", kind, host, email, since, password }, (r: Any) => {
+      chrome.runtime.sendMessage({ type: "OH_WD_MAIL_LINK", kind, host, email, since, password, wait }, (r: Any) => {
         void chrome.runtime.lastError;
-        resolve(r || { ok: false, reason: "no answer" });
+        done(r || { ok: false, reason: "no answer" });
       });
     } catch {
-      resolve({ ok: false, reason: "extension reloaded" });
+      done({ ok: false, reason: "extension reloaded" });
     }
   });
 }
@@ -276,9 +335,11 @@ async function answerWd(msg: Any): Promise<unknown> {
     case "wd:auth:mailVerify": {
       const { email } = await workdayLogin();
       const host = String(msg.tenantHost || tenantHost());
-      const r = await mailLink("verify", host, String(msg.email || email), Number(msg.since) || Date.now() - 600_000);
+      const wait = Math.max(10_000, Math.min(150_000, Number(msg.wait) || 150_000));
+      const r = await mailLink("verify", host, String(msg.email || email), Number(msg.since) || Date.now() - 600_000, undefined, wait);
       if (r.ok) await noteSite("account", {}, host);
-      return { ok: !!r.ok, reason: r.reason };
+      // off: the reader is off or Gmail isn't signed in, so a reset email couldn't be read either
+      return { ok: !!r.ok, reason: r.reason, off: /codes are off|not signed in/i.test(String(r.reason || "")) };
     }
     case "wd:cred:set":
       await noteSite("account", { password: String(msg.password || "") || undefined });
@@ -329,23 +390,50 @@ function parse(v: unknown): Any {
   return v && typeof v === "object" ? (v as Any) : {};
 }
 
+const PLACE_PART = new Set(["location", "city", "state", "province", "region", "country", "county", "zip", "zipcode",
+  "postal", "postcode", "address", "street", "lat", "lng", "latitude", "longitude", "timezone"]);
+function isPlaceKey(k: string): boolean {
+  return /post_?code/i.test(k) || k.split(/[_\W]+|(?=[A-Z])/).some((p) => PLACE_PART.has(p.toLowerCase()));
+}
+
 /** OptimHire's details for you, flattened: the job's seeker record first, then the stored profile. */
 async function profileSources(ad?: Any): Promise<Any> {
-  const d = await ST.get(["candidateDetails", "cachedSeekerInfo", "seekerDetails", "userDetails", "complexFormData", "autoApplyState", "manualApplicationDetail", SEEKER_KEY]);
+  const d = await ST.get(["candidateDetails", "cachedSeekerInfo", "seekerDetails", "userDetails", "complexFormData", "autoApplyState", "manualApplicationDetail", SEEKER_KEY,
+    "ohMyPhone", "ohCvProfile", "appAccountEmail"]);
   // Outside a run OptimHire keeps little more than your name; the last job's details fill the gap.
   const merged: Any = Object.assign({}, parse(d[SEEKER_KEY]));
   // OptimHire keeps the full details (phone, address, CV…) on the job it is working on.
+  const jobs: Any[] = [];
   for (const k of ["manualApplicationDetail", "autoApplyState", "complexFormData"]) {
     const v = parse(d[k]);
     const s = (v.applicationDetails || v).seeker;
-    if (s && typeof s === "object") Object.assign(merged, s);
+    if (s && typeof s === "object") jobs.push(s);
   }
+  // Where you live goes as a whole: when the job names any of it, none of the kept copy's.
+  const current = jobs.concat(ad && ad.seeker && typeof ad.seeker === "object" ? [ad.seeker] : []);
+  if (current.some((s) => Object.keys(s).some((k) => isPlaceKey(k) && s[k] != null && s[k] !== "" && typeof s[k] !== "object")))
+    for (const k of Object.keys(merged)) if (isPlaceKey(k)) delete merged[k];
+  for (const s of jobs) Object.assign(merged, s);
   for (const k of ["userDetails", "seekerDetails", "cachedSeekerInfo", "candidateDetails"]) {
     const v = parse(d[k]);
     for (const [kk, vv] of Object.entries({ ...v, ...(v.seeker && typeof v.seeker === "object" ? v.seeker : {}) }))
       if (vv !== "" && vv != null) merged[kk] = vv;
   }
   for (const [k, v] of Object.entries((ad && ad.seeker) || {})) if (v !== "" && v != null) merged[k] = v;
+  // The phone you typed on the side panel's card wins; your CV's header fills what is still
+  // missing; the Applications Account e-mail stands in when OptimHire gives none.
+  const mine = String(d.ohMyPhone || "").trim();
+  if (mine) {
+    const m = mine.match(/^\+\s*(\d{1,3})\s*(.*)$/);
+    if (m) merged.mobile_code = m[1];
+    merged.mobile_num = (m ? m[2] : mine).replace(/\D/g, "");
+    merged.phone = mine;
+  }
+  const cvc: Any = (parse(d.ohCvProfile).profile || {}).contact || {};
+  if (!merged.mobile_num && !merged.phone && cvc.phone) merged.phone = cvc.phone;
+  if (!merged.email && cvc.email) merged.email = cvc.email;
+  if (!merged.linkedin_profile_url && cvc.linkedin) merged.linkedin_profile_url = cvc.linkedin;
+  if (!merged.email && d.appAccountEmail) merged.email = String(d.appAccountEmail);
   return merged;
 }
 
@@ -395,7 +483,7 @@ function historyFrom(s: Any): Pick<Profile, "work" | "education"> {
           .slice(0, 6),
       };
     })
-    .filter((w) => w.title && w.company && w.start);
+    .filter((w) => w.title && w.company);   // a role without a start date is still a role
   const education = listOf(s, ["education", "educations", "education_history", "academics", "qualifications"])
     .map((e, i) => ({
       id: `e${i + 1}`,
@@ -465,7 +553,7 @@ async function buildProfile(ad?: Any, cvUrl = ""): Promise<Profile> {
       firstName: pick(s, "first_name", "firstName", "given_name"),
       lastName: pick(s, "last_name", "lastName", "family_name", "surname"),
       preferredName: "",
-      email: pick(s, "email", "email_address", "emailAddress"),
+      email: pick(s, "email", "email_address", "emailAddress") || anyEmail(s),
       phone: { countryName: DIAL[code] || country, countryCode: code ? `+${code}` : "", number: num, deviceType: "Mobile" },
       address: {
         line1: pick(s, "street", "address_line1", "address1", "street_address") || pick(s, "address").split(",")[0] || "",
@@ -498,6 +586,26 @@ async function buildProfile(ad?: Any, cvUrl = ""): Promise<Profile> {
       previouslyWorkedHere: false,
     },
   } as any);
+  // EEO answers from your saved profile; without this every Self Identify / disclosure
+  // question fell back to "decline" (e.g. "I don't wish to answer" instead of your "No").
+  {
+    const pk = (...k: string[]) => pick(s, ...k);
+    const yn = (v: string) => {
+      const t = String(v || "").trim().toLowerCase();
+      if (!t || /prefer not|decline|wish/.test(t)) return "decline";
+      if (/^(no|i do not|i don'?t|not a|none)/.test(t)) return "no";
+      if (/^(yes|i have|i am)/.test(t)) return "yes";
+      return "decline";
+    };
+    const dc = (v: string) => { const t = String(v || "").trim(); return !t || /prefer not|decline|do not wish|don'?t wish|not to say/i.test(t) ? "decline" : t; };
+    (base as Any).eeo = {
+      gender: dc(pk("gender", "sex")),
+      hispanicOrLatino: yn(pk("hispanic_latino", "hispanicOrLatino", "hispanic", "latino")),
+      ethnicity: dc(pk("ethnicity", "race", "race_ethnicity")),
+      veteran: dc(pk("veteran", "veteran_status", "veteranStatus")),
+      disability: yn(pk("disability", "disability_status", "disabilityStatus", "has_disability")),
+    };
+  }
   /* Returned at once; your CV is read alongside and its history put into this
      same profile object when ready (My Experience waits for it: cvReady). */
   const withCv = async (prof: Profile): Promise<Profile> => {
@@ -519,7 +627,7 @@ async function buildProfile(ad?: Any, cvUrl = ""): Promise<Profile> {
   const fillIn = (a: Any, b: Any) => {
     for (const k of Object.keys(b)) {
       if (b[k] && typeof b[k] === "object" && !Array.isArray(b[k])) fillIn((a[k] ??= {}), b[k]);
-      else if (a[k] === "" || a[k] == null || (Array.isArray(a[k]) && !a[k].length)) a[k] = b[k];
+      else if (a[k] === "" || a[k] == null || (Array.isArray(a[k]) && !a[k].length) || (a[k] === "decline" && b[k] && b[k] !== "decline")) a[k] = b[k];
     }
   };
   fillIn(p, base);
@@ -527,7 +635,7 @@ async function buildProfile(ad?: Any, cvUrl = ""): Promise<Profile> {
 }
 
 /* Assist: as fast as Workday takes it. */
-const ASSIST_SETTINGS = (): WorkdaySettings => ({ ...SETTINGS, fieldDelayMs: 10 });
+const ASSIST_SETTINGS = (): WorkdaySettings => ({ ...SETTINGS, fieldDelayMs: 5 });
 
 const SETTINGS: WorkdaySettings = {
   ...DEFAULT_WD_SETTINGS,
@@ -537,7 +645,7 @@ const SETTINGS: WorkdaySettings = {
   requireDocApproval: false,
   llmAnswers: false,                // answers come from OptimHire (hooks.answer) instead
   trustedInputFallback: false,
-  fieldDelayMs: 40,
+  fieldDelayMs: 15,
   fallbackToMasterCv: true,
   externalAutoRequest: false,
 };
@@ -653,7 +761,125 @@ async function installHooks(mode: Mode): Promise<void> {
     onPage: (run) => onPage(mode, run),
     beforeExperience: () => within(cvReady, 30_000).then(() => undefined),
     onFinish: (run, outcome) => void finish(mode, run, outcome),
+    ...(engineForms || mode.assist ? {} : { handOff: () => handOff(mode, profile) }),
   });
+}
+
+/* ---------------- the application pages: OptimHire's own filler ---------------- */
+
+const SKILLS_KEY = "ohWdSkills";          // sessionStorage: your skills, for the Skills box after the handoff
+let skillsFor: string[] = [];
+async function skillsList(): Promise<string[]> {
+  if (skillsFor.length) return skillsFor;
+  try { skillsFor = JSON.parse(sessionStorage.getItem(SKILLS_KEY) || "[]"); } catch { /* */ }
+  if (!skillsFor.length) {
+    // Signed in before this tab's run (no handoff here): your profile, as the engine builds it.
+    const p = await within(buildProfile(undefined, await primaryCvUrl()), 20_000).catch(() => null);
+    skillsFor = ((p as Profile | null)?.skills || []).slice(0, SKILLS_MAX);
+  }
+  return skillsFor;
+}
+
+/** Signed in (or no sign-in needed): OptimHire's original Workday autofill takes the application.
+ *  The background gives it the job OptimHire sent the engine (its FILL_COMPLEX_FORM); a CSV
+ *  queue job goes back to the queue's own filler. With neither (you clicked Workday's own Apply,
+ *  or the panel's "Fill"), the engine fills the application itself: false. */
+async function handOff(mode: Mode, profile: Profile): Promise<boolean> {
+  skillsFor = (profile.skills || []).slice(0, SKILLS_MAX);
+  try { sessionStorage.setItem(SKILLS_KEY, JSON.stringify(skillsFor)); } catch { /* storage blocked */ }
+  const r = (await within(chrome.runtime.sendMessage({ type: "OH_WD_HANDOFF" }), 5000).catch(() => null)) as Any;
+  const { ohJobQueueActive } = await ST.get("ohJobQueueActive");
+  if (r?.via !== "fill" && !ohJobQueueActive) {
+    if (!selfFill()) say("signed in — nothing from OptimHire to hand over, so the engine fills the application");
+    try { sessionStorage.setItem(SELF_FILL_KEY, "1"); } catch { /* storage blocked */ }
+    return false;
+  }
+  try { sessionStorage.removeItem(SELF_FILL_KEY); } catch { /* storage blocked */ }
+  clearMode();
+  say(`signed in — OptimHire's own Workday autofill fills the application (${r?.via === "fill" ? "its job" : "the queue"})`);
+  if (mode.auto && r?.via !== "fill") send({ type: "COMPLEX_FORM_PROGRESS", progress: 75, message: "Workday: OptimHire fills the application" });
+  return true;
+}
+
+/* Skills on My Experience, after OptimHire's filler: Workday's Skills box only takes a skill that is
+   searched for (typed, then Enter) and ticked in the results — typed text alone is dropped on save. */
+async function fillSkills(): Promise<void> {
+  const box = field("skills");
+  const list = box ? await skillsList() : [];
+  if (!box || !list.length) return;
+  const c = (box.closest('[data-automation-id^="formField"]') as HTMLElement | null) ?? box;
+  let added = 0;
+  for (const s of list.slice(0, SKILLS_MAX)) {
+    if (detectPage() !== "myExperience" || multiselectSelected(c).length >= SKILLS_MAX) break;
+    if (multiselectSelected(c).some((x) => similarity(x, s) >= 0.85)) continue;
+    // multiselectPick tries other names and shorter forms itself (AWS for "Amazon Web Services (AWS)").
+    if (await multiselectPick(c, s, { min: 0.75 })) added++;
+    await sleep(150);
+  }
+  say(`skills: ${added} added`);
+}
+
+/* 10 IN THE SKILLS BOX, WHOEVER ADDS THEM. OptimHire's own filler (or any other) can type every
+   skill in the profile — 40 on one tenant. Once the box holds 10, picking another result (a click,
+   or Enter in its search box) is refused; unticking one still works. Anything over 10 is removed,
+   newest first. On every Workday page, run or not. */
+const SKILLS_MAX = 10;
+const OPTION_SEL = '[data-automation-id="promptOption"], [data-automation-id="promptLeafNode"], [role="option"], [data-automation-id="menuItem"]';
+function skillsBox(): HTMLElement | null {
+  const f = field("skills");
+  return f ? ((f.closest('[data-automation-id^="formField"]') as HTMLElement | null) ?? f) : null;
+}
+function optionTicked(o: Element): boolean {
+  const row = o.closest(OPTION_SEL) ?? o;
+  for (const el of [o, row]) {
+    if (el.getAttribute("aria-checked") === "true" || el.getAttribute("aria-selected") === "true") return true;
+    const box = el.querySelector<HTMLInputElement>('input[type="checkbox"], [role="checkbox"]');
+    if (box && (box.checked || box.getAttribute("aria-checked") === "true")) return true;
+  }
+  return false;
+}
+function installSkillsLimit() {
+  let lastUsedAt = 0; // the skills search box was the last field used
+  document.addEventListener("focusin", (e) => {
+    const box = skillsBox();
+    if (!box) return;
+    const t = (e.composedPath?.()[0] as Element | undefined) ?? (e.target as Element | null);
+    if (t && box.contains(t)) lastUsedAt = Date.now();
+    else if (t?.closest?.('[data-automation-id^="formField"]')) lastUsedAt = 0; // another question now
+  }, true);
+  const guard = (e: Event) => {
+    try {
+      const box = skillsBox();
+      if (!box || multiselectSelected(box).length < SKILLS_MAX) return;
+      const path = e.composedPath ? e.composedPath() : [e.target as EventTarget];
+      const inBox = path.includes(box);
+      if (e.type === "keydown") {
+        if (!inBox || (e as KeyboardEvent).key !== "Enter") return;
+      } else {
+        const opt = path.find((n): n is Element => n instanceof Element && n.matches(OPTION_SEL));
+        if (!opt || inBox || Date.now() - lastUsedAt > 60_000 || optionTicked(opt)) return;
+      }
+      e.stopImmediatePropagation();
+      e.preventDefault();
+    } catch { /* never break the page */ }
+  };
+  for (const t of ["pointerdown", "mousedown", "mouseup", "click", "keydown"]) document.addEventListener(t, guard, true);
+  let told = false;
+  setInterval(() => {
+    const box = skillsBox();
+    if (!box) return;
+    const chips = Array.from(box.querySelectorAll<HTMLElement>('[data-automation-id="selectedItem"]'));
+    if (chips.length <= SKILLS_MAX) return;
+    const last = chips[chips.length - 1];
+    const del =
+      last.querySelector<HTMLElement>('[data-automation-id="DELETE_charm"], [aria-label*="delete" i], [aria-label*="remove" i], button, [role="button"]') ??
+      last.parentElement?.querySelector<HTMLElement>('[data-automation-id="DELETE_charm"]');
+    del?.click();
+    if (!told) {
+      told = true;
+      say(`skills box held to ${SKILLS_MAX} — removing the ${chips.length - SKILLS_MAX} extra`);
+    }
+  }, 700);
 }
 
 const AUTH_PAGES: PageKind[] = ["signIn", "createAccount", "verifyEmail"];
@@ -738,7 +964,12 @@ async function startFromOptimHire(msg: Any): Promise<void> {
   const ad: Any = msg.applicationDetails || {};
   let ci: Any = msg.complexInstructions;
   if (typeof ci === "string") ci = parse(ci);
-  const mode: Mode = { auto: true, submit: true, startedAt: Date.now(), jobId: String(ad.copilot_job_id || ad.application_id || "") };
+  // OptimHire 2.10.0's "Autofill Application" button on a job page (pageAutofillApplicationId):
+  // a job you picked to fill and check yourself — filled, then left on Review, never submitted.
+  const { pageAutofillApplicationId: pageFill } = await ST.get("pageAutofillApplicationId");
+  const pageOnly = !!pageFill && String(pageFill) === String(ad.application_id ?? "");
+  if (pageOnly) say("page autofill: filling this job and stopping on Review for you");
+  const mode: Mode = { auto: true, submit: !pageOnly, startedAt: Date.now(), jobId: String(ad.copilot_job_id || ad.application_id || "") };
   writeMode(mode);
   answerCache.clear();
   for (let i = 0; i < 40 && !hasWorkdayApp(); i++) await new Promise((r) => setTimeout(r, 500));   // the app may still be rendering
@@ -756,6 +987,25 @@ async function startFromOptimHire(msg: Any): Promise<void> {
   if (toApplyManually()) return;
   await installHooks(mode);
   await startRun(null);
+}
+
+/** Another job-autofill extension applying on this page (its "Automation In Progress"-style panel
+ *  on screen): assist keeps out of it — two fillers on one form undo each other. */
+const FOREIGN_RUN_RE = /automation in progress|auto-?applying|auto-?filling|autofilling|applying to (this )?job|filling (the |your )?(application|form)/i;
+function otherAutomationOnPage(): boolean {
+  try {
+    if (document.getElementById("ua-ctrl")) return true;
+    const roots = [...Array.from(document.documentElement.children), ...(document.body ? Array.from(document.body.children) : [])];
+    for (const el of roots) {
+      if (el === document.body || el === document.head || /^(oh-|wd-)|optimhire/i.test(el.id || "")) continue;
+      const cs = getComputedStyle(el);
+      if (cs.position !== "fixed" || cs.display === "none" || cs.visibility === "hidden") continue;
+      if (FOREIGN_RUN_RE.test(((el as HTMLElement).innerText || "").slice(0, 400))) return true;
+    }
+  } catch {
+    /* page not ready */
+  }
+  return false;
 }
 
 /** A link straight into "Autofill with Resume" / "Use My Last Application" (a job board's or OptimHire's
@@ -806,10 +1056,12 @@ async function startManual(submit: boolean, pageOnly = false): Promise<void> {
 /* ---------------- wiring ---------------- */
 
 if (TOP && isWorkdayHost()) {
+  installSkillsLimit();
   chrome.runtime.onMessage.addListener((msg: Any, _sender, reply) => {
     if (!msg) return false;
     if (msg.type === "oh:wd:start") {
       reply({ acknowledged: true });
+      try { sessionStorage.removeItem(SELF_FILL_KEY); } catch { /* storage blocked */ }
       say(`applying (job ${msg.applicationDetails?.copilot_job_id ?? "?"})`);
       startFromOptimHire(msg).catch((e) => {
         clearMode();
@@ -829,6 +1081,32 @@ if (TOP && isWorkdayHost()) {
     }
     return false;
   });
+
+  /* Skills, while OptimHire fills My Experience: before its Next / Save and Continue goes through
+     (the click waits for the skills), or once the page has sat 8 s. Once per page visit. */
+  let skillsKey = "";
+  let skillsState: "" | "busy" | "done" = "";
+  let expSince = 0;
+  const runSkills = async (): Promise<void> => {
+    skillsState = "busy";
+    try { await fillSkills(); } catch (e) { say(`skills: ${(e as Error)?.message || e}`); }
+    skillsState = "done";
+  };
+  setInterval(() => {
+    if (engineForms || isActive() || !hasWorkdayApp() || detectPage() !== "myExperience" || !field("skills")) { expSince = 0; return; }
+    const key = `${location.pathname}|${activeStepName()}`;
+    if (key !== skillsKey) { skillsKey = key; skillsState = ""; expSince = Date.now(); }
+    if (!skillsState && Date.now() - expSince > 8000) void runSkills();
+  }, 1000);
+  document.addEventListener("click", (ev) => {
+    if (engineForms || skillsState === "done" || !(ev.target instanceof Element)) return;
+    const btn = nextButton();
+    if (!btn || !btn.contains(ev.target) || detectPage() !== "myExperience" || !field("skills")) return;
+    ev.preventDefault();
+    ev.stopImmediatePropagation();
+    const go = skillsState === "busy" ? (async () => { while (skillsState === "busy") await sleep(300); })() : runSkills();
+    void go.then(() => { skillsState = "done"; btn.click(); });
+  }, true);
 
   /* Assist, on Review: "Submitting your application in 5…" with Cancel, then Submit. */
   const submitCountdown = (seconds = 5) => {
@@ -870,7 +1148,7 @@ if (TOP && isWorkdayHost()) {
   const ASSIST_PAGES: PageKind[] = ["resumeUpload", "myInformation", "myExperience", "questions", "voluntaryDisclosures", "selfIdentify"];
   const assisted = new Set<string>();
   setInterval(() => {
-    if (!assistOn || readMode() || isActive() || !hasWorkdayApp()) return;
+    if (!assistOn || readMode() || isActive() || !hasWorkdayApp() || otherAutomationOnPage()) return;
     const page = detectPage();
     if (page === "review") {
       const rk = `review|${location.pathname}`;
@@ -884,6 +1162,18 @@ if (TOP && isWorkdayHost()) {
     const mode: Mode = { auto: false, submit: false, assist: true, startedAt: Date.now(), jobId: "" };
     void installHooks(mode).then(() => startRun(null));
   }, 900);
+
+  const ACCT_PAGES: PageKind[] = ["applyMethod", "signIn", "createAccount"];
+  const acctStarted = new Set<string>();
+  setInterval(() => {
+    if (!acctAssistOn || readMode() || isActive() || !hasWorkdayApp() || otherAutomationOnPage()) return;
+    const page = detectPage();
+    if (!ACCT_PAGES.includes(page)) return;
+    const key = `${location.host}|${Math.floor(Date.now() / 600000)}`;
+    if (acctStarted.has(key)) return;
+    acctStarted.add(key);
+    void startManual(false, false);
+  }, 400);
 
   /* Read your CV as soon as a Workday page with the app opens (assist on), so
      your roles are ready by My Experience. Once per CV; kept after that. */

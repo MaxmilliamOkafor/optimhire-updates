@@ -65,6 +65,12 @@
  *    step, submits and reports back like OptimHire's own filler. If it
  *    doesn't answer within 8 s the message goes to OptimHire's filler as
  *    before. ohWdEngineOff: true in storage turns it off.
+ *    9b. The engine only does Apply, the sign-in and the account now: on the
+ *    first application page (CV, My Information…) it says OH_WD_HANDOFF and
+ *    the job goes to OptimHire's original Workday filler — the FILL_COMPLEX_FORM
+ *    OptimHire sent, or the page's "Autofill Application" press, given to it
+ *    as it came. That tab's job is OptimHire's from then on (30 min).
+ *    ohWdEngineForms: true gives the application pages back to the engine.
  *
  * 10. Verification codes from the Gmail you are signed in to (opt-in:
  *    ohGmailCodes, Queue Manager → Workday sign-in). Oracle's "Confirm Your
@@ -91,6 +97,46 @@
  * relative to the worker script changes.
  */
 /* global importScripts */   // service-worker global
+
+/* 9b. Shared by the FILL_COMPLEX_FORM hand-over (below) and the page button (15): what each
+   Workday tab was given, and which tabs' jobs went back to OptimHire after the sign-in. */
+var HANDOFF_TTL_MS = 30 * 60 * 1000;
+function handoffState() {
+  return self.__ohWdHandoff || (self.__ohWdHandoff = { fills: {}, presses: {}, done: {}, send: null, ohListeners: [] });
+}
+function jobIdOf(msg) {
+  var ad = msg && msg.applicationDetails;
+  return ad ? String(ad.application_id || ad.copilot_job_id || '') : '';
+}
+/** This tab's job went to OptimHire's filler after the sign-in (the same job, not a newer one). */
+function handedOff(tabId, msg) {
+  var d = handoffState().done[tabId];
+  if (!d || Date.now() - d.at > HANDOFF_TTL_MS) return false;
+  var id = jobIdOf(msg);
+  return !id || !d.jobId || id === d.jobId;
+}
+/* Kept in session storage too: a service worker put to sleep during a long sign-in forgets it. */
+function saveHandoff() {
+  var h = handoffState();
+  try { chrome.storage.session.set({ ohWdHandoff: { fills: h.fills, presses: h.presses, done: h.done } }); } catch (_) {}
+}
+function loadHandoff() {
+  var h = handoffState();
+  return new Promise(function (resolve) {
+    try {
+      chrome.storage.session.get('ohWdHandoff', function (d) {
+        void chrome.runtime.lastError;
+        var s = d && d.ohWdHandoff;
+        if (s) ['fills', 'presses', 'done'].forEach(function (k) {
+          Object.keys(s[k] || {}).forEach(function (t) { if (!h[k][t]) h[k][t] = s[k][t]; });
+        });
+        resolve(h);
+      });
+    } catch (_) { resolve(h); }
+  });
+}
+loadHandoff();
+
 (function () {
   'use strict';
   var KEYS = ['copilotTabId', 'isAutoProcessStartJob', 'isManuallyStartJob', 'autoApplyState',
@@ -219,29 +265,44 @@
   }
 
   /* ── ATS jobs first, Reed last ── */
-  /* Ranked by what gets an application to an employer fastest: one-page company ATS forms
-     first (no account, quickest, straight to the hiring team), then ATS sites that need an
-     account or several steps, then job boards; OptimHire's mixed queue — where Reed comes
-     from — last. Same order as self.ohJobRank (the CSV queue). */
-  var FAST_ATS_SITES = ['greenhouse', 'lever', 'ashby', 'workable', 'smartrecruiters', 'recruitee', 'bamboohr',
-                        'breezyhr', 'jazzhr', 'rippling', 'comeet', 'jobvite', 'freshteam', 'manatal', 'recooty', 'gohire'];
-  var SLOW_ATS_SITES = ['workday', 'paylocity'];
-  var ATS_SITES = FAST_ATS_SITES.concat(SLOW_ATS_SITES);
+  /* Your order (asked for 30-10): Greenhouse, Workable, SmartRecruiters, Workday, Oracle, iCIMS,
+     then Lever, Ashby, BambooHR, Jobvite, Teamtailor, Recruitee, Breezy, JazzHR, SuccessFactors,
+     the other ATS; then company career sites; then job boards; Reed last. The jobsite keys are
+     the ones OptimHire's server knows, in that order. Same order as self.ohJobRank (CSV queue). */
+  var ATS_SITES = ['greenhouse', 'workable', 'smartrecruiters', 'workday', 'lever', 'ashby', 'bamboohr', 'jobvite',
+                   'recruitee', 'breezyhr', 'jazzhr', 'rippling', 'comeet', 'freshteam', 'manatal', 'recooty', 'gohire', 'paylocity'];
   var BOARD_SITES = ['linkedin', 'indeed', 'dice', 'ziprecruiter', 'adzuna', 'ziprecruiterpaid', 'adzunapaid'];
-  var JOB_TIERS = [['quick-apply ATS', FAST_ATS_SITES], ['ATS (account sites)', SLOW_ATS_SITES], ['job boards', BOARD_SITES]];
+  var JOB_TIERS = [['ATS', ATS_SITES], ['job boards', BOARD_SITES]];
+  var ATS_TIERS = JOB_TIERS.slice(0, 1);
   /* The same order for any job link (the CSV queue, queue-runner.js): lower = sooner. */
   var RANK_RES = [
-    [/greenhouse\.io|grnh\.se/, 0], [/lever\.co/, 1], [/ashbyhq/, 2], [/workable/, 3], [/smartrecruiters/, 4], [/recruitee/, 5],
-    [/teamtailor/, 6], [/bamboohr/, 7], [/breezy\.hr/, 8], [/jazzhr|resumatorapi|applytojob/, 9], [/pinpointhq/, 10], [/rippling/, 11],
-    [/comeet/, 12], [/personio/, 13], [/jobvite/, 14], [/freshteam|manatal|recooty|gohire|forhyre|homerun|dover|wellfound/, 15],
-    [/myworkdayjobs|myworkdaysite|workdayjobs|\.workday\.com/, 20], [/icims/, 21], [/successfactors|sapsf/, 22], [/oraclecloud/, 23],
-    [/taleo/, 24], [/paylocity|ultipro|ukg\.com|adp\.com|avature|bullhorn/, 25]];
+    [/greenhouse\.io|grnh\.se/, 0], [/workable/, 1], [/smartrecruiters/, 2], [/myworkdayjobs|myworkdaysite|myworkday\.com|workdayjobs|\.workday\.com/, 3],
+    [/oraclecloud/, 4], [/icims/, 5], [/lever\.co/, 6], [/ashbyhq/, 7], [/bamboohr/, 8], [/jobvite/, 9], [/teamtailor/, 10], [/recruitee/, 11],
+    [/breezy\.hr/, 12], [/jazzhr|resumatorapi|applytojob/, 13], [/successfactors|sapsf/, 14], [/pinpointhq/, 15], [/rippling/, 16],
+    [/comeet/, 17], [/personio/, 18], [/freshteam|manatal|recooty|gohire|forhyre|homerun|dover|jobs\.gem\.com|join\.com|factorialhr/, 19],
+    [/taleo/, 20], [/paylocity|ultipro|ukg\.com|adp\.com|avature|bullhorn|dayforcehcm|brassring/, 21]];
+  /* Job boards and recruitment sites: where OptimHire found a job, not the employer's own form.
+     After every ATS and company career site; Reed after all of them. Matched on the host + '.'. */
+  var BOARD_HOST_RE = new RegExp('(^|\\.)(' + [
+    'linkedin', 'indeed', 'glassdoor', 'ziprecruiter', 'adzuna', 'dice', 'monster', 'totaljobs', 'cwjobs', 'jobsite', 'cv-library',
+    'caterer', 'milkround', 'efinancialcareers', 'efinancial', 'irishjobs', 'jobs\\.ie', 'nijobs', 'recruitireland', 'jobs\\.ac\\.uk',
+    'simplyhired', 'careerbuilder', 'jooble', 'careerjet', 'jora', 'talent\\.com', 'neuvoo', 'lensa', 'snagajob', 'theladders', 'ladders',
+    'hired', 'wellfound', 'angel\\.co', 'otta', 'welcometothejungle', 'builtin[a-z]*', 'stepstone', 'xing', 'seek', 'jobstreet', 'naukri',
+    'foundit', 'bayt', 'gulftalent', 'workinstartups', 'jobserve', 'technojobs', 'jobs\\.theguardian', 'guardianjobs', 'charityjob',
+    'escapethecity', 'idealist', 'remoteok', 'weworkremotely', 'remotive', 'flexjobs', 'himalayas', 'jobgether', 'jobleads', 'jobright',
+    'hiring\\.cafe', 'getwork', 'joblist', 'clearancejobs', 'usajobs', 'civilservicejobs', 'findajob', 'jobs\\.nhs', 'hays', 'michaelpage',
+    'pagepersonnel', 'roberthalf', 'randstad', 'adecco', 'reed', 'jobteaser', 'gradcracker', 'targetjobs', 'prospects', 'jobindex',
+    'infojobs', 'computrabajo', 'catho', 'bumeran', 'apec', 'welcometothejungle', 'jobat', 'jobs\\.ch', 'karriere\\.at', 'pracuj',
+    'jobrapido', 'trovit', 'mitula', 'ziprecruiterpaid', 'dailyremote', 'workingnomads', 'nodesk', 'jobbank', 'workopolis', 'eluta',
+  ].join('|') + ')\\.', 'i');
+  var BOARD_NAME_RE = /\b(linkedin|indeed|ziprecruiter|adzuna|dice|glassdoor|monster|totaljobs|cwjobs|jobsite|cv-?library|e-?financial ?careers|efc|irishjobs|jobs\.ie|stepstone|careerjet|jooble|simplyhired|careerbuilder|talent\.com|seek|naukri|wellfound|otta|welcome to the jungle|built ?in|hays|michael page|robert half|randstad|adecco|guardian jobs|jobserve|hired)\b/i;
   var RANK_BOARDS = [[/(^|\.)linkedin\./, 40], [/(^|\.)indeed\./, 41], [/(^|\.)dice\./, 42], [/(^|\.)ziprecruiter\./, 43], [/(^|\.)adzuna\./, 44],
-    [/(^|\.)(glassdoor|totaljobs|cv-library|monster|jobsite|irishjobs|jobs\.ie|simplyhired|careerbuilder|jooble|hiring\.cafe)\./, 45]];
+    [BOARD_HOST_RE, 45]];
   self.ohJobRank = function (url) {
     var host = '';
     try { host = new URL(url).hostname.toLowerCase(); } catch (_) { return 30; }
     if (/(^|\.)reed\.co\.uk$/.test(host)) return 99;
+    if (/(^|\.)efinancialcareers\.[a-z.]+$/.test(host)) return 100;   // your order: Reed, then eFinancialCareers last
     var i;
     for (i = 0; i < RANK_BOARDS.length; i++) if (RANK_BOARDS[i][0].test(host + '.')) return RANK_BOARDS[i][1];
     for (i = 0; i < RANK_RES.length; i++) if (RANK_RES[i][0].test(String(url).toLowerCase())) return RANK_RES[i][1];
@@ -252,7 +313,6 @@
   var _tierSig = '';
   var NEXT_JOB_RE = /\/candidate\/[^/?#]+\/application(?:[?#]|$)/;
   var REED_HOST_RE = /(^|\.)reed\.co\.uk$/i;
-  var BOARD_HOST_RE = /(^|\.)(linkedin|indeed|ziprecruiter|adzuna|dice|glassdoor|monster|totaljobs|cv-library|simplyhired|careerbuilder|jooble)\./i;
   var ATS_HOST_RE = /greenhouse|lever\.co|myworkdayjobs|workday|ashbyhq|smartrecruiters|workable|bamboohr|breezy|jazzhr|resumatorapi|jobvite|recruitee|rippling|comeet|paylocity|manatal|freshteam|recooty|gohire|icims|taleo|oraclecloud|successfactors|ultipro|teamtailor|pinpointhq|avature/i;
   var _fetch = self.fetch.bind(self);
 
@@ -281,9 +341,17 @@
     try { host = new URL(src.apply_now_url || src.job_url || '').hostname.toLowerCase(); } catch (_) {}
     var ai = j && j.additional_info && !Array.isArray(j.additional_info) ? j.additional_info : {};
     var names = [j && j.ats_name, ai.source_name, src.source_name, src.job_board].filter(Boolean).join(' ');
-    if (REED_HOST_RE.test(host) || /\breed\b/i.test(names)) return 'reed';
-    if (BOARD_HOST_RE.test(host) || /\b(linkedin|indeed|ziprecruiter|adzuna|dice)\b/i.test(names)) return 'board';
-    if (ATS_HOST_RE.test(host) || ATS_HOST_RE.test(names)) return 'ats';
+    /* Where you APPLY decides, before where OptimHire found the job: a
+       Workday / Greenhouse job it found on LinkedIn has source_name
+       "LinkedIn", and was taken for a job-board job — held back and
+       swapped for another job, which looked like jobs skipped at random
+       (seen live: a Medtronic Workday job replaced by a Lever one). */
+    if (REED_HOST_RE.test(host)) return 'reed';
+    if (ATS_HOST_RE.test(host)) return 'ats';
+    if (BOARD_HOST_RE.test(host + '.')) return 'board';
+    if (/\breed\b/i.test(names)) return 'reed';
+    if (BOARD_NAME_RE.test(names)) return 'board';
+    if (ATS_HOST_RE.test(names)) return 'ats';
     return 'other';
   }
   /* First job from these jobsite tiers (ATS, then boards…), skipping sites
@@ -356,7 +424,10 @@
       if (!r) return 'timeout';
       if (r.auth) return { auth: true };
       if (r.cancelled) return null;
-      if (r.res && !(excludeId && String((r.job && r.job.copilot_job_id) || '') === excludeId)) {
+      /* An ATS jobsite's answer counts only when the job really is on an ATS or company site — a
+         server that ignored the jobsite and sent its default (a Reed / board job) is no hit. */
+      var wrongKind = tier === 'ATS' && r.job && /^(reed|board)$/.test(jobKind(r.job));
+      if (r.res && !wrongKind && !(excludeId && String((r.job && r.job.copilot_job_id) || '') === excludeId)) {
         return { res: r.res, tier: tier, site: r.site };
       }
       _emptyUntil[r.site] = Date.now() + (r.failed ? FAIL_TTL_MS : EMPTY_TTL_MS);
@@ -403,15 +474,39 @@
     if (now - (+snap.ohAutoPressTs || 0) < 30000) return true;         // our auto-clicker just pressed Apply
     return !!snap.ohAutoApplyEngaged && now - (+snap.ohAutoApplyEngagedTs || 0) < 10 * 60 * 1000;
   }
+  /* A job you picked yourself — the "Autofill Application" button OptimHire
+     2.10.0 draws on a job page (START_PAGE_AUTOFILL) — is never swapped. */
+  var _pageAutofillTs = 0;
+  try {
+    chrome.runtime.onMessage.addListener(function (msg) {
+      if (!msg) return;
+      /* A page autofill is one job, not a run; Stop ends the run. Either way
+         our "you pressed Start" engagement ends here — it outlived Stop by
+         up to 10 minutes (the panel's heartbeat even renewed it), and in
+         that time our job-apply clicker pressed Apply on whatever job the
+         page showed: Stop, or a page autofill passing through "Loading your
+         Job", restarted the whole queue. */
+      var stop = msg.type === 'AUTO_APPLY_STOP' || msg.type === 'STOP_ALL_PROCESSES' || msg.type === 'MANUAL_APPLY_STOP';
+      var page = msg.action === 'START_PAGE_AUTOFILL';
+      if (!stop && !page) return;
+      var now = Date.now();
+      if (page) _pageAutofillTs = now;
+      try {
+        chrome.storage.local.set(Object.assign({ ohAutoApplyEngaged: false, ohAutoApplyEngagedTs: 0 },
+          page ? { ohPageAutofillTs: now } : { ohStoppedTs: now }));
+      } catch (_) {}
+    });
+  } catch (_) {}
   async function heldBackSwap(url, init) {
     var res = await _fetch(url, init);
     if (!automationDriven() || snap.preferredJobsite) return res;
+    if (Date.now() - _pageAutofillTs < 60000) return res;
     var j = await jobOf(res);
     if (!j) return res;
     var kind = jobKind(j);
     if (kind !== 'reed' && kind !== 'board') return res;
     var base = url.replace(/[?#].*$/, '');
-    var tiers = kind === 'reed' ? JOB_TIERS : JOB_TIERS.slice(0, 2);
+    var tiers = kind === 'reed' ? JOB_TIERS : ATS_TIERS;
     var hit = await firstJobFrom(tiers, base, init, String(j.copilot_job_id || ''));
     if (hit && hit.res) {
       noteTier(hit.tier, hit.site, kind);
@@ -544,6 +639,8 @@
 
   if (tabsApi && typeof tabsApi.sendMessage === 'function') {
     var origSend = tabsApi.sendMessage.bind(tabsApi);
+    var wdh = handoffState();
+    wdh.send = origSend;
     tabsApi.sendMessage = function (tabId, msg) {
       var args = arguments;
       if (msg && typeof msg === 'object' && (msg.type === 'FILL_COMPLEX_FORM' || msg.type === 'MANUALLY_FORM_SUBMIT') &&
@@ -557,11 +654,16 @@
             typeof args[args.length - 1] !== 'function' && snap.ohAutomationDisabled !== true && snap.ohWdEngineOff !== true) {
           return tabHost(tabId).then(function (host) {
             if (!WD_ENGINE_RE.test(host)) return origSend.apply(null, args);
+            // Signed in already and handed back: this job's application is OptimHire's.
+            if (handedOff(tabId, msg)) return origSend.apply(null, args);
             var start = Object.assign({}, msg, { type: 'oh:wd:start' });
             return within(origSend(tabId, start, { frameId: 0 }).catch(function () { return null; }), WD_ENGINE_ACK_MS)
               .then(function (r) {
                 if (r && r.acknowledged) {
                   try { console.info('[OH-BG] Workday job handed to the Workday engine on ' + host); } catch (_) {}
+                  wdh.fills[tabId] = { msg: msg, at: Date.now() };
+                  delete wdh.presses[tabId];
+                  saveHandoff();
                   return { acknowledged: true };
                 }
                 try { console.info('[OH-BG] Workday engine did not answer on ' + host + ' — OptimHire fills it'); } catch (_) {}
@@ -833,7 +935,8 @@
     var kind = msg.kind === 'verify' ? 'verify' : 'reset';
     var since = Number(msg.since) || Date.now();
     var seen = {}, start = Date.now(), signedIn = false;
-    while (Date.now() - start < 150000) {
+    var wait = Math.max(10000, Math.min(150000, Number(msg.wait) || 150000));
+    while (Date.now() - start < wait) {
       keepAlive();
       var r = await gmailEntries(kind, [msg.host], since);
       signedIn = signedIn || r.signedIn;
@@ -863,6 +966,104 @@
       });
       return true;
     });
+  } catch (_) {}
+
+  /* 16. The service worker's own log, for the audit (Debug Log / the card's Audit): every
+     console line here — ours and OptimHire's own background — and uncaught errors, while
+     recording is on (the same switch and time limit as the pages', ohDebugEnabled /
+     ohDebugUntil). Kept in ohBgLog, the last 800 lines. Lines that carry a login token or
+     password are not kept. */
+  (function backgroundLog() {
+    var on = false, until = 0, buf = [], timer = null, MAX = 800;
+    var SECRET_RE = /(token|password|passwd|secret|cookie|authorization)\s*[:=]|eyJ[\w-]{8,}\.[\w-]{8,}\./i;
+    function live() { return on && Date.now() < until; }
+    try {
+      chrome.storage.local.get(['ohDebugEnabled', 'ohDebugUntil'], function (d) { on = !!(d && d.ohDebugEnabled === true); until = +(d && d.ohDebugUntil) || 0; });
+      chrome.storage.onChanged.addListener(function (c, area) {
+        if (area !== 'local') return;
+        if (c.ohDebugEnabled) on = c.ohDebugEnabled.newValue === true;
+        if (c.ohDebugUntil) until = +c.ohDebugUntil.newValue || 0;
+      });
+    } catch (_) {}
+    function flush() {
+      timer = null;
+      var add = buf; buf = [];
+      try {
+        chrome.storage.local.get(['ohBgLog'], function (d) {
+          var arr = Array.isArray(d && d.ohBgLog) ? d.ohBgLog : [];
+          chrome.storage.local.set({ ohBgLog: arr.concat(add).slice(-MAX) });
+        });
+      } catch (_) {}
+    }
+    function keep(lvl, args) {
+      if (!live()) return;
+      var msg = '';
+      try {
+        msg = Array.prototype.map.call(args, function (a) {
+          if (typeof a === 'string') return a;
+          if (a && a.message) return a.message;
+          try { return JSON.stringify(a); } catch (_) { return String(a); }
+        }).join(' ').slice(0, 1500);
+      } catch (_) { return; }
+      if (!msg || SECRET_RE.test(msg)) return;
+      buf.push({ ts: Date.now(), lvl: lvl, msg: msg });
+      if (buf.length > 200) flush();
+      else if (!timer) timer = setTimeout(flush, 2000);
+    }
+    ['log', 'info', 'warn', 'error'].forEach(function (k) {
+      var orig = console[k] && console[k].bind(console);
+      if (!orig) return;
+      console[k] = function () { try { keep(k === 'log' ? 'info' : k, arguments); } catch (_) {} return orig.apply(null, arguments); };
+    });
+    try {
+      self.addEventListener('error', function (e) { keep('error', ['Uncaught: ' + ((e && e.message) || e)]); });
+      self.addEventListener('unhandledrejection', function (e) { keep('error', ['Unhandled rejection: ' + ((e && e.reason && (e.reason.message || e.reason)) || '')]); });
+    } catch (_) {}
+  })();
+
+  /* 15. Your details from every OptimHire job. OptimHire keeps your phone, e-mail, address…
+     only on the job it is working on (applicationDetails.seeker); outside a run its saved
+     profile is little more than your name — so "Autofill this page", the CSV queue and the
+     Greenhouse phone box had no phone to type. Each job's details are kept in ohWdSeeker
+     (which the page script and the Workday engine read; oh-persist keeps it): newest wins,
+     an empty value never overwrites one you have — except where you live, which is kept
+     as a whole: a job that names any of it (city, location, country, postcode…) replaces
+     all of it, so an old location never sits beside a new city. */
+  var PLACE_PART = { location: 1, city: 1, state: 1, province: 1, region: 1, country: 1, county: 1, zip: 1, zipcode: 1,
+                     postal: 1, postcode: 1, address: 1, street: 1, lat: 1, lng: 1, latitude: 1, longitude: 1, timezone: 1 };
+  function isPlaceKey(k) {
+    return /post_?code/i.test(k) || String(k).split(/[_\W]+|(?=[A-Z])/).some(function (p) { return PLACE_PART[p.toLowerCase()]; });
+  }
+  self.ohIsPlaceKey = isPlaceKey;
+  function keepSeeker(v) {
+    try {
+      if (typeof v === 'string') v = JSON.parse(v);
+      var ad = v && (v.applicationDetails || v);
+      var sk = ad && ad.seeker;
+      if (!sk || typeof sk !== 'object') return;
+      chrome.storage.local.get(['ohWdSeeker'], function (d) {
+        var cur = d && d.ohWdSeeker && typeof d.ohWdSeeker === 'object' ? d.ohWdSeeker : {};
+        var next = Object.assign({}, cur), changed = false;
+        var newPlace = Object.keys(sk).some(function (k) { return isPlaceKey(k) && sk[k] != null && sk[k] !== '' && typeof sk[k] !== 'object'; });
+        if (newPlace) Object.keys(next).forEach(function (k) {
+          if (isPlaceKey(k) && (sk[k] == null || sk[k] === '') && next[k] != null) { delete next[k]; changed = true; }
+        });
+        Object.keys(sk).forEach(function (k) {
+          var val = sk[k];
+          if (k === 'seeker_response' || val == null || val === '' || typeof val === 'object') return;
+          if (next[k] !== val) { next[k] = val; changed = true; }
+        });
+        if (changed) chrome.storage.local.set({ ohWdSeeker: next });
+      });
+    } catch (_) {}
+  }
+  var SEEKER_SOURCES = ['autoApplyState', 'complexFormData', 'manualApplicationDetail'];
+  try {
+    chrome.storage.onChanged.addListener(function (c, area) {
+      if (area !== 'local') return;
+      SEEKER_SOURCES.forEach(function (k) { if (c[k] && c[k].newValue) keepSeeker(c[k].newValue); });
+    });
+    chrome.storage.local.get(SEEKER_SOURCES, function (d) { SEEKER_SOURCES.forEach(function (k) { if (d && d[k]) keepSeeker(d[k]); }); });
   } catch (_) {}
 
   /* The removed "pause other extensions" setting and its list: gone from storage. */
@@ -949,7 +1150,262 @@
   } catch (_) {}
 })();
 
+/* 14b. "Autofill Application" is one job, in the tab you pressed it in. OptimHire runs it as a
+   one-job run (isSingleManualApplication) and, when that job is done or fails, sends the tab to
+   optimhire.com/d/job-apply (or My Jobs / apply-success) — mid-application, as you saw it — and
+   that page then carried on into OptimHire's whole queue (Mastercard, Capital One…). For 30 min
+   after a press, that tab is never sent to optimhire.com by the background: it stays on the job. */
+(function pageAutofillStaysPut() {
+  var tabsApi = chrome.tabs, ev = chrome.runtime && chrome.runtime.onMessage;
+  if (!tabsApi || typeof tabsApi.update !== 'function' || !ev || typeof ev.addListener !== 'function') return;
+  var KEEP_MS = 30 * 60 * 1000;
+  var OH_PAGE_RE = /^https:\/\/(www\.)?optimhire\.com\/d\/(job-apply|my-jobs|apply-success)\b/i;
+  var pressed = {};
+  try {
+    chrome.storage.session.get(['ohPageAutofillTabs'], function (d) {
+      if (d && d.ohPageAutofillTabs) Object.assign(pressed, d.ohPageAutofillTabs);
+    });
+  } catch (_) {}
+  function keep() { try { chrome.storage.session.set({ ohPageAutofillTabs: pressed }); } catch (_) {} }
+  ev.addListener(function (msg, sender) {
+    if (!msg || msg.action !== 'START_PAGE_AUTOFILL') return;
+    var id = (sender && sender.tab && sender.tab.id) || msg.tabId;
+    if (typeof id === 'number') { pressed[id] = Date.now(); keep(); }
+  });
+  // Stop (yours, from the panel) ends the hold.
+  ev.addListener(function (msg) {
+    if (msg && (msg.type === 'AUTO_APPLY_STOP' || msg.type === 'MANUAL_APPLY_STOP') && Object.keys(pressed).length) { pressed = {}; keep(); }
+  });
+  try { tabsApi.onRemoved.addListener(function (id) { if (pressed[id]) { delete pressed[id]; keep(); } }); } catch (_) {}
+  var realUpdate = tabsApi.update.bind(tabsApi);
+  tabsApi.update = function (tabId, props) {
+    try {
+      var url = props && props.url;
+      if (typeof tabId === 'number' && typeof url === 'string' && OH_PAGE_RE.test(url) &&
+          pressed[tabId] && Date.now() - pressed[tabId] < KEEP_MS) {
+        try { console.info('[OH-BG] Autofill Application finished: the tab stays on the job (not sent to ' + url + ')'); } catch (_) {}
+        var cb = arguments[arguments.length - 1];
+        var p = new Promise(function (res) { tabsApi.get(tabId, function (t) { void chrome.runtime.lastError; res(t); }); });
+        if (typeof cb === 'function') { p.then(cb); return undefined; }
+        return p;
+      }
+    } catch (_) {}
+    return realUpdate.apply(null, arguments);
+  };
+})();
+
+/* 15. "Autofill Application" on a Workday job page applies to THAT job.
+   OptimHire 2.10.0 draws the button (atsInject → START_PAGE_AUTOFILL).
+   Its own handler refuses while its saved "a run is going" flags are set —
+   and those survive Stop and extension reloads — and then the old run
+   resumes instead: seen live, pressing it on a Medtronic Workday job ran
+   a London Reed job, then OptimHire's whole queue, in that tab. On a
+   Workday tab the press now goes straight to the Workday engine on that
+   page (OH_AUTOFILL_THIS_PAGE, as the panel's "Fill & submit" does): it
+   applies — sign-in, every step, Submit — and OptimHire's handler never
+   sees it. ohWdEngineOff (Queue Manager) gives it back to OptimHire. */
+(function workdayPageButtonToEngine() {
+  var WD_PAGE_RE = /(^|\.)(myworkdayjobs|myworkdaysite|myworkday|workdayjobs)\.com$/i;
+  var ev = chrome.runtime && chrome.runtime.onMessage;
+  if (!ev || typeof ev.addListener !== 'function') return;
+  var engineOff = false;
+  try {
+    chrome.storage.local.get(['ohWdEngineOff', 'ohAutomationDisabled'], function (d) {
+      engineOff = !!(d && (d.ohWdEngineOff === true || d.ohAutomationDisabled === true));
+    });
+    chrome.storage.onChanged.addListener(function (c, area) {
+      if (area !== 'local' || !(c.ohWdEngineOff || c.ohAutomationDisabled)) return;
+      chrome.storage.local.get(['ohWdEngineOff', 'ohAutomationDisabled'], function (d) {
+        engineOff = !!(d && (d.ohWdEngineOff === true || d.ohAutomationDisabled === true));
+      });
+    });
+  } catch (_) {}
+  function isWorkdayPagePress(msg, sender) {
+    if (engineOff || !msg || msg.action !== 'START_PAGE_AUTOFILL' || !sender || !sender.tab) return false;
+    if (handedOff(sender.tab.id, null)) return false;   // signed in and handed back: OptimHire's press
+    var host = '';
+    try { host = new URL(sender.tab.url || '').hostname; } catch (_) {}
+    return WD_PAGE_RE.test(host);
+  }
+  var h = handoffState();
+  /* 9b. The engine is past the sign-in: the job goes to OptimHire's original filler, as it came. */
+  ev.addListener(function (msg, sender, reply) {
+    if (!msg || msg.type !== 'OH_WD_HANDOFF' || sender.id !== chrome.runtime.id || !sender.tab) return;
+    var tabId = sender.tab.id;
+    loadHandoff().then(function () {
+      var fill = h.fills[tabId], press = h.presses[tabId];
+      if (fill && Date.now() - fill.at > HANDOFF_TTL_MS) fill = null;
+      if (press && Date.now() - press.at > HANDOFF_TTL_MS) press = null;
+      h.done[tabId] = { at: Date.now(), jobId: fill ? jobIdOf(fill.msg) : '' };
+      delete h.fills[tabId];
+      delete h.presses[tabId];
+      saveHandoff();
+      if (fill && h.send) {
+        try { console.info('[OH-BG] Workday: signed in — OptimHire\'s own filler takes the application'); } catch (_) {}
+        h.send(tabId, fill.msg).catch(function () {});
+        reply({ via: 'fill' });
+        return;
+      }
+      /* No FILL_COMPLEX_FORM from OptimHire for this tab: its press is never replayed here —
+         that starts OptimHire's whole job over (it re-opens the job, "Loading your Job", and its
+         reset sends the tab to optimhire.com/d/job-apply mid-application). The engine fills on. */
+      delete h.done[tabId];
+      saveHandoff();
+      reply({ via: 'none' });
+    });
+    return true;
+  });
+  try { chrome.tabs.onRemoved.addListener(function (tabId) { delete h.fills[tabId]; delete h.presses[tabId]; delete h.done[tabId]; saveHandoff(); }); } catch (_) {}
+  /* Ours runs first and answers the button. */
+  ev.addListener(function (msg, sender, reply) {
+    if (!isWorkdayPagePress(msg, sender)) return;
+    var tabId = sender.tab.id;
+    h.presses[tabId] = { msg: msg, sender: { id: sender.id, tab: sender.tab, frameId: sender.frameId, url: sender.url, origin: sender.origin }, at: Date.now() };
+    delete h.fills[tabId];
+    saveHandoff();
+    /* OptimHire runs this job itself (it opens it and sends FILL_COMPLEX_FORM, which 9 gives the
+       engine for the sign-in and 9b hands back to OptimHire's filler). Its stale "a run is going"
+       flags are cleared first, so it doesn't refuse or resume an old run; its in-memory copy
+       follows storage, so the press goes to it once that change has landed. */
+    try { console.info('[OH-BG] Autofill Application on a Workday job — OptimHire applies; the Workday engine signs in'); } catch (_) {}
+    chrome.storage.local.set({ isManuallyStartJob: false, isAutoProcessStartJob: false }, function () {
+      void chrome.runtime.lastError;
+      setTimeout(function () {
+        h.ohListeners.forEach(function (fn) {
+          try { fn(msg, sender, function () {}); } catch (e) { try { console.warn('[OH-BG] Autofill Application:', e); } catch (_) {} }
+        });
+      }, 150);
+    });
+    try { reply({ success: true, jobRunning: false }); } catch (_) {}
+  });
+  /* Every listener added after this point (OptimHire's) skips that press. */
+  var realAdd = ev.addListener.bind(ev);
+  ev.addListener = function (fn) {
+    if (typeof fn !== 'function') return realAdd.apply(null, arguments);
+    var wrapped = function (msg, sender) {
+      if (isWorkdayPagePress(msg, sender)) return false;
+      return fn.apply(this, arguments);
+    };
+    h.ohListeners.push(fn);   // given the press itself after the sign-in (9b)
+    return realAdd(wrapped);
+  };
+})();
+
+/* 17. "Loading your Job" that never ends. A run's start — and each next job opened from
+   optimhire.com's job page — shows "Loading your Job", tells the panel, fetches your profile
+   from optimhire.com, then the job. None of those waits had a time limit or a second try: a
+   slow or failed answer and the start just stopped, the panel spinning for good (seen live,
+   at random). Now: those two requests get a time limit and two more tries (no answer, network
+   error, or a 5xx from the server); the panel notices never hold the start up more than 4 s;
+   and a start that still stopped (nothing in flight, the panel never told to move on) is
+   started again with the same request — twice at most. After that the panel is reset instead
+   of left spinning, and the card says why (ohLoadRescue). */
+(function loadingRescue() {
+  var rt = chrome.runtime, ev = rt && rt.onMessage;
+  if (!ev || typeof ev.addListener !== 'function' || typeof rt.sendMessage !== 'function') return;
+  var PROFILE_TIMEOUT_MS = 15000, JOB_TIMEOUT_MS = 30000, API_RETRIES = 2, NOTE_CAP_MS = 4000;
+  var STALL_MS = 15000, QUIET_MS = 5000, TRIES = 2;
+  var OH_API_GET_RE = /^https:\/\/(www\.)?optimhire\.com\/api\/v1\/candidate\/[^/?#]+(\/application)?(?:[?#]|$)/i;
+  var START_ACTIONS = { START_JOB_APPLICATION_VIA_WEB: 1, START_PAGE_AUTOFILL: 1 };
+  var NOTES = { STARTED_LOADING_SCREEN: 1, SIDE_PANEL_RELOAD: 1, SIDE_PANEL_MANUAL_RELOAD: 1 };
+  var MOVED_ON = { SIDE_PANEL_RELOAD: 1, SIDE_PANEL_MANUAL_RELOAD: 1, RELOAD_SIDE: 1, PILOT_STOP: 1, AUTO_APPLY_COMPLETE: 1,
+                   AUTO_APPLY_STATE_UPDATE: 1, MANUALLY_APPLY_STATE_UPDATE: 1 };
+  var ohListeners = [], capturing = true;
+  var lastStart = null, watch = null, tries = 0, triedTs = 0;
+  var inflight = 0, lastApiTs = 0;
+
+  /* The start request as it came (only what reaches OptimHire — a Workday page press doesn't, 15). */
+  ev.addListener(function (msg, sender) {
+    if (msg && START_ACTIONS[msg.action]) lastStart = { msg: msg, sender: sender, ts: Date.now() };
+  });
+  /* OptimHire's own handlers (added while index.js loads), to hand that request to again. */
+  var prevAdd = ev.addListener;
+  ev.addListener = function (fn) {
+    if (capturing && typeof fn === 'function') ohListeners.push(fn);
+    return prevAdd.apply(ev, arguments);
+  };
+  self.__ohEndListenerCapture = function () { capturing = false; };
+
+  var realSend = rt.sendMessage;
+  rt.sendMessage = function (msg) {
+    var type = msg && msg.type;
+    if (type === 'STARTED_LOADING_SCREEN') {
+      if (Date.now() - triedTs > 120000) tries = 0;      // a new start, not one we restarted
+      watch = { since: Date.now() };
+    } else if (type && MOVED_ON[type]) { watch = null; tries = 0; }
+    var p = realSend.apply(rt, arguments);
+    if (type && NOTES[type] && p && typeof p.then === 'function') {
+      return Promise.race([p, new Promise(function (r) { setTimeout(r, NOTE_CAP_MS); })]);
+    }
+    return p;
+  };
+
+  /* optimhire.com's answer for your profile / the next job: a time limit and two more tries. */
+  var prevFetch = self.fetch;
+  self.fetch = function (input, init) {
+    var method = String((init && init.method) || 'GET').toUpperCase();
+    if (typeof input !== 'string' || method !== 'GET' || (init && init.signal) || !OH_API_GET_RE.test(input)) {
+      return prevFetch.apply(self, arguments);
+    }
+    var url = input, job = /\/application(?:[?#]|$)/.test(url), n = 0;
+    function again(why) {
+      try { console.info('[OH-BG] optimhire.com ' + (job ? 'next-job' : 'profile') + ' request: ' + why + ' — trying again (' + n + '/' + API_RETRIES + ')'); } catch (_) {}
+      return new Promise(function (r) { setTimeout(r, n === 1 ? 1000 : 3000); }).then(once);
+    }
+    function once() {
+      n++;
+      var ctl = new AbortController();
+      var timer = setTimeout(function () { ctl.abort(); }, job ? JOB_TIMEOUT_MS : PROFILE_TIMEOUT_MS);
+      return prevFetch.call(self, url, Object.assign({}, init, { signal: ctl.signal })).then(function (res) {
+        clearTimeout(timer);
+        if (res.status >= 500 && n <= API_RETRIES) return again('answered ' + res.status);
+        return res;
+      }, function (err) {
+        clearTimeout(timer);
+        if (n <= API_RETRIES) return again(ctl.signal.aborted ? 'no answer in ' + (job ? JOB_TIMEOUT_MS : PROFILE_TIMEOUT_MS) / 1000 + ' s' : 'network error');
+        throw err;
+      });
+    }
+    inflight++;
+    function settle() { inflight = Math.max(0, inflight - 1); lastApiTs = Date.now(); }
+    return once().then(function (r) { settle(); return r; }, function (e) { settle(); throw e; });
+  };
+
+  function tell(msg, final) {
+    try { console.info('[OH-BG] ' + msg); } catch (_) {}
+    try { chrome.storage.local.set({ ohLoadRescue: { ts: Date.now(), msg: msg, final: !!final } }); } catch (_) {}
+  }
+  setInterval(function () {
+    var w = watch, now = Date.now();
+    if (!w || now - w.since < STALL_MS || inflight > 0 || now - lastApiTs < QUIET_MS) return;
+    watch = null;
+    chrome.storage.local.get(['autoApplyState', 'isManuallyStartJob'], function (d) {
+      d = d || {};
+      if ((d.autoApplyState && d.autoApplyState.isActive) || d.isManuallyStartJob) return;   // it got going after all
+      chrome.cookies.get({ url: 'https://optimhire.com', name: 'at' }, function (c) {
+        void chrome.runtime.lastError;
+        var s = Math.round((Date.now() - w.since) / 1000);
+        if (!(c && c.value)) {
+          tries = 0;
+          tell('"Loading your Job" for ' + s + ' s: you are signed out of optimhire.com — sign in there, then press Start again', true);
+        } else if (lastStart && Date.now() - lastStart.ts < 600000 && tries < TRIES && ohListeners.length) {
+          tries++; triedTs = Date.now();
+          tell('"Loading your Job" for ' + s + ' s: optimhire.com did not hand out the job — starting it again (' + tries + '/' + TRIES + ')', false);
+          var st = lastStart;
+          ohListeners.forEach(function (fn) { try { fn.call(null, st.msg, st.sender, function () {}); } catch (_) {} });
+          return;
+        } else {
+          tries = 0;
+          tell('"Loading your Job": optimhire.com did not hand out the job after ' + (TRIES + 1) + ' tries — panel reset; it carries on with the next start', true);
+        }
+        try { Promise.resolve(realSend.call(rt, { type: 'RELOAD_SIDE' })).catch(function () {}); } catch (_) {}
+      });
+    });
+  }, 2000);
+})();
+
 importScripts('index.js');
+try { self.__ohEndListenerCapture(); } catch (_) {}
 /* 12. The CSV Job Queue runs here, not in the Queue Manager tab (queue-runner.js). */
 importScripts('queue-runner.js');
 
@@ -960,9 +1416,11 @@ importScripts('queue-runner.js');
    lives in the bundle's module registry (globalThis.parcelRequire*), found
    by shape so this survives OptimHire updates. */
 (function tuneOptimHireTimers() {
-  /* 3s: long enough to read the reason on the panel. Workday sign-in runs
-     BEFORE OptimHire's login check (7 above), so it needs no wait here. */
-  var AUTO_SKIP_S = 3, LOGIN_WAIT_S = 3;
+  /* Was 3 s each, which skipped jobs mid-application: OptimHire starts this
+     countdown on a missing-details or sign-in pause, and 3 s gave neither
+     its own answers nor the person time to finish. Kept in step with
+     AUTO_SKIP_MAX in sidepanel-patch.js. */
+  var AUTO_SKIP_S = 30, LOGIN_WAIT_S = 45;
   try {
     Object.getOwnPropertyNames(self).forEach(function (name) {
       var req = /^parcelRequire/.test(name) ? self[name] : null;
