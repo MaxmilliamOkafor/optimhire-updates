@@ -1584,3 +1584,53 @@ importScripts('queue-runner.js');
     });
   } catch (_) {}
 })();
+
+/* 19. Greenhouse "closed" that is not closed. Many companies take
+   applications only through Greenhouse's embedded form. Their
+   job-boards.greenhouse.io/<board>/jobs/<id> link then redirects to the
+   board page with ?error=true — "The job you are looking for is no longer
+   open." — and OptimHire marks the job closed, although the same job at
+   /embed/job_app?for=<board>&token=<id> is open and takes the application
+   (seen in an audit: a job marked closed at 06:47 was submitted at 07:16
+   through its embed link). So while a run is on, when a job link lands on
+   that error page, open the embed form for the same job once. If the job
+   really is closed the embed page says so and OptimHire moves on as before. */
+(function greenhouseEmbedRetry() {
+  var JOB_RX = /^https:\/\/(?:job-boards|boards)(\.eu)?\.greenhouse\.io\/(?!embed\/)([^\/?#]+)\/jobs\/(\d+)/i;
+  var GH_RX = /^https:\/\/(?:job-boards|boards)(?:\.eu)?\.greenhouse\.io\//i;
+  var RUN_KEYS = ['isAutoProcessStartJob', 'isManuallyStartJob', 'ohJobQueueActive', 'csvActiveJobId'];
+  var pending = {};   // tabId -> { eu, board, id, ts }
+  var tried = {};     // board/id -> ts, so a job is retried once only
+  function landedOnError(url) {
+    if (!GH_RX.test(url)) return false;
+    if (/[?&]error=true\b/i.test(url)) return true;
+    // board front page (/<board> or /<board>/) with no job in it
+    return /^https:\/\/[^\/]+\/[^\/?#]+\/?(?:[?#]|$)/.test(url) && !/\/embed\//i.test(url);
+  }
+  try {
+    chrome.webNavigation.onBeforeNavigate.addListener(function (d) {
+      if (d.frameId !== 0) return;
+      var m = JOB_RX.exec(d.url || '');
+      if (m) pending[d.tabId] = { eu: !!m[1], board: m[2], id: m[3], ts: Date.now() };
+      else if (!GH_RX.test(d.url || '')) delete pending[d.tabId];
+    });
+    chrome.webNavigation.onCommitted.addListener(function (d) {
+      if (d.frameId !== 0) return;
+      var p = pending[d.tabId];
+      if (!p || Date.now() - p.ts > 60000) return;
+      if (JOB_RX.test(d.url || '') || !landedOnError(d.url || '')) return;
+      var key = p.board.toLowerCase() + '/' + p.id;
+      if (tried[key] && Date.now() - tried[key] < 6 * 3600 * 1000) return;
+      chrome.storage.local.get(RUN_KEYS, function (s) {
+        var running = s && RUN_KEYS.some(function (k) { return !!s[k]; });
+        if (!running) return;
+        tried[key] = Date.now();
+        delete pending[d.tabId];
+        var url = 'https://job-boards' + (p.eu ? '.eu' : '') + '.greenhouse.io/embed/job_app?for=' +
+          encodeURIComponent(p.board) + '&token=' + p.id;
+        try { Promise.resolve(chrome.tabs.update(d.tabId, { url: url })).catch(function () {}); } catch (_) {}
+      });
+    });
+    chrome.tabs.onRemoved.addListener(function (tabId) { delete pending[tabId]; });
+  } catch (_) {}
+})();
