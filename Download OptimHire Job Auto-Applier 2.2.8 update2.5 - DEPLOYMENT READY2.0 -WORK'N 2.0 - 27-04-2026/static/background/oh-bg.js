@@ -1555,3 +1555,32 @@ importScripts('queue-runner.js');
     });
   } catch (_) {}
 })();
+
+/* 18. Keep the job tab alive while it applies. The job page's content script
+   (optimhire-patch.js) asks for this while a job runs in its tab:
+     OH_TAB_HOLD  {hold}   — hold: the browser may not discard (unload) the
+                             tab to save memory; release when the job ends.
+     OH_TICK      {ms}     — answer after ms. Timers in a hidden tab are
+                             slowed to about once a minute; this worker's are
+                             not, so the page uses it as a clock when it
+                             cannot start a Worker of its own (the site's
+                             security policy forbids it). */
+(function tabKeepAlive() {
+  try {
+    chrome.runtime.onMessage.addListener(function (msg, sender, reply) {
+      if (!msg || typeof msg.type !== 'string') return false;
+      var tabId = sender && sender.tab && sender.tab.id;
+      if (msg.type === 'OH_TAB_HOLD') {
+        if (typeof tabId !== 'number' || (sender.frameId || 0) !== 0) return false;
+        try { Promise.resolve(chrome.tabs.update(tabId, { autoDiscardable: !msg.hold })).catch(function () {}); } catch (_) {}
+        return false;
+      }
+      if (msg.type === 'OH_TICK') {
+        var ms = Math.max(0, Math.min(25000, Number(msg.ms) || 0));
+        setTimeout(function () { try { reply({ ok: true }); } catch (_) {} }, ms);
+        return true;
+      }
+      return false;
+    });
+  } catch (_) {}
+})();

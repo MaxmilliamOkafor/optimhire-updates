@@ -4263,6 +4263,117 @@ OPTIONS: ${JSON.stringify(options.slice(0, 150))}`
         btn.click();
       });
     }, true);
+    const WD_ERROR_CODE_RX = /\b[A-Z]{2,8}\|[0-9a-f]{6,}\b/;
+    const WD_ERROR_HOOKS = ["errorPage", "errorPageContainer", "errorCode", "errorContainer"].map((a) => `[data-automation-id="${a}"]`).join(",");
+    const WD_FOOTER_NAV = ["pageFooterNextButton", "bottom-navigation-next-button", "pageFooterSubmitButton", "bottom-navigation-submit-button", "pageFooterBackButton", "bottom-navigation-previous-button"].map((a) => `[data-automation-id="${a}"]`).join(",");
+    const WD_FLAG_SEL = '[data-automation-id="errorMessage"],[data-automation-id="inputAlert"]';
+    const RUN_KEYS = ["isAutoProcessStartJob", "isManuallyStartJob", "ohJobQueueActive", "csvActiveJobId"];
+    const ERR_RELOAD_KEY = "ohWdErrorReload";
+    const shown = (el) => el.getClientRects().length > 0;
+    const inChrome = (el) => !!el.closest('header, nav, [role="banner"], [role="navigation"]');
+    const hasFormControls = () => Array.from(document.querySelectorAll("input, select, textarea")).some((el) => {
+      const t = (el.type || "").toLowerCase();
+      return !["hidden", "submit", "button", "search"].includes(t) && shown(el) && !inChrome(el);
+    });
+    const workdayErrorPage = () => {
+      if (!document.body || hasFormControls()) return false;
+      if (Array.from(document.querySelectorAll(WD_FOOTER_NAV)).some(shown)) return false;
+      if (document.querySelector(WD_ERROR_HOOKS)) return true;
+      if (WD_ERROR_CODE_RX.test((document.body.textContent || "").slice(0, 2e4))) return true;
+      return Array.from(document.querySelectorAll('h1, h2, [role="heading"]')).some((h) => /something went wrong/i.test(h.textContent || ""));
+    };
+    const flaggedFields = () => {
+      const seen = /* @__PURE__ */ new Set();
+      for (const e of Array.from(document.querySelectorAll(WD_FLAG_SEL))) {
+        if (!(e.textContent || "").trim() || !shown(e)) continue;
+        seen.add(e.closest('[data-automation-id^="formField-"]') || e);
+      }
+      return seen.size;
+    };
+    const formSig = () => Array.from(document.querySelectorAll("input, textarea, select")).slice(0, 80).map((e) => `${(e.value || "").length}${e.checked ? 1 : 0}`).join("|");
+    const fillFlaggedStep = async () => {
+      if (isActive()) return;
+      try {
+        await installHooks({ auto: false, submit: false, assist: true, startedAt: Date.now(), jobId: "" });
+        await startRun(null);
+      } catch (e) {
+        say(`flagged step: ${e?.message || e}`);
+      }
+    };
+    let errSince = 0;
+    let errSkipped = "";
+    let flagSince = 0;
+    let flagSig = "";
+    const flagDone = /* @__PURE__ */ new Set();
+    setInterval(async () => {
+      if (isActive()) {
+        errSince = 0;
+        flagSince = 0;
+        return;
+      }
+      const d = await ST.get(RUN_KEYS).catch(() => ({}));
+      if (!RUN_KEYS.some((k) => d[k])) {
+        errSince = 0;
+        flagSince = 0;
+        return;
+      }
+      if (workdayErrorPage()) {
+        if (errSkipped === location.href) return;
+        if (!errSince) {
+          errSince = Date.now();
+          return;
+        }
+        if (Date.now() - errSince < 4e3) return;
+        errSince = 0;
+        let reloaded = false;
+        try {
+          reloaded = sessionStorage.getItem(ERR_RELOAD_KEY) === location.href;
+        } catch {
+        }
+        if (!reloaded) {
+          try {
+            sessionStorage.setItem(ERR_RELOAD_KEY, location.href);
+          } catch {
+          }
+          say("Workday showed its error page — reloading once");
+          location.reload();
+          return;
+        }
+        errSkipped = location.href;
+        say("Workday's error page came back after a reload — moving on to the next job");
+        const skip = window.__ohSkipCurrent;
+        if (typeof skip === "function") void skip("Workday error page, twice");
+        else send({ type: "COMPLEX_FORM_ERROR", errorType: "failure", message: "Workday: the site showed its error page twice", url: location.href, fromWdEngine: true });
+        return;
+      }
+      errSince = 0;
+      if (engineForms || selfFill() || !hasWorkdayApp()) {
+        flagSince = 0;
+        return;
+      }
+      const page = detectPage();
+      if (page === "review" || !HANDOFF_PAGES.includes(page)) {
+        flagSince = 0;
+        return;
+      }
+      const key2 = `${location.pathname}|${activeStepName()}`;
+      const n = flaggedFields();
+      if (!n || flagDone.has(key2)) {
+        flagSince = 0;
+        return;
+      }
+      const sig = formSig();
+      if (!flagSince || sig !== flagSig) {
+        flagSince = Date.now();
+        flagSig = sig;
+        return;
+      }
+      if (Date.now() - flagSince < 1e4) return;
+      flagDone.add(key2);
+      flagSince = 0;
+      say(`Workday flagged ${n} field(s) on this step and nothing changed for 10 s — the engine fills the step's empty fields`);
+      void fillFlaggedStep();
+    }, 2e3);
     const submitCountdown = (seconds = 5) => {
       if (!document.body) return;
       const host2 = document.createElement("div");

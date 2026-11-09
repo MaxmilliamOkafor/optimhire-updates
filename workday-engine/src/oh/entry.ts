@@ -1111,6 +1111,98 @@ if (TOP && isWorkdayHost()) {
     void go.then(() => { skillsState = "done"; btn.click(); });
   }, true);
 
+  /* Workday's own error signals while a run fills the application.
+     1. Workday's error page ("Something went wrong", or an error code like "ABC|1a2b3c", and no
+        form): reload once; if it comes back, the queue moves on now instead of waiting out the
+        stuck watchdog (3–8 minutes).
+     2. Fields Workday flags in red after Next: when the step has sat flagged and unchanged for
+        10 s, the engine fills that step once — its empty fields only; it presses nothing. */
+  const WD_ERROR_CODE_RX = /\b[A-Z]{2,8}\|[0-9a-f]{6,}\b/;
+  const WD_ERROR_HOOKS = ["errorPage", "errorPageContainer", "errorCode", "errorContainer"].map((a) => `[data-automation-id="${a}"]`).join(",");
+  const WD_FOOTER_NAV = ["pageFooterNextButton", "bottom-navigation-next-button", "pageFooterSubmitButton", "bottom-navigation-submit-button", "pageFooterBackButton", "bottom-navigation-previous-button"]
+    .map((a) => `[data-automation-id="${a}"]`).join(",");
+  const WD_FLAG_SEL = '[data-automation-id="errorMessage"],[data-automation-id="inputAlert"]';
+  const RUN_KEYS = ["isAutoProcessStartJob", "isManuallyStartJob", "ohJobQueueActive", "csvActiveJobId"];
+  const ERR_RELOAD_KEY = "ohWdErrorReload";
+  const shown = (el: Element) => (el as HTMLElement).getClientRects().length > 0;
+  const inChrome = (el: Element) => !!el.closest('header, nav, [role="banner"], [role="navigation"]');
+  const hasFormControls = () =>
+    Array.from(document.querySelectorAll<HTMLInputElement>("input, select, textarea")).some((el) => {
+      const t = (el.type || "").toLowerCase();
+      return !["hidden", "submit", "button", "search"].includes(t) && shown(el) && !inChrome(el);
+    });
+  const workdayErrorPage = (): boolean => {
+    if (!document.body || hasFormControls()) return false;
+    if (Array.from(document.querySelectorAll(WD_FOOTER_NAV)).some(shown)) return false;
+    if (document.querySelector(WD_ERROR_HOOKS)) return true;
+    if (WD_ERROR_CODE_RX.test((document.body.textContent || "").slice(0, 20000))) return true;
+    return Array.from(document.querySelectorAll('h1, h2, [role="heading"]')).some((h) => /something went wrong/i.test(h.textContent || ""));
+  };
+  const flaggedFields = (): number => {
+    const seen = new Set<Element>();
+    for (const e of Array.from(document.querySelectorAll(WD_FLAG_SEL))) {
+      if (!(e.textContent || "").trim() || !shown(e)) continue;
+      seen.add(e.closest('[data-automation-id^="formField-"]') || e);
+    }
+    return seen.size;
+  };
+  const formSig = () =>
+    Array.from(document.querySelectorAll<HTMLInputElement>("input, textarea, select")).slice(0, 80)
+      .map((e) => `${(e.value || "").length}${e.checked ? 1 : 0}`).join("|");
+  const fillFlaggedStep = async (): Promise<void> => {
+    if (isActive()) return;
+    try {
+      await installHooks({ auto: false, submit: false, assist: true, startedAt: Date.now(), jobId: "" });
+      await startRun(null);
+    } catch (e) { say(`flagged step: ${(e as Error)?.message || e}`); }
+  };
+  let errSince = 0;
+  let errSkipped = "";
+  let flagSince = 0;
+  let flagSig = "";
+  const flagDone = new Set<string>();
+  setInterval(async () => {
+    if (isActive()) { errSince = 0; flagSince = 0; return; }
+    const d = (await ST.get(RUN_KEYS).catch(() => ({}))) as Any;
+    if (!RUN_KEYS.some((k) => d[k])) { errSince = 0; flagSince = 0; return; }
+
+    if (workdayErrorPage()) {
+      if (errSkipped === location.href) return;
+      if (!errSince) { errSince = Date.now(); return; }
+      if (Date.now() - errSince < 4000) return;     // not a page still drawing
+      errSince = 0;
+      let reloaded = false;
+      try { reloaded = sessionStorage.getItem(ERR_RELOAD_KEY) === location.href; } catch { /* storage blocked */ }
+      if (!reloaded) {
+        try { sessionStorage.setItem(ERR_RELOAD_KEY, location.href); } catch { /* storage blocked */ }
+        say("Workday showed its error page — reloading once");
+        location.reload();
+        return;
+      }
+      errSkipped = location.href;
+      say("Workday's error page came back after a reload — moving on to the next job");
+      const skip = (window as Any).__ohSkipCurrent;
+      if (typeof skip === "function") void skip("Workday error page, twice");
+      else send({ type: "COMPLEX_FORM_ERROR", errorType: "failure", message: "Workday: the site showed its error page twice", url: location.href, fromWdEngine: true });
+      return;
+    }
+    errSince = 0;
+
+    if (engineForms || selfFill() || !hasWorkdayApp()) { flagSince = 0; return; }
+    const page = detectPage();
+    if (page === "review" || !HANDOFF_PAGES.includes(page)) { flagSince = 0; return; }
+    const key = `${location.pathname}|${activeStepName()}`;
+    const n = flaggedFields();
+    if (!n || flagDone.has(key)) { flagSince = 0; return; }
+    const sig = formSig();
+    if (!flagSince || sig !== flagSig) { flagSince = Date.now(); flagSig = sig; return; }
+    if (Date.now() - flagSince < 10_000) return;
+    flagDone.add(key);
+    flagSince = 0;
+    say(`Workday flagged ${n} field(s) on this step and nothing changed for 10 s — the engine fills the step's empty fields`);
+    void fillFlaggedStep();
+  }, 2000);
+
   /* Assist, on Review: "Submitting your application in 5…" with Cancel, then Submit. */
   const submitCountdown = (seconds = 5) => {
     if (!document.body) return;

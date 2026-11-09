@@ -1116,6 +1116,9 @@
     LOG(`skip sent: ${reason || ''}`);
     return true;
   }
+  /* For the Workday engine (same script world): its error-page guard moves
+     the queue on through the same path. */
+  window.__ohSkipCurrent = (reason) => requestSkipCurrent(reason);
 
   /* ── "Autofill this page" — on-demand fill of whatever page you are on ──
    * 2.8.2 shipped an "Autofill Application" button for this, but it is
@@ -6231,6 +6234,122 @@
    * treat OptimHire's working indicators and any form-field changes as
    * progress, so we never skip while it's actively applying.
    * ─────────────────────────────────────────────────────────────────────── */
+  /* ── Keep the job tab running ───────────────────────────────────────────
+   * A queue job often runs in a tab nobody is looking at. The browser then
+   * slows that tab's timers (to about once a minute after a few minutes
+   * hidden), may freeze it, and may discard it to save memory. All three
+   * looked like "stuck" to the watchdogs, and jobs were skipped
+   * mid-application.
+   *   hold(on)        while a job runs here the tab may not be discarded
+   *                   (background block 18).
+   *   after/every     a clock that is not slowed: a Worker, or the
+   *                   background worker (OH_TICK) when the site's security
+   *                   policy forbids Workers, else plain timers.
+   *   frozenMs()      time this tab spent frozen; the stuck watchdog does
+   *                   not count it as "no progress".
+   *   setTimeout      while a job runs and the tab is hidden, short waits
+   *                   started by this extension's content scripts (OptimHire's
+   *                   filler included) run on the Worker clock. Only this
+   *                   extension's script world is touched, never the site's.
+   * ─────────────────────────────────────────────────────────────────────── */
+  const OH_CLOCK = (function () {
+    const TOP = window.top === window.self;
+    const _setTimeout = window.setTimeout.bind(window);
+    const _clearTimeout = window.clearTimeout.bind(window);
+    const waiting = new Map();
+    let worker = null, mode = 'timer', nextId = 1, frozen = 0, freezeAt = 0, held = false, jobActive = false;
+
+    function fire(id) {
+      const fn = waiting.get(id);
+      if (!fn) return;
+      waiting.delete(id);
+      try { fn(); } catch (_) {}
+    }
+    function viaBackground(id, ms) {
+      const t0 = Date.now();
+      try {
+        chrome.runtime.sendMessage({ type: 'OH_TICK', ms }, () => {
+          const failed = !!chrome.runtime.lastError;
+          const left = ms - (Date.now() - t0);
+          if (failed) mode = 'timer';
+          if (left > 30) _setTimeout(() => fire(id), left); else fire(id);
+        });
+      } catch (_) { mode = 'timer'; _setTimeout(() => fire(id), ms); }
+    }
+    if (TOP) {
+      try {
+        const src = 'onmessage=function(e){var d=e.data;setTimeout(function(){postMessage(d.id)},d.ms)}';
+        const url = URL.createObjectURL(new Blob([src], { type: 'application/javascript' }));
+        worker = new Worker(url);
+        try { URL.revokeObjectURL(url); } catch (_) {}
+        worker.onmessage = (e) => fire(e.data);
+        worker.onerror = () => {
+          /* The site's security policy refused it — hand what was waiting to
+             the background clock. */
+          worker = null; mode = 'sw';
+          for (const id of Array.from(waiting.keys())) viaBackground(id, 1000);
+        };
+        mode = 'worker';
+      } catch (_) { worker = null; mode = 'sw'; }
+    }
+
+    function after(ms, fn) {
+      ms = Math.max(0, Number(ms) || 0);
+      const id = nextId++;
+      waiting.set(id, fn);
+      if (worker) {
+        try { worker.postMessage({ id, ms }); return id; } catch (_) { worker = null; mode = 'sw'; }
+      }
+      /* The background clock only while a job runs here, so idle tabs do not
+         keep the background worker awake. */
+      if (mode === 'sw' && jobActive && ms <= 25_000) viaBackground(id, ms);
+      else _setTimeout(() => fire(id), ms);
+      return id;
+    }
+    function cancel(id) { waiting.delete(id); }
+    function every(ms, fn) {
+      const tick = () => { try { fn(); } catch (_) {} after(ms, tick); };
+      after(ms, tick);
+    }
+
+    /* Page lifecycle: the browser says when it freezes and resumes a tab. */
+    document.addEventListener('freeze', () => { freezeAt = Date.now(); }, true);
+    document.addEventListener('resume', () => {
+      if (freezeAt) { frozen += Date.now() - freezeAt; freezeAt = 0; }
+    }, true);
+
+    function hold(on) {
+      on = !!on;
+      if (!TOP || on === held) return;
+      held = on;
+      try { Promise.resolve(chrome.runtime.sendMessage({ type: 'OH_TAB_HOLD', hold: on })).catch(() => {}); } catch (_) {}
+    }
+
+    if (TOP && worker) {
+      const fakeIds = new Map();
+      let fake = 1_000_000_000;
+      window.setTimeout = function (fn, ms, ...args) {
+        if (!jobActive || !document.hidden || !worker || typeof fn !== 'function') return _setTimeout(fn, ms, ...args);
+        const n = fake++;
+        fakeIds.set(n, after(ms, () => { fakeIds.delete(n); fn(...args); }));
+        return n;
+      };
+      window.clearTimeout = function (n) {
+        if (fakeIds.has(n)) { cancel(fakeIds.get(n)); fakeIds.delete(n); return; }
+        return _clearTimeout(n);
+      };
+    }
+
+    return {
+      after, cancel, every, hold,
+      setJobActive(on) { jobActive = !!on; },
+      /* true when after() is not slowed in a hidden tab */
+      unslowed: () => mode === 'worker' || (mode === 'sw' && jobActive),
+      frozenMs: () => frozen + (freezeAt ? Date.now() - freezeAt : 0),
+      addFrozen(ms) { if (ms > 0) frozen += ms; },
+    };
+  })();
+
   (function installStuckWatchdog() {
     /* 60s of genuine inactivity = stuck. This is a safety net, NOT the
        throughput driver — OptimHire's full per-job flow (load details →
@@ -6274,8 +6393,25 @@
        once); Workday's many pages plus signing in get longer. */
     const JOB_CAP_MS = /myworkday(jobs|site)\.com$|workday\.com$/i.test(location.hostname) ? 480_000 : 180_000;
     let _capKey = '', _capStartTs = 0, _beatTs = 0;
+    let _lastCheckTs = Date.now(), _frozenSeen = OH_CLOCK.frozenMs();
 
     async function checkStuck() {
+      /* Time the tab spent frozen is not "no progress". The browser reports
+         most freezes; on the unslowed clock a gap between checks of more
+         than 10 s also means the tab was frozen (on plain timers such a
+         gap is just a hidden tab being slowed, so it is not counted). */
+      const t = Date.now();
+      const gap = t - _lastCheckTs - POLL_MS;
+      _lastCheckTs = t;
+      if (gap > 10_000 && OH_CLOCK.unslowed()) OH_CLOCK.addFrozen(gap);
+      const frozenNow = OH_CLOCK.frozenMs();
+      const thawedMs = frozenNow - _frozenSeen;
+      _frozenSeen = frozenNow;
+      if (thawedMs > 0) {
+        _lastProgressTs += thawedMs;
+        if (_capStartTs) _capStartTs += thawedMs;
+      }
+
       let active = false, jobKey = '';
       try {
         const d = await ST.get([
@@ -6287,6 +6423,8 @@
         jobKey = String(d.csvActiveJobId || d.active_copilot_job_id || '');
       } catch (_) { return; }
 
+      OH_CLOCK.setJobActive(active);
+      OH_CLOCK.hold(active);
       if (!active) { _lastProgressTs = Date.now(); _capKey = ''; return; }
 
       const cur = normalizeUrl(location.href);
@@ -6305,7 +6443,7 @@
       }
 
       /* Any of these counts as progress → reset the inactivity clock */
-      let progressed = false;
+      let progressed = thawedMs > 0;                                      // just woke from a freeze
       if (cur !== _lastUrl) { _lastUrl = cur; progressed = true; }       // navigation
       if (_fillActive) progressed = true;                                 // our autofill
       if (_submitAttempted && now - _submitAttemptTs < 30_000) progressed = true;
@@ -6321,7 +6459,7 @@
         /* Tell the side panel this job is mid-application, so its own skip
            timers (auto-skip, 25 s watchdog, missing-details, blocked) hold
            off. The job cap above still ends a form that loops for ever. */
-        if (window.top === window.self && now - _beatTs >= 5_000) {
+        if (window.top === window.self && (now - _beatTs >= 5_000 || thawedMs > 0)) {
           _beatTs = now;
           Promise.resolve(ST.set({ ohJobActivity: { ts: now, url: cur } })).catch(() => {});
         }
@@ -6336,7 +6474,9 @@
       }
     }
 
-    setInterval(checkStuck, POLL_MS);
+    /* On the unslowed clock, so a hidden job tab is still checked (and still
+       tells the side panel it is busy) every 2 s. */
+    OH_CLOCK.every(POLL_MS, checkStuck);
     checkStuck();
   })();
 
