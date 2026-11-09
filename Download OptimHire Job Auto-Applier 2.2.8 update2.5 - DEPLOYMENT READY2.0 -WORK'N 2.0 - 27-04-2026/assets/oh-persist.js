@@ -37,7 +37,6 @@
     'ohAutomationDisabled',   // master ON/OFF switch
     'ohAutoTrigger',          // "Auto-fill on supported ATS pages" toggle
     'ohFreshBadges',          // freshness badges opt-in
-    'ohAutoFilledUrls',       // already-filled URL de-dupe list
     'ohPreferAts',            // "ATS first, Reed last" queue order
     'ohQaMemory',             // remembered answers
     'ohWorkdayLogin',         // Workday e-mail + password, and which company sites have an account

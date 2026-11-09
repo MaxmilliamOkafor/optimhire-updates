@@ -1077,6 +1077,33 @@
     }
     return '';
   }
+  /* What the page looked like when the job was given up — so a diagnostic
+     file says WHY a job with no unfinished field still did not go through:
+     was the form ever filled by us, is there a submit button and is it
+     disabled, what does the site say in its own error text, is it asking
+     for a code or showing a challenge. No values typed, only facts. */
+  function failurePageFacts() {
+    const f = {};
+    try {
+      const clean = t => String(t || '').replace(/\s+/g, ' ').trim();
+      const all = $$('input:not([type=hidden]):not([type=submit]):not([type=button]),textarea,select').filter(isVisible);
+      f.controls = all.length;
+      f.withValue = all.filter(e => (e.type === 'checkbox' || e.type === 'radio') ? e.checked : !!clean(e.value)).length;
+      try { f.filledByUs = !!_autoTriggered; } catch (_) {}
+      const sub = $$('button,[role="button"],input[type="submit"]').filter(isVisible)
+        .find(b => /^(submit|send|apply|complete|finish)\b/i.test(clean(b.innerText || b.value)));
+      f.submit = sub ? clean(sub.innerText || sub.value).slice(0, 40) + (sub.disabled || sub.getAttribute('aria-disabled') === 'true' ? ' (disabled)' : '') : '';
+      f.says = [...new Set($$(ERROR_TEXT_SEL + ',[role="alert"]').filter(e => isVisible(e) && !e.querySelector(FIELD_SEL))
+        .map(e => clean(e.textContent).slice(0, 90)).filter(Boolean))].slice(0, 5);
+      const body = clean(document.body && document.body.innerText).slice(0, 6000);
+      f.asksForCode = /verification code|security code|enter the code|confirm your identity/i.test(body);
+      f.challenge = $$('iframe').some(fr => /recaptcha\/(api2|enterprise)\/bframe|hcaptcha\.com\/.*challenge|challenges\.cloudflare/i.test(fr.src || '') &&
+        isVisible(fr) && fr.getBoundingClientRect().height > 120);
+      f.signIn = !!$('input[type="password"]');
+      f.frames = $$('iframe').filter(isVisible).map(fr => { try { return new URL(fr.src).hostname; } catch (_) { return ''; } }).filter(Boolean).slice(0, 4);
+    } catch (_) {}
+    return f;
+  }
   async function noteFieldFailures(reason) {
     try {
       if (window.top !== window.self || _IS_OH_PAGE) return;
@@ -1097,7 +1124,8 @@
         if (!((required && empty) || flagged)) continue;
         fields.push({ label: lbl.slice(0, 90), widget: failureWidget(el), required, empty, flagged, error: flagged ? failureMessage(el) : '' });
       }
-      const entry = { ts: Date.now(), host: location.hostname, path: location.pathname.slice(0, 120), ats: CURRENT_ATS || '', reason: String(reason || '').slice(0, 120), fields };
+      const entry = { ts: Date.now(), host: location.hostname, path: location.pathname.slice(0, 120), ats: CURRENT_ATS || '', reason: String(reason || '').slice(0, 120), fields,
+        page: failurePageFacts() };
       const d = await ST.get(['ohFieldFailures']);
       const list = Array.isArray(d.ohFieldFailures) ? d.ohFieldFailures : [];
       list.push(entry);
@@ -5102,6 +5130,35 @@
       'input:not([type=hidden]):not([type=file]):not([type=submit]):not([type=button]),' +
       'textarea'
     ).filter(isVisible);
+
+    /* ── Country dropdown left on the list's first entry ──
+       A plain <select> of countries that nobody answered, or that a filler
+       opened and left, shows the first country in the list — "Afghanistan"
+       went onto a form that way. When your country is known and is in the
+       list, an empty Country dropdown, or one sitting on the first entry,
+       is set to it. Phone-code, nationality and "countries you can work
+       in" dropdowns are left alone. */
+    if (p.country) {
+      const want = String(p.country).trim().toLowerCase();
+      for (const sel of $$('select').filter(isVisible)) {
+        if (sel.disabled || sel.multiple) continue;
+        const lbl = (getLabel(sel) || sel.name || sel.id || '').replace(/\s+/g, ' ').trim();
+        if (!/^country\b|country of residence|country\s*\/\s*region|current country|country you (currently )?(live|reside)/i.test(lbl)) continue;
+        if (/code|phone|dial|citizen|national|authori[sz]|eligible|birth|passport/i.test(lbl)) continue;
+        const real = [...sel.options].filter(o => o.value && !/^(select|choose|please|--)/i.test((o.text || '').trim()));
+        if (real.length < 20) continue;                       // not a list of countries
+        const cur = sel.options[sel.selectedIndex];
+        const onFirst = cur && real[0] && cur.value === real[0].value;
+        if (cur && cur.value && !onFirst) continue;           // someone chose a country: keep it
+        const mine = real.find(o => (o.text || '').trim().toLowerCase() === want) ||
+                     real.find(o => (o.text || '').trim().toLowerCase().startsWith(want));
+        if (!mine || (cur && cur.value === mine.value)) continue;
+        LOG(`sanitize: Country dropdown "${lbl.slice(0, 40)}" was ${cur && cur.value ? '"' + (cur.text || '').trim() + '"' : 'empty'} → ${mine.text.trim()}`);
+        sel.value = mine.value;
+        sel.dispatchEvent(new Event('input', { bubbles: true }));
+        sel.dispatchEvent(new Event('change', { bubbles: true }));
+      }
+    }
 
     /* ── Email + confirm-email correction + empty-required force-fill ──
        Forces every email field — and any confirm/verify/re-enter email
@@ -9389,6 +9446,24 @@
     } catch (_) { return false; }
   }
 
+  /* Which page of which job was just filled: the address with the query
+     that names the job (tracking parameters dropped), plus the job's id. */
+  const AUTO_FILL_AGAIN_MS = 60_000;
+  async function autoFillKey() {
+    let page = location.href;
+    try {
+      const u = new URL(location.href);
+      for (const k of [...u.searchParams.keys()]) {
+        if (/^(utm_|fbclid$|gclid$|ref$|referer$|source$|src$|jr_id$|oga$)/i.test(k)) u.searchParams.delete(k);
+      }
+      u.searchParams.sort();
+      page = u.origin + u.pathname + u.search;
+    } catch (_) {}
+    let job = '';
+    try { const d = await ST.get(['csvActiveJobId', 'active_copilot_job_id']); job = String(d.csvActiveJobId || d.active_copilot_job_id || ''); } catch (_) {}
+    return job + '|' + page;
+  }
+
   /** Run the full auto-trigger flow */
   let _autoTriggered = false;
   let _autoTriggerRunning = false;
@@ -9431,10 +9506,18 @@
        only the job's own tab. */
     if (onJobBoard() && !(active && await isActiveJobTab()) && !boardApplyFlowOpen()) return;
 
-    /* URL-dedup: don't fill same page twice */
-    const norm = normalizeUrl(location.href);
-    const { ohAutoFilledUrls = [] } = await ST.get('ohAutoFilledUrls');
-    if (ohAutoFilledUrls.includes(norm)) return;
+    /* Don't fill the same page twice in a row (a quick redirect or a second
+       trigger). This used to be a permanent list of addresses with the
+       query string removed — so every Greenhouse embedded form
+       (/embed/job_app?for=<company>&token=<job>) was one entry, and after
+       the first one was filled no later one ever was: those jobs sat
+       untouched until the 3-minute cap skipped them (24 of 43 stalls in
+       one audit). A page filled on an earlier try was also never filled
+       again. Now: the address keeps the part that names the job, the job's
+       id is part of the key, and an entry lasts a minute. */
+    const fillKey = await autoFillKey();
+    const { ohAutoFilledAt = {} } = await ST.get('ohAutoFilledAt');
+    if (Date.now() - (ohAutoFilledAt[fillKey] || 0) < AUTO_FILL_AGAIN_MS) return;
 
     /* ── Is this actually an application page? ── */
     if (!isApplicationPage()) {
@@ -9471,10 +9554,15 @@
       await sleep(1000); await sanitizeBadFills();
       _fillActive = false;
 
-      /* Remember */
-      ohAutoFilledUrls.push(norm);
-      while (ohAutoFilledUrls.length > 500) ohAutoFilledUrls.shift();
-      await ST.set({ ohAutoFilledUrls });
+      /* Remember (for a minute) */
+      try {
+        const now = Date.now();
+        const { ohAutoFilledAt: seen = {} } = await ST.get('ohAutoFilledAt');
+        for (const k of Object.keys(seen)) if (now - seen[k] > AUTO_FILL_AGAIN_MS) delete seen[k];
+        seen[fillKey] = now;
+        await ST.set({ ohAutoFilledAt: seen });
+        ST.remove('ohAutoFilledUrls');           // the old permanent list
+      } catch (_) {}
 
       showAutofillBanner('done');
       LOG('Auto-trigger: complete');
