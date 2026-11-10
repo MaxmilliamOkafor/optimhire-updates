@@ -1575,6 +1575,10 @@ importScripts('queue-runner.js');
         try { Promise.resolve(chrome.tabs.update(tabId, { autoDiscardable: !msg.hold })).catch(function () {}); } catch (_) {}
         return false;
       }
+      if (msg.type === 'OH_WHOAMI') {            // a page asks which tab it is (content scripts cannot tell)
+        try { reply({ tabId: typeof tabId === 'number' ? tabId : null, frameId: sender.frameId || 0 }); } catch (_) {}
+        return false;
+      }
       if (msg.type === 'OH_TICK') {
         var ms = Math.max(0, Math.min(25000, Number(msg.ms) || 0));
         setTimeout(function () { try { reply({ ok: true }); } catch (_) {} }, ms);

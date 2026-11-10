@@ -203,7 +203,32 @@
   let _jobTabPingTs = 0;
   const JOB_TAB_PING_FRESH_MS = 12_000;
   const JOB_TAB_PIN_FRESH_MS = 45_000;
-  function isPingedJobTab() { return Date.now() - _jobTabPingTs < JOB_TAB_PING_FRESH_MS; }
+  /* The pings come from the side panel's timer, and a side panel nobody
+     is looking at has its timers slowed (down to once a minute on a long
+     unattended run). A new job page also starts with no ping at all. In
+     both cases the job's own tab judged itself "not the job tab" and stood
+     down — no fill, no submit — until the 3-minute cap skipped the job.
+     So the page also asks the background which tab it is (once) and
+     compares that with the pinned tab id directly. */
+  let _myTabId = null, _pinnedJobTabId = null, _pinnedJobTabTs = 0;
+  function _notePin(j) { _pinnedJobTabId = j && j.id != null ? j.id : null; _pinnedJobTabTs = (j && j.ts) || 0; }
+  function _askMyTab(n) {
+    try {
+      Promise.resolve(chrome.runtime.sendMessage({ type: 'OH_WHOAMI' })).then(r => {
+        if (r && typeof r.tabId === 'number') _myTabId = r.tabId;
+        else if (n > 0) setTimeout(() => _askMyTab(n - 1), 1500);
+      }).catch(() => { if (n > 0) setTimeout(() => _askMyTab(n - 1), 1500); });
+    } catch (_) {}
+  }
+  try {
+    _askMyTab(3);
+    chrome.storage.local.get(['ohJobTab'], d => { try { _notePin(d && d.ohJobTab); } catch (_) {} });
+    chrome.storage.onChanged.addListener((c, area) => { if (area === 'local' && c.ohJobTab) _notePin(c.ohJobTab.newValue); });
+  } catch (_) {}
+  function isPingedJobTab() {
+    if (Date.now() - _jobTabPingTs < JOB_TAB_PING_FRESH_MS) return true;
+    return _myTabId != null && _pinnedJobTabId === _myTabId && Date.now() - _pinnedJobTabTs < JOB_TAB_PIN_FRESH_MS;
+  }
   function jobTabPinned(d) {
     const j = d && d.ohJobTab;
     return !!(j && j.id != null && Date.now() - (j.ts || 0) < JOB_TAB_PIN_FRESH_MS);
@@ -570,11 +595,26 @@
       if (el.closest('header,nav,footer,[role="search"],[role="navigation"],[role="banner"],[role="contentinfo"]')) return true;
       const f = el.form || el.closest('form');
       if (f) {
-        if (f.getAttribute('role') === 'search' || f.querySelector('input[type=search]')) return true;
+        if (f.getAttribute('role') === 'search') return true;
         if (/search/i.test((f.id || '') + ' ' + (typeof f.className === 'string' ? f.className : '') +
                            ' ' + (f.getAttribute('action') || ''))) return true;
-        for (const b of f.querySelectorAll('button,input[type=submit]')) {
-          if (/\b(search|find jobs|subscribe|sign up)\b/i.test((b.innerText || b.value || '') + '')) return true;
+        /* A search box or a "Search" button inside the form marks a small
+           search / newsletter form — not an application form. Greenhouse's
+           phone box has a country picker with its own search box INSIDE the
+           application form: with that box present every field of the form
+           counted as "page chrome", so nothing filled it, nothing saw its
+           unanswered questions, and the job sat until the 3-minute cap.
+           A form with an upload box or more than four fields is never
+           page chrome; a picker's own search box doesn't count either. */
+        const isBig = !!f.querySelector('input[type=file]') ||
+          f.querySelectorAll('input:not([type=hidden]):not([type=search]):not([type=submit]):not([type=button]),textarea,select').length > 4;
+        if (!isBig) {
+          const sb = [...f.querySelectorAll('input[type=search]')].some(x =>
+            !x.closest('.iti,[class*="iti__"],[role="listbox"],[role="combobox"],[class*="select" i],[class*="dropdown" i],[class*="picker" i]'));
+          if (sb) return true;
+          for (const b of f.querySelectorAll('button,input[type=submit]')) {
+            if (/\b(search|find jobs|subscribe|sign up)\b/i.test((b.innerText || b.value || '') + '')) return true;
+          }
         }
       }
     } catch (_) {}
@@ -705,10 +745,67 @@
     if (!v || /placeholder/i.test(v.className || '') || v.querySelector('[class*="placeholder" i]')) return '';
     return (v.textContent || '').trim();
   }
-  function comboOptions() {
-    return $$('[role="option"],[id*="-option-"],[class*="__option" i],.select2-results__option')
-      .filter(o => isVisible(o) && !/disabled|no-?options|notice|group-heading|placeholder/i.test(o.className || '') &&
-                   !o.querySelector('[role="option"],[class*="__option" i]'));
+  /* The options of THIS dropdown's own menu. It used to be every option
+     visible anywhere on the page: with another dropdown's menu still open
+     (two fill passes overlapping) "School" was answered "Less than 1 year"
+     and "Degree" with a work-authorisation sentence. The input names its
+     menu (aria-controls / aria-owns); otherwise the menu inside the same
+     widget; only when neither exists, the page-wide list as before. */
+  function comboOptions(input) {
+    const OPT = '[role="option"],[id*="-option-"],[class*="__option" i],.select2-results__option';
+    const ok = o => isVisible(o) && !/disabled|no-?options|notice|group-heading|placeholder/i.test(o.className || '') &&
+                    !o.querySelector('[role="option"],[class*="__option" i]');
+    if (input) {
+      try {
+        const id = input.getAttribute('aria-controls') || input.getAttribute('aria-owns');
+        const box = id && document.getElementById(id);
+        if (box) return $$(OPT, box).filter(ok);
+        const ctl = comboControl(input);
+        for (let n = ctl, i = 0; n && n !== document.body && i < 3; n = n.parentElement, i++) {
+          const menu = n.querySelector('[role="listbox"],[class*="__menu" i],[class*="-menu" i]');
+          if (menu && !menu.contains(input)) return $$(OPT, menu).filter(ok);
+        }
+        /* a menu drawn elsewhere on the page while this input says it is open */
+        if (input.getAttribute('aria-expanded') !== 'true' && document.activeElement !== input) return [];
+      } catch (_) {}
+    }
+    return $$(OPT).filter(ok);
+  }
+  /* What your CV and details say for the factual dropdowns no rule covers:
+     school, degree, subject, country you live in. Several wordings each,
+     tried in order. Empty when unknown — never a guess. */
+  function factualComboAnswers(lbl, p) {
+    const l = String(lbl || '').toLowerCase();
+    const out = [];
+    try {
+      const edu = ((_koCv && _koCv.education) || []).map(e => {
+        const full = (String(e.degree || '') + String(e.field || '')).replace(/\s+/g, ' ').trim();   // the CV reader splits "Ma|ster of…"
+        const level = /\b(ph\.?d|doctor)/i.test(full) ? 'doctor' : /\b(master|m\.?sc|m\.?eng|mba|m\.?a\b)/i.test(full) ? 'master' :
+                      /\b(bachelor|b\.?sc|b\.?eng|b\.?a\b|undergraduate)/i.test(full) ? 'bachelor' : '';
+        const m = /\b(?:in|of)\s+(?!science\b|arts\b|engineering\s+in\b)([A-Za-z][A-Za-z &,/-]{2,60})/i.exec(full.replace(/^(master|bachelor|doctor)\w*\s+of\s+(science|arts|engineering)\s+in\s+/i, 'in '));
+        const field = m ? m[1].replace(/\s*\(.*$/, '').trim() : '';
+        return { school: String(e.school || '').trim(), level, field };
+      });
+      const rank = { doctor: 3, master: 2, bachelor: 1, '': 0 };
+      const top = edu.slice().sort((a, b) => rank[b.level] - rank[a.level])[0];
+      if (/\b(code|dial|phone|citizen|national|passport|birth)\b/.test(l)) return out;
+      if (top) {
+        if (/^(school|university|college|institution)\b|name of (your )?(school|university|college|institution)/.test(l)) { if (top.school) out.push(top.school); }
+        else if (/^degree\b|highest (level of )?(education|degree|qualification)|level of education|education level/.test(l)) {
+          if (top.level === 'doctor') out.push("Doctor of Philosophy", 'Doctorate', 'PhD', 'Doctor');
+          if (top.level === 'master') out.push("Master's Degree", "Master's", 'Masters', 'Master', 'Postgraduate', 'Graduate degree');
+          if (top.level === 'bachelor') out.push("Bachelor's Degree", "Bachelor's", 'Bachelors', 'Bachelor', 'Undergraduate');
+        }
+        else if (/^(discipline|major|field of study|area of study|subject)\b/.test(l)) {
+          if (top.field) { out.push(top.field); const w = top.field.split(/\s+(and|&)\s+/i)[0]; if (w && w !== top.field) out.push(w); }
+          for (const e of edu) if (e.field && !out.includes(e.field)) out.push(e.field);
+        }
+      }
+      if (!out.length && p && p.country && /country/.test(l) &&
+          /resid|live|located|based|currently|^country\b|country of residence|current country/.test(l) &&
+          !/authori[sz]|eligib|sponsor|right to work|legally/.test(l)) out.push(String(p.country));
+    } catch (_) {}
+    return out;
   }
   /* Open the widget and click the option that best matches `answer`.
      `fallbackFirst` picks the first real option when nothing matches (for
@@ -721,8 +818,8 @@
     try { realClick(ctl || input); } catch (_) {}
     try { input.focus(); } catch (_) {}
     let opts = [];
-    if (want) { nativeSet(input, answer); await sleep(450); opts = comboOptions(); }
-    if (!opts.length) { nativeSet(input, ''); keyDown('ArrowDown'); await sleep(450); opts = comboOptions(); }
+    if (want) { nativeSet(input, answer); await sleep(450); opts = comboOptions(input); if (!opts.length) { await sleep(700); opts = comboOptions(input); } }
+    if (!opts.length) { nativeSet(input, ''); keyDown('ArrowDown'); await sleep(450); opts = comboOptions(input); }
     const txt = o => norm(o.textContent);
     let best = null;
     /* A location question: the town, never a building in it (and no "first option"). */
@@ -737,8 +834,18 @@
              opts.find(o => txt(o).includes(want));
       if (!best && /^(yes|no)\b/.test(want)) best = opts.find(o => new RegExp('^' + want.split(' ')[0] + '\\b').test(txt(o)));
     }
-    if (!best && fallbackFirst) best = opts[0] || null;
-    if (!best) { keyDown('Escape'); try { input.blur(); } catch (_) {} return ''; }
+    /* Nothing matched a required question. The first option used to be
+       taken whatever it said — "Afghanistan" for the country you live in,
+       "Less than high school" for your education, the first university in
+       the alphabet for your school. Now only an answer that states nothing
+       untrue: "prefer not to say", the only option there is, or an
+       acknowledgement / consent. Otherwise the question is left unanswered. */
+    if (!best && fallbackFirst && opts.length) {
+      best = opts.find(o => /prefer not|rather not|decline|do(n't| not) (wish|want)|not (to )?(say|disclose|answer|specify)|choose not/i.test(txt(o))) ||
+             (opts.length === 1 ? opts[0] : null) ||
+             (opts.length <= 3 ? opts.find(o => /^(i |yes,? i )?(acknowledge|agree|consent|confirm|accept|have read|understand)/i.test(txt(o))) : null) || null;
+    }
+    if (!best) { nativeSet(input, ''); keyDown('Escape'); try { input.blur(); } catch (_) {} return ''; }
     const chosen = (best.textContent || '').trim();
     try { realClick(best); } catch (_) { try { best.click(); } catch (__) {} }
     await sleep(250);
@@ -746,7 +853,14 @@
   }
   /* Answer every dropdown in `scope` that is required-but-empty, or has
      junk typed into its search box with nothing chosen. */
+  const _comboNoAnswerLogged = new Set();
+  let _comboPassRunning = false;
   async function answerComboDropdowns(scope, p) {
+    if (_comboPassRunning) return 0;            // one pass at a time: two at once pick from each other's menus
+    _comboPassRunning = true;
+    try { return await answerComboDropdownsOnce(scope, p); } finally { _comboPassRunning = false; }
+  }
+  async function answerComboDropdownsOnce(scope, p) {
     const LOC_LBL = /location|city|residence|where.*(based|live|located)/i;
     let n = 0;
     for (const input of $$('input', scope || document)) {
@@ -762,8 +876,14 @@
       if (!required && !junk) continue;
       let ans = String(guessValue(lbl, p || {}) || '');
       if (/^(n\/?a|none)$/i.test(ans)) ans = '';
-      const picked = await chooseComboOption(input, ans, required);
+      let picked = '';
+      for (const fact of factualComboAnswers(lbl, p || {})) {      // your CV / details first
+        picked = await chooseComboOption(input, fact, false);
+        if (picked) break;
+      }
+      if (!picked) picked = await chooseComboOption(input, ans, required);
       if (picked) { n++; LOG(`Dropdown: "${lbl.slice(0, 60)}" → "${picked.slice(0, 40)}"`); }
+      else if (required && !_comboNoAnswerLogged.has(lbl)) { _comboNoAnswerLogged.add(lbl); LOG(`Dropdown: "${lbl.slice(0, 60)}" — no known answer, left unanswered (not guessed)`); }
       else if (junk) nativeSet(input, '');                        // at least clear the junk text
     }
     return n;
@@ -2116,7 +2236,7 @@
         nativeSet(input, '');
         try { input.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', code: 'ArrowDown', bubbles: true, cancelable: true })); } catch (_) {}
         await sleep(450);
-        const opts = comboOptions();
+        const opts = comboOptions(input);
         const hitText = pickRegion(opts.map(o => (o.textContent || '').trim()), wants);
         const hit = hitText && opts.find(o => (o.textContent || '').trim() === hitText);
         if (!hit) { try { input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', code: 'Escape', bubbles: true })); input.blur(); } catch (_) {} continue; }
@@ -3666,7 +3786,7 @@
           try { input.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', code: 'ArrowDown', bubbles: true, cancelable: true })); } catch (_) {}
         } else koClick(input);
         await sleep(450);
-        const opts = item.type === 'combo' ? comboOptions() : $$('[role="listbox"] [role="option"],[data-automation-id="promptOption"]').filter(isVisible);
+        const opts = item.type === 'combo' ? comboOptions(input) : $$('[role="listbox"] [role="option"],[data-automation-id="promptOption"]').filter(isVisible);
         const texts = opts.map(o => (o.textContent || '').replace(/\s+/g, ' ').trim());
         const want = koPick(texts, item.ko);
         const hit = want && opts[texts.indexOf(want)];
@@ -4434,7 +4554,31 @@
      "Done", "Save and Submit", "Continue & Submit", etc. */
   const SUBMIT_BTN_RE = /^(submit|submit(\s+(application|now|my\s+application|form|résumé|resume))?|send(\s+(application|your\s+application))?|apply(\s+now)?|finish(\s+application)?|confirm(\s+(and\s+)?submit)?|complete(\s+application)?|done|i['’]m\s+done|save\s+(and|&)\s+submit|continue\s+(and|&)\s+submit)$/i;
 
+  /* A review page shows answers already given. A page with an unanswered
+     required question, or several empty boxes, is a form still to fill —
+     whatever its text says. This test used to be the wording alone, over
+     the whole page: a form with the question "Please confirm your highest
+     level of education" (or a job description saying "please review…")
+     counted as a review page, so the fill was SKIPPED and "Apply Now" /
+     Submit pressed on an empty form. The job then sat with the site's
+     "First Name is required" until the 3-minute cap skipped it. */
+  function unansweredOnPage() {
+    let emptyReq = 0, empty = 0;
+    try {
+      for (const el of $$(FIELD_SEL)) {
+        const t = (el.type || '').toLowerCase();
+        if (t === 'radio' || t === 'checkbox') continue;
+        if (!isVisible(el) || isPageChromeField(el) || isTrapField(el)) continue;
+        if (!failureEmpty(el)) continue;
+        empty++;
+        if (el.required || el.getAttribute('aria-required') === 'true') emptyReq++;
+      }
+    } catch (_) {}
+    return { emptyReq, empty };
+  }
   function isReviewPage() {
+    const un = unansweredOnPage();
+    if (un.emptyReq > 0 || un.empty >= 3) return false;
     const bodyText = (document.body?.innerText || '').slice(0, 8000);
     if (REVIEW_PAGE_RE.test(bodyText)) return true;
     const hdr = document.querySelector('h1,h2,h3,[role="heading"]');
@@ -4797,6 +4941,9 @@
   } catch (_) {}
 
   function guessValue(label, p = {}, inputType = '') {
+    /* An education or job entry's "Start date year" / "End date month" is
+       not "when can you start": "1 month notice" was typed into it. */
+    if (/\b(start|end)\s+(date\s+)?(year|month)\b/i.test(String(label || ''))) return '';
     label = label == null ? '' : String(label);
     const l = label.toLowerCase().replace(/[^a-z0-9 ]/g, ' ');
     const fullName = `${p.first_name||''} ${p.last_name||''}`.trim();
@@ -7064,6 +7211,7 @@
        Lever/iCIMS wording added so the user never has to press submit. */
     const T43_TERMINAL_RE = /^(submit\s+application|submit\s+your\s+application|send\s+application|send\s+my\s+application|submit\s+my\s+application|complete\s+application|finish\s+application|submit\s+&\s+apply|submit\s+and\s+apply|submit\s+profile|send\s+profile|submit)$/i;
 
+    const _refillsFor = new Map();
     async function tickGenericSubmit() {
       if (autoSubmitBlockedHere()) return;   // user asked for fill-only here
       if (!await automationActive()) return;
@@ -7081,6 +7229,27 @@
 
       const btn = findBtnByText(T43_TERMINAL_RE);
       if (!btn) return;
+      /* Required questions still unanswered: fill the form (again) before
+         pressing submit — up to twice per page. Submit used to be pressed
+         regardless, and the site answered with a wall of "… is required".
+         After two fills it is pressed as before, as the last resort (our
+         reading of a custom widget may be what is wrong). */
+      if (!requiredFieldsSatisfied()) {
+        if (_fillActive || _autoTriggerRunning || _comboPassRunning) return;   // a fill is still at work
+        const n = _refillsFor.get(location.href) || 0;
+        if (n < 2) {
+          _refillsFor.set(location.href, n + 1);
+          LOG(`Flow: required questions still unanswered — filling the form before submit (${n + 1}/2)`);
+          try {
+            _fillActive = true;
+            await runAtsAutofill();
+            try { await detectAndFixValidationErrors(); } catch (_) {}
+            try { await sanitizeBadFills(); } catch (_) {}
+            try { await answerComboDropdowns(document, await getProfile()); } catch (_) {}
+          } catch (_) {} finally { _fillActive = false; }
+          return;
+        }
+      }
       /* Don't double-submit on the same step */
       const fp = pageFingerprint('submit');
       if (_dismissedFingerprints.has(fp)) return;
@@ -9468,7 +9637,7 @@
   let _autoTriggered = false;
   let _autoTriggerRunning = false;
 
-  let _foreignNoted = false;
+  let _foreignNoted = false, _noFormLoggedFor = '';
   async function autoTriggerAutofill() {
     /* Guards */
     /* Autofill off: no fill when a page opens, even with "Auto-fill on ATS pages" on —
@@ -9522,7 +9691,7 @@
     /* ── Is this actually an application page? ── */
     if (!isApplicationPage()) {
       /* Silent: don't show any banner — just wait for DOM changes */
-      LOG(`Auto-trigger: ${CURRENT_ATS} page, but no application form yet`);
+      if (_noFormLoggedFor !== location.href) { _noFormLoggedFor = location.href; LOG(`Auto-trigger: ${CURRENT_ATS} page, but no application form yet`); }
       return;
     }
 
@@ -9594,6 +9763,19 @@
   if (CURRENT_ATS || _looksApplyPage) {
     /* First attempt after 2.5 s (most SPAs have rendered by then) */
     sleep(2500).then(() => autoTriggerAutofill());
+
+    /* …and again every 4 s for the page's first 2 minutes while nothing has
+       been filled. One try was all a page got: when that try came before
+       the run's flags, the job-tab pin or the form itself were in place,
+       the form was never filled and the job sat until the 3-minute cap.
+       Each try is a few cheap checks; it stops at the first fill. */
+    let _retryHref = location.href, _retrySince = Date.now();
+    setInterval(() => {
+      if (location.href !== _retryHref) { _retryHref = location.href; _retrySince = Date.now(); }
+      if (_autoTriggered || _autoTriggerRunning) return;
+      if (Date.now() - _retrySince > 120_000) return;
+      autoTriggerAutofill();
+    }, 4000);
 
     /* ── SPA navigation watcher (URL changes without full reload) ── */
     let _lastHref = location.href;
