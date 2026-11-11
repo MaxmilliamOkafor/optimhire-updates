@@ -37,7 +37,6 @@
     'ohAutomationDisabled',   // master ON/OFF switch
     'ohAutoTrigger',          // "Auto-fill on supported ATS pages" toggle
     'ohFreshBadges',          // freshness badges opt-in
-    'ohAutoFilledUrls',       // already-filled URL de-dupe list
     'ohPreferAts',            // "ATS first, Reed last" queue order
     'ohQaMemory',             // remembered answers
     'ohWorkdayLogin',         // Workday e-mail + password, and which company sites have an account
@@ -50,7 +49,8 @@
     'ohGmailCodes',           // read verification codes from the signed-in Gmail (opt-in)
     'ohCvProfile',            // roles / education / skills read from your CV
     'ohKnockout',             // your true answers to knockout questions (work rights, relocation…)
-    'ohTailorCv'              // CSV jobs: your CV ordered to each job's description (off by default)
+    'ohTailorCv',             // CSV jobs: your CV ordered to each job's description (off by default)
+    'ohMyPhone'               // the phone you typed on the side panel's card (wins over the profile's)
   ];
   var KEYSET = {};
   KEYS.forEach(function (k) { KEYSET[k] = 1; });

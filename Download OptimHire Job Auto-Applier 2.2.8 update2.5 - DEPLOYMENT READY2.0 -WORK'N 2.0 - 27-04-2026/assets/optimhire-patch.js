@@ -164,6 +164,18 @@
   };
   const ST  = chrome.storage.local;
 
+  /* Autofill switched OFF (ohAutomationDisabled — the bar at the top of the side panel, the
+     toolbar icon's right-click menu, Alt+Shift+O): this script types, picks and clicks
+     nothing, on any page, whatever asks it to (a timer, a page watcher, a message). Read
+     once at load and kept current, so the check costs nothing. */
+  let _masterOff = false;
+  try {
+    ST.get(['ohAutomationDisabled']).then(d => { _masterOff = !!(d && d.ohAutomationDisabled === true); }, () => {});
+    chrome.storage.onChanged.addListener((c, area) => {
+      if (area === 'local' && c.ohAutomationDisabled) _masterOff = c.ohAutomationDisabled.newValue === true;
+    });
+  } catch (_) {}
+
   /* ── Engagement freshness + master kill switch ───────────────────────
    * ohAutoApplyEngaged was a PERMANENT flag: set the first time the user
    * pressed "Start Auto-Applying" and never cleared unless they pressed
@@ -191,7 +203,32 @@
   let _jobTabPingTs = 0;
   const JOB_TAB_PING_FRESH_MS = 12_000;
   const JOB_TAB_PIN_FRESH_MS = 45_000;
-  function isPingedJobTab() { return Date.now() - _jobTabPingTs < JOB_TAB_PING_FRESH_MS; }
+  /* The pings come from the side panel's timer, and a side panel nobody
+     is looking at has its timers slowed (down to once a minute on a long
+     unattended run). A new job page also starts with no ping at all. In
+     both cases the job's own tab judged itself "not the job tab" and stood
+     down — no fill, no submit — until the 3-minute cap skipped the job.
+     So the page also asks the background which tab it is (once) and
+     compares that with the pinned tab id directly. */
+  let _myTabId = null, _pinnedJobTabId = null, _pinnedJobTabTs = 0;
+  function _notePin(j) { _pinnedJobTabId = j && j.id != null ? j.id : null; _pinnedJobTabTs = (j && j.ts) || 0; }
+  function _askMyTab(n) {
+    try {
+      Promise.resolve(chrome.runtime.sendMessage({ type: 'OH_WHOAMI' })).then(r => {
+        if (r && typeof r.tabId === 'number') _myTabId = r.tabId;
+        else if (n > 0) setTimeout(() => _askMyTab(n - 1), 1500);
+      }).catch(() => { if (n > 0) setTimeout(() => _askMyTab(n - 1), 1500); });
+    } catch (_) {}
+  }
+  try {
+    _askMyTab(3);
+    chrome.storage.local.get(['ohJobTab'], d => { try { _notePin(d && d.ohJobTab); } catch (_) {} });
+    chrome.storage.onChanged.addListener((c, area) => { if (area === 'local' && c.ohJobTab) _notePin(c.ohJobTab.newValue); });
+  } catch (_) {}
+  function isPingedJobTab() {
+    if (Date.now() - _jobTabPingTs < JOB_TAB_PING_FRESH_MS) return true;
+    return _myTabId != null && _pinnedJobTabId === _myTabId && Date.now() - _pinnedJobTabTs < JOB_TAB_PIN_FRESH_MS;
+  }
   function jobTabPinned(d) {
     const j = d && d.ohJobTab;
     return !!(j && j.id != null && Date.now() - (j.ts || 0) < JOB_TAB_PIN_FRESH_MS);
@@ -236,10 +273,30 @@
 
   /* May we take ACTION (click Apply, submit a form, skip a job)?
      `d` is a storage snapshot containing the keys below. */
+  /* OptimHire 2.10.0's "Autofill Application" button on a job page: it
+     fills that one job for you to check (it says "please review and
+     submit"), and marks it with pageAutofillApplicationId. Its run looks
+     like any other, so our flow pressed "SUBMIT APPLICATION" by itself
+     (seen live on Lever). That job is filled, never submitted or skipped. */
+  function isPageAutofillJob(d) {
+    const want = d && d.pageAutofillApplicationId;
+    if (!want) return false;
+    for (const k of ['complexFormData', 'manualApplicationDetail']) {
+      try {
+        let v = d[k];
+        if (typeof v === 'string') v = JSON.parse(v);
+        const ad = v && (v.applicationDetails || v);
+        if (ad && ad.application_id != null && String(ad.application_id) === String(want)) return true;
+      } catch (_) {}
+    }
+    return false;
+  }
+
   function mayAutomate(d) {
     if (!d) return false;
     if (d.ohAutomationDisabled === true) return false;          // master OFF
     if (notTheJobTab(d)) return false;                          // another tab is the job tab
+    if (isPageAutofillJob(d)) return false;                     // you review and submit this one
     const st = d.autoApplyState;
     if (st && st.isActive === true) return true;                // live session
     if (d.isAutoProcessStartJob) return true;                   // live session
@@ -253,7 +310,8 @@
     return false;
   }
   const AUTOMATION_KEYS = ['autoApplyState', 'isAutoProcessStartJob', 'isManuallyStartJob', 'ohJobQueueActive',
-                           'ohAutoApplyEngaged', 'ohAutoApplyEngagedTs', 'ohAutomationDisabled', 'ohJobTab'];
+                           'ohAutoApplyEngaged', 'ohAutoApplyEngagedTs', 'ohAutomationDisabled', 'ohJobTab',
+                           'pageAutofillApplicationId', 'complexFormData', 'manualApplicationDetail'];
 
   /* ── Idle governor (CRITICAL for CPU) ────────────────────────────────
    * This file installs ~22 polling loops and ~14 subtree
@@ -341,6 +399,7 @@
    * didn't take, fall back to the native prototype value setter → then
    * dispatch the full keyboard/input/change event sequence either way. */
   function _protoValueSet(el, val) {
+    if (_masterOff) return;
     try {
       const proto = el.tagName === 'TEXTAREA'
         ? window.HTMLTextAreaElement.prototype
@@ -456,7 +515,7 @@
   }
 
   function nativeSet(el, val) {
-    if (!el) return false;
+    if (!el || _masterOff) return false;
     val = (val == null) ? '' : String(val);
     val = phoneValueFor(el, val);
     if (val && isTrapField(el)) {
@@ -503,7 +562,7 @@
 
   /** Real pointer-events click sequence (unchanged proven behaviour). */
   function realClick(el) {
-    if (!el) return;
+    if (!el || _masterOff) return;
     el.dispatchEvent(new MouseEvent('mouseover', { bubbles: true }));
     el.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
     el.dispatchEvent(new MouseEvent('mouseup',   { bubbles: true }));
@@ -536,11 +595,26 @@
       if (el.closest('header,nav,footer,[role="search"],[role="navigation"],[role="banner"],[role="contentinfo"]')) return true;
       const f = el.form || el.closest('form');
       if (f) {
-        if (f.getAttribute('role') === 'search' || f.querySelector('input[type=search]')) return true;
+        if (f.getAttribute('role') === 'search') return true;
         if (/search/i.test((f.id || '') + ' ' + (typeof f.className === 'string' ? f.className : '') +
                            ' ' + (f.getAttribute('action') || ''))) return true;
-        for (const b of f.querySelectorAll('button,input[type=submit]')) {
-          if (/\b(search|find jobs|subscribe|sign up)\b/i.test((b.innerText || b.value || '') + '')) return true;
+        /* A search box or a "Search" button inside the form marks a small
+           search / newsletter form — not an application form. Greenhouse's
+           phone box has a country picker with its own search box INSIDE the
+           application form: with that box present every field of the form
+           counted as "page chrome", so nothing filled it, nothing saw its
+           unanswered questions, and the job sat until the 3-minute cap.
+           A form with an upload box or more than four fields is never
+           page chrome; a picker's own search box doesn't count either. */
+        const isBig = !!f.querySelector('input[type=file]') ||
+          f.querySelectorAll('input:not([type=hidden]):not([type=search]):not([type=submit]):not([type=button]),textarea,select').length > 4;
+        if (!isBig) {
+          const sb = [...f.querySelectorAll('input[type=search]')].some(x =>
+            !x.closest('.iti,[class*="iti__"],[role="listbox"],[role="combobox"],[class*="select" i],[class*="dropdown" i],[class*="picker" i]'));
+          if (sb) return true;
+          for (const b of f.querySelectorAll('button,input[type=submit]')) {
+            if (/\b(search|find jobs|subscribe|sign up)\b/i.test((b.innerText || b.value || '') + '')) return true;
+          }
         }
       }
     } catch (_) {}
@@ -671,10 +745,67 @@
     if (!v || /placeholder/i.test(v.className || '') || v.querySelector('[class*="placeholder" i]')) return '';
     return (v.textContent || '').trim();
   }
-  function comboOptions() {
-    return $$('[role="option"],[id*="-option-"],[class*="__option" i],.select2-results__option')
-      .filter(o => isVisible(o) && !/disabled|no-?options|notice|group-heading|placeholder/i.test(o.className || '') &&
-                   !o.querySelector('[role="option"],[class*="__option" i]'));
+  /* The options of THIS dropdown's own menu. It used to be every option
+     visible anywhere on the page: with another dropdown's menu still open
+     (two fill passes overlapping) "School" was answered "Less than 1 year"
+     and "Degree" with a work-authorisation sentence. The input names its
+     menu (aria-controls / aria-owns); otherwise the menu inside the same
+     widget; only when neither exists, the page-wide list as before. */
+  function comboOptions(input) {
+    const OPT = '[role="option"],[id*="-option-"],[class*="__option" i],.select2-results__option';
+    const ok = o => isVisible(o) && !/disabled|no-?options|notice|group-heading|placeholder/i.test(o.className || '') &&
+                    !o.querySelector('[role="option"],[class*="__option" i]');
+    if (input) {
+      try {
+        const id = input.getAttribute('aria-controls') || input.getAttribute('aria-owns');
+        const box = id && document.getElementById(id);
+        if (box) return $$(OPT, box).filter(ok);
+        const ctl = comboControl(input);
+        for (let n = ctl, i = 0; n && n !== document.body && i < 3; n = n.parentElement, i++) {
+          const menu = n.querySelector('[role="listbox"],[class*="__menu" i],[class*="-menu" i]');
+          if (menu && !menu.contains(input)) return $$(OPT, menu).filter(ok);
+        }
+        /* a menu drawn elsewhere on the page while this input says it is open */
+        if (input.getAttribute('aria-expanded') !== 'true' && document.activeElement !== input) return [];
+      } catch (_) {}
+    }
+    return $$(OPT).filter(ok);
+  }
+  /* What your CV and details say for the factual dropdowns no rule covers:
+     school, degree, subject, country you live in. Several wordings each,
+     tried in order. Empty when unknown — never a guess. */
+  function factualComboAnswers(lbl, p) {
+    const l = String(lbl || '').toLowerCase();
+    const out = [];
+    try {
+      const edu = ((_koCv && _koCv.education) || []).map(e => {
+        const full = (String(e.degree || '') + String(e.field || '')).replace(/\s+/g, ' ').trim();   // the CV reader splits "Ma|ster of…"
+        const level = /\b(ph\.?d|doctor)/i.test(full) ? 'doctor' : /\b(master|m\.?sc|m\.?eng|mba|m\.?a\b)/i.test(full) ? 'master' :
+                      /\b(bachelor|b\.?sc|b\.?eng|b\.?a\b|undergraduate)/i.test(full) ? 'bachelor' : '';
+        const m = /\b(?:in|of)\s+(?!science\b|arts\b|engineering\s+in\b)([A-Za-z][A-Za-z &,/-]{2,60})/i.exec(full.replace(/^(master|bachelor|doctor)\w*\s+of\s+(science|arts|engineering)\s+in\s+/i, 'in '));
+        const field = m ? m[1].replace(/\s*\(.*$/, '').trim() : '';
+        return { school: String(e.school || '').trim(), level, field };
+      });
+      const rank = { doctor: 3, master: 2, bachelor: 1, '': 0 };
+      const top = edu.slice().sort((a, b) => rank[b.level] - rank[a.level])[0];
+      if (/\b(code|dial|phone|citizen|national|passport|birth)\b/.test(l)) return out;
+      if (top) {
+        if (/^(school|university|college|institution)\b|name of (your )?(school|university|college|institution)/.test(l)) { if (top.school) out.push(top.school); }
+        else if (/^degree\b|highest (level of )?(education|degree|qualification)|level of education|education level/.test(l)) {
+          if (top.level === 'doctor') out.push("Doctor of Philosophy", 'Doctorate', 'PhD', 'Doctor');
+          if (top.level === 'master') out.push("Master's Degree", "Master's", 'Masters', 'Master', 'Postgraduate', 'Graduate degree');
+          if (top.level === 'bachelor') out.push("Bachelor's Degree", "Bachelor's", 'Bachelors', 'Bachelor', 'Undergraduate');
+        }
+        else if (/^(discipline|major|field of study|area of study|subject)\b/.test(l)) {
+          if (top.field) { out.push(top.field); const w = top.field.split(/\s+(and|&)\s+/i)[0]; if (w && w !== top.field) out.push(w); }
+          for (const e of edu) if (e.field && !out.includes(e.field)) out.push(e.field);
+        }
+      }
+      if (!out.length && p && p.country && /country/.test(l) &&
+          /resid|live|located|based|currently|^country\b|country of residence|current country/.test(l) &&
+          !/authori[sz]|eligib|sponsor|right to work|legally/.test(l)) out.push(String(p.country));
+    } catch (_) {}
+    return out;
   }
   /* Open the widget and click the option that best matches `answer`.
      `fallbackFirst` picks the first real option when nothing matches (for
@@ -687,19 +818,34 @@
     try { realClick(ctl || input); } catch (_) {}
     try { input.focus(); } catch (_) {}
     let opts = [];
-    if (want) { nativeSet(input, answer); await sleep(450); opts = comboOptions(); }
-    if (!opts.length) { nativeSet(input, ''); keyDown('ArrowDown'); await sleep(450); opts = comboOptions(); }
+    if (want) { nativeSet(input, answer); await sleep(450); opts = comboOptions(input); if (!opts.length) { await sleep(700); opts = comboOptions(input); } }
+    if (!opts.length) { nativeSet(input, ''); keyDown('ArrowDown'); await sleep(450); opts = comboOptions(input); }
     const txt = o => norm(o.textContent);
     let best = null;
-    if (want && opts.length) {
+    /* A location question: the town, never a building in it (and no "first option"). */
+    const isLoc = /location|\bcity\b|\btown\b|residence|where.*(based|live|located)/i.test(getLabel(input) || getLabel(ctl) || '');
+    if (isLoc) {
+      best = want && opts.length ? bestPlaceOption(opts, answer) : null;
+      fallbackFirst = false;
+    } else if (want && opts.length) {
       best = opts.find(o => txt(o) === want) ||
              opts.find(o => txt(o).startsWith(want + ' ') || txt(o).startsWith(want + ',')) ||
              opts.find(o => txt(o).startsWith(want)) ||
              opts.find(o => txt(o).includes(want));
       if (!best && /^(yes|no)\b/.test(want)) best = opts.find(o => new RegExp('^' + want.split(' ')[0] + '\\b').test(txt(o)));
     }
-    if (!best && fallbackFirst) best = opts[0] || null;
-    if (!best) { keyDown('Escape'); try { input.blur(); } catch (_) {} return ''; }
+    /* Nothing matched a required question. The first option used to be
+       taken whatever it said — "Afghanistan" for the country you live in,
+       "Less than high school" for your education, the first university in
+       the alphabet for your school. Now only an answer that states nothing
+       untrue: "prefer not to say", the only option there is, or an
+       acknowledgement / consent. Otherwise the question is left unanswered. */
+    if (!best && fallbackFirst && opts.length) {
+      best = opts.find(o => /prefer not|rather not|decline|do(n't| not) (wish|want)|not (to )?(say|disclose|answer|specify)|choose not/i.test(txt(o))) ||
+             (opts.length === 1 ? opts[0] : null) ||
+             (opts.length <= 3 ? opts.find(o => /^(i |yes,? i )?(acknowledge|agree|consent|confirm|accept|have read|understand)/i.test(txt(o))) : null) || null;
+    }
+    if (!best) { nativeSet(input, ''); keyDown('Escape'); try { input.blur(); } catch (_) {} return ''; }
     const chosen = (best.textContent || '').trim();
     try { realClick(best); } catch (_) { try { best.click(); } catch (__) {} }
     await sleep(250);
@@ -707,7 +853,14 @@
   }
   /* Answer every dropdown in `scope` that is required-but-empty, or has
      junk typed into its search box with nothing chosen. */
+  const _comboNoAnswerLogged = new Set();
+  let _comboPassRunning = false;
   async function answerComboDropdowns(scope, p) {
+    if (_comboPassRunning) return 0;            // one pass at a time: two at once pick from each other's menus
+    _comboPassRunning = true;
+    try { return await answerComboDropdownsOnce(scope, p); } finally { _comboPassRunning = false; }
+  }
+  async function answerComboDropdownsOnce(scope, p) {
     const LOC_LBL = /location|city|residence|where.*(based|live|located)/i;
     let n = 0;
     for (const input of $$('input', scope || document)) {
@@ -723,8 +876,14 @@
       if (!required && !junk) continue;
       let ans = String(guessValue(lbl, p || {}) || '');
       if (/^(n\/?a|none)$/i.test(ans)) ans = '';
-      const picked = await chooseComboOption(input, ans, required);
+      let picked = '';
+      for (const fact of factualComboAnswers(lbl, p || {})) {      // your CV / details first
+        picked = await chooseComboOption(input, fact, false);
+        if (picked) break;
+      }
+      if (!picked) picked = await chooseComboOption(input, ans, required);
       if (picked) { n++; LOG(`Dropdown: "${lbl.slice(0, 60)}" → "${picked.slice(0, 40)}"`); }
+      else if (required && !_comboNoAnswerLogged.has(lbl)) { _comboNoAnswerLogged.add(lbl); LOG(`Dropdown: "${lbl.slice(0, 60)}" — no known answer, left unanswered (not guessed)`); }
       else if (junk) nativeSet(input, '');                        // at least clear the junk text
     }
     return n;
@@ -831,6 +990,28 @@
      everything here that fills fields or presses buttons leaves it alone —
      two fillers on one form undo each other. */
   const wdEngineOwns = () => { try { return !!(window.__ohWdEngine && window.__ohWdEngine.owns()); } catch (_) { return false; } };
+  /* Another job-autofill extension driving this page — its own "Automation In Progress"-style
+     panel on screen (the Jobright / LazyApply-style build's #ua-ctrl, or any fixed panel saying it
+     is applying / filling). Outside our own run, ours keeps out of that page: no auto-fill, no
+     answer corrections — two fillers on one form undo each other, and both slow down. */
+  const FOREIGN_RUN_RE = /automation in progress|auto-?applying|auto-?filling|autofilling|applying to (this )?job|filling (the |your )?(application|form)/i;
+  function otherAutomationOnPage() {
+    try {
+      if (window.top !== window.self) { try { return !!window.top.document && otherAutomationOnPageIn(window.top.document); } catch (_) { return false; } }
+      return otherAutomationOnPageIn(document);
+    } catch (_) { return false; }
+  }
+  function otherAutomationOnPageIn(doc) {
+    if (doc.getElementById('ua-ctrl')) return true;
+    const roots = [...doc.documentElement.children, ...(doc.body ? doc.body.children : [])];
+    for (const el of roots) {
+      if (!el || el === doc.body || el === doc.head || /^(oh-|wd-)|optimhire/i.test(el.id || '')) continue;
+      const cs = getComputedStyle(el);
+      if (cs.position !== 'fixed' || cs.display === 'none' || cs.visibility === 'hidden') continue;
+      if (FOREIGN_RUN_RE.test((el.innerText || '').slice(0, 400))) return true;
+    }
+    return false;
+  }
   const _rawATS = Object.entries(ATS_DOMAINS)
     .find(([domain]) => HOST.includes(domain))?.[1] || null;
   // LinkedIn: only activate on /jobs path — not on feeds, profiles, or messaging
@@ -883,7 +1064,8 @@
          terminal-submit (T43) bails on its very first line when
          automation is inactive, the run sat on "Review and submit the
          form" waiting for a human click. */
-      const active = (!!csvActiveJobId || isRunning || mayAutomate(d)) && !notTheJobTab(d);
+      const active = (!!csvActiveJobId || isRunning || mayAutomate(d)) && !notTheJobTab(d) &&
+                     !isPageAutofillJob(d);   // a job you autofilled by hand: you submit it
       _automationCache = { active, ts: Date.now() };
       return active;
     } catch (_) {
@@ -1015,6 +1197,33 @@
     }
     return '';
   }
+  /* What the page looked like when the job was given up — so a diagnostic
+     file says WHY a job with no unfinished field still did not go through:
+     was the form ever filled by us, is there a submit button and is it
+     disabled, what does the site say in its own error text, is it asking
+     for a code or showing a challenge. No values typed, only facts. */
+  function failurePageFacts() {
+    const f = {};
+    try {
+      const clean = t => String(t || '').replace(/\s+/g, ' ').trim();
+      const all = $$('input:not([type=hidden]):not([type=submit]):not([type=button]),textarea,select').filter(isVisible);
+      f.controls = all.length;
+      f.withValue = all.filter(e => (e.type === 'checkbox' || e.type === 'radio') ? e.checked : !!clean(e.value)).length;
+      try { f.filledByUs = !!_autoTriggered; } catch (_) {}
+      const sub = $$('button,[role="button"],input[type="submit"]').filter(isVisible)
+        .find(b => /^(submit|send|apply|complete|finish)\b/i.test(clean(b.innerText || b.value)));
+      f.submit = sub ? clean(sub.innerText || sub.value).slice(0, 40) + (sub.disabled || sub.getAttribute('aria-disabled') === 'true' ? ' (disabled)' : '') : '';
+      f.says = [...new Set($$(ERROR_TEXT_SEL + ',[role="alert"]').filter(e => isVisible(e) && !e.querySelector(FIELD_SEL))
+        .map(e => clean(e.textContent).slice(0, 90)).filter(Boolean))].slice(0, 5);
+      const body = clean(document.body && document.body.innerText).slice(0, 6000);
+      f.asksForCode = /verification code|security code|enter the code|confirm your identity/i.test(body);
+      f.challenge = $$('iframe').some(fr => /recaptcha\/(api2|enterprise)\/bframe|hcaptcha\.com\/.*challenge|challenges\.cloudflare/i.test(fr.src || '') &&
+        isVisible(fr) && fr.getBoundingClientRect().height > 120);
+      f.signIn = !!$('input[type="password"]');
+      f.frames = $$('iframe').filter(isVisible).map(fr => { try { return new URL(fr.src).hostname; } catch (_) { return ''; } }).filter(Boolean).slice(0, 4);
+    } catch (_) {}
+    return f;
+  }
   async function noteFieldFailures(reason) {
     try {
       if (window.top !== window.self || _IS_OH_PAGE) return;
@@ -1035,7 +1244,8 @@
         if (!((required && empty) || flagged)) continue;
         fields.push({ label: lbl.slice(0, 90), widget: failureWidget(el), required, empty, flagged, error: flagged ? failureMessage(el) : '' });
       }
-      const entry = { ts: Date.now(), host: location.hostname, path: location.pathname.slice(0, 120), ats: CURRENT_ATS || '', reason: String(reason || '').slice(0, 120), fields };
+      const entry = { ts: Date.now(), host: location.hostname, path: location.pathname.slice(0, 120), ats: CURRENT_ATS || '', reason: String(reason || '').slice(0, 120), fields,
+        page: failurePageFacts() };
       const d = await ST.get(['ohFieldFailures']);
       const list = Array.isArray(d.ohFieldFailures) ? d.ohFieldFailures : [];
       list.push(entry);
@@ -1054,6 +1264,9 @@
     LOG(`skip sent: ${reason || ''}`);
     return true;
   }
+  /* For the Workday engine (same script world): its error-page guard moves
+     the queue on through the same path. */
+  window.__ohSkipCurrent = (reason) => requestSkipCurrent(reason);
 
   /* ── "Autofill this page" — on-demand fill of whatever page you are on ──
    * 2.8.2 shipped an "Autofill Application" button for this, but it is
@@ -1127,6 +1340,7 @@
         msg.action === 'autofill' || msg.action === 'startAutofill' ||
         msg.type === 'OH_AUTOFILL_THIS_PAGE') {
       if (msg.type === 'OH_AUTOFILL_THIS_PAGE' && window.__ohWdEngine && window.__ohWdEngine.takesManual()) return;   // Workday: the engine fills it
+      if (_masterOff) { LOG('Autofill is off — not filling this page (turn it on at the top of the side panel)'); return; }
       _manualTriggerTs = Date.now();
       _automationCache = { active: true, ts: Date.now() };
       /* Only the top frame drives the fill so we don't run once per iframe. */
@@ -1622,6 +1836,15 @@
    * so we match on the button's own text, plus aria-label/title as a
    * fallback, and explicitly reject the Skip (thumbs-down) twin.
    * ────────────────────────────────────────────────────────────────── */
+  /* optimhire.com's own job lists are put ATS-first in the page (oh-queue-order.js, page world);
+     "Quickest ATS first" switched off (ohPreferAts) leaves them in the site's order. */
+  (function markAtsFirst() {
+    if (!/(^|\.)optimhire\.com$/i.test(location.hostname)) return;
+    const paint = d => document.documentElement.setAttribute('data-oh-ats-first', d && d.ohPreferAts === false ? '0' : '1');
+    ST.get(['ohPreferAts']).then(paint, () => {});
+    try { chrome.storage.onChanged.addListener((c, area) => { if (area === 'local' && c.ohPreferAts) paint({ ohPreferAts: c.ohPreferAts.newValue }); }); } catch (_) {}
+  })();
+
   (function installPageApplyClicker() {
     if (!/(^|\.)optimhire\.com$/i.test(location.hostname)) return;
     if (window.top !== window.self) return;
@@ -1650,11 +1873,20 @@
       return null;
     }
 
-    /* Identify the current job so we press Apply at most once per job. */
+    /* Identify the current job so we press Apply at most once per job.
+       Not "the first h1/h2": on this page that is the fixed "Explore Our
+       Success Stories" heading, the same for every job — so after the
+       first job Apply was never pressed again, and each later job sat
+       until a timeout skipped it. The job's own title (h1.jva-job-title),
+       its company line and the "Job N of …" counter change per job. */
     function jobKey() {
       try {
-        const h = document.querySelector('h1,h2');
-        return ((h && (h.innerText || h.textContent)) || '').trim().slice(0, 120);
+        const own = el => ((el && (el.innerText || el.textContent)) || '').replace(/\s+/g, ' ').trim();
+        const title = document.querySelector('.jva-job-title') ||
+                      [...document.querySelectorAll('h1')].find(isVisible) || null;
+        const head = title && title.closest('[class*="job-head"]');
+        const counter = [...document.querySelectorAll('div,span,p')].find(e => e.children.length === 0 && /^job \d+ of\b/i.test(own(e)));
+        return [own(title), own(head && head.parentElement), own(counter)].filter(Boolean).join(' | ').slice(0, 240);
       } catch (_) { return ''; }
     }
 
@@ -1664,8 +1896,13 @@
         /* Only while the user has actually engaged auto-apply (or a
            session/queue is running) — never while they are just browsing
            jobs by hand. */
-        const d = await ST.get(AUTOMATION_KEYS.concat(['copilotTabId']));
+        const d = await ST.get(AUTOMATION_KEYS.concat(['copilotTabId', 'ohPageAutofillTs', 'ohStoppedTs']));
         if (!mayAutomate(d)) return;
+        /* A page autofill shows this page while it loads ITS job: pressing
+           Apply here started OptimHire's whole queue instead. Same just
+           after Stop. */
+        if (Date.now() - (+d.ohPageAutofillTs || 0) < 180_000) return;
+        if (Date.now() - (+d.ohStoppedTs || 0) < 60_000) return;
         /* Only one tab may drive applications: the pinned job tab, or —
            when no side panel is pinning — the elected owner. */
         if (!isPingedJobTab() && !(await isAutomationOwnerTab())) return;
@@ -1807,7 +2044,11 @@
         const ps = (o.textContent || '').split(',').map(x => x.trim().toLowerCase()).filter(Boolean);
         return (ps[0] === want ? 2 : 1) + (country && ps.length > 1 && norm(ps[ps.length - 1]) === norm(country) ? 4 : 0);
       };
-      const matching = () => visibleOptions(el).filter(o => (o.textContent || '').toLowerCase().includes(want))
+      /* A place, not a building in it: "National University of Ireland, Galway"
+         was picked for a Galway address. */
+      const NOT_A_PLACE_RE = /\b(universit(y|ies)|college|school|academy|institute|campus|hospital|clinic|airport|station|hotel|stadium|park|centre|center|museum|library|church|ltd|limited|inc|llc|plc|gmbh|corporation|company|bank|office)\b/i;
+      const isPlace = o => !NOT_A_PLACE_RE.test((o.textContent || '').split(',')[0]);
+      const matching = () => visibleOptions(el).filter(o => isPlace(o) && (o.textContent || '').toLowerCase().includes(want))
         .map((o, i) => ({ o, i, s: score(o) })).sort((a, b) => b.s - a.s || a.i - b.i).map(x => x.o);
       let opts = matching();
       if (!opts.length) {                    // retry with a shorter query
@@ -1819,7 +2060,7 @@
           opts = matching();
         }
       }
-      if (!opts.length && ownList(el)) opts = visibleOptions(el);   // the field's own list: its best guess
+      if (!opts.length && ownList(el)) opts = visibleOptions(el).filter(isPlace);   // the field's own list: its best guess (a place)
       if (opts.length) {
         const best = opts[0];
         try { realClick(best); } catch (_) { try { best.click(); } catch (__) {} }
@@ -1856,7 +2097,7 @@
         _tries++;
         const p = await getProfile();
         for (const t of targets) {
-          let val = guessValue(t.lbl, p);
+          let val = placeOnly(guessValue(t.lbl, p));
           if (!val) val = `${(p && p.city) || 'Dublin'}, ${(p && p.country) || 'Ireland'}`;
           await fillOne(t, val);
         }
@@ -1995,7 +2236,7 @@
         nativeSet(input, '');
         try { input.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', code: 'ArrowDown', bubbles: true, cancelable: true })); } catch (_) {}
         await sleep(450);
-        const opts = comboOptions();
+        const opts = comboOptions(input);
         const hitText = pickRegion(opts.map(o => (o.textContent || '').trim()), wants);
         const hit = hitText && opts.find(o => (o.textContent || '').trim() === hitText);
         if (!hit) { try { input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', code: 'Escape', bubbles: true })); input.blur(); } catch (_) {} continue; }
@@ -2873,9 +3114,15 @@
   const CONTACT_LABEL_RE = /\b(first|last|middle|full|given|family|preferred|legal|sur)?\s?name\b|e-?mail|phone|mobile|telephone|address|street|city|town|post ?code|postal|zip|county|state|province|country|linkedin|github|website|portfolio|url\b/i;
 
   /* ── Profile helper ─────────────────────────────────────── */
+  const PLACE_PART = { location: 1, city: 1, state: 1, province: 1, region: 1, country: 1, county: 1, zip: 1, zipcode: 1,
+                       postal: 1, postcode: 1, address: 1, street: 1, lat: 1, lng: 1, latitude: 1, longitude: 1, timezone: 1 };
+  function isPlaceKey(k) {
+    return /post_?code/i.test(k) || String(k).split(/[_\W]+|(?=[A-Z])/).some(p => PLACE_PART[p.toLowerCase()]);
+  }
   async function getProfile() {
     const keys = ['candidateDetails', 'cachedSeekerInfo', 'seekerDetails', 'userDetails'];
-    const data = await ST.get(keys.concat(['autoApplyState', 'complexFormData', 'manualApplicationDetail', 'ohWdSeeker']));
+    const data = await ST.get(keys.concat(['autoApplyState', 'complexFormData', 'manualApplicationDetail', 'ohWdSeeker',
+                                           'ohMyPhone', 'ohCvProfile', 'appAccountEmail']));
     /* Outside a run OptimHire keeps little more than your name: your details
        from the last OptimHire job (kept by the Workday engine) are the base. */
     let merged = {};
@@ -2894,7 +3141,14 @@
         if (ad && ad.seeker && typeof ad.seeker === 'object') { merged = Object.assign({}, ad.seeker, merged); }
       } catch (_) {}
     }
-    if (data.ohWdSeeker && typeof data.ohWdSeeker === 'object') merged = Object.assign({}, data.ohWdSeeker, merged);   // lowest of all
+    if (data.ohWdSeeker && typeof data.ohWdSeeker === 'object') {   // lowest of all
+      /* Where you live goes as a whole: when the job now names any of it, none
+         of the kept copy's (an old location beside a new city picked the old town). */
+      const kept = Object.assign({}, data.ohWdSeeker);
+      if (Object.keys(merged).some(k => isPlaceKey(k) && merged[k] != null && merged[k] !== '' && typeof merged[k] !== 'object'))
+        Object.keys(kept).forEach(k => { if (isPlaceKey(k)) delete kept[k]; });
+      merged = Object.assign({}, kept, merged);
+    }
 
     // Parse and merge all available profile sources
     for (const key of keys) {
@@ -2922,9 +3176,27 @@
       if (code && !merged.phone_country_code) merged.phone_country_code = '+' + code;
       if (code) _profileDialCode = code;
     }
+    /* The phone you typed on the side panel's card (Applications Account) wins;
+       else your details from OptimHire's jobs; else your CV's own header. The
+       Applications Account e-mail stands in when OptimHire gives none. */
+    {
+      const mine = String(data.ohMyPhone || '').trim();
+      if (mine) {
+        merged.phone = mine;
+        const m = mine.match(/^\+\s*(\d{1,3})/);
+        if (m) { merged.phone_country_code = '+' + m[1]; _profileDialCode = m[1]; }
+      }
+      const cvc = data.ohCvProfile && data.ohCvProfile.profile && data.ohCvProfile.profile.contact;
+      if (cvc && typeof cvc === 'object') {
+        if (!merged.phone && cvc.phone) merged.phone = cvc.phone;
+        if (!merged.email && cvc.email) merged.email = cvc.email;
+      }
+      if (!merged.email && data.appAccountEmail) merged.email = String(data.appAccountEmail).trim();
+    }
     merged.first_name = pick('first_name', 'firstName', 'given_name', 'givenName');
     merged.last_name  = pick('last_name',  'lastName',  'family_name','familyName', 'surname');
-    merged.linkedin_profile_url = pick('linkedin_profile_url','linkedin_url','linkedinUrl','linkedin','LinkedIn');
+    merged.linkedin_profile_url = pick('linkedin_profile_url','linkedin_url','linkedinUrl','linkedin','LinkedIn') ||
+      String((data.ohCvProfile && data.ohCvProfile.profile && data.ohCvProfile.profile.contact && data.ohCvProfile.profile.contact.linkedin) || '');
     merged.github_url    = pick('github_url', 'github', 'githubUrl', 'GitHub');
     merged.website_url   = pick('website_url', 'website', 'websiteUrl', 'portfolio', 'portfolioUrl', 'personal_website');
     merged.twitter_url   = pick('twitter_url', 'twitter', 'twitterUrl', 'x_url', 'x_handle');
@@ -3110,7 +3382,7 @@
       driversLicence: null, clearance: false,
       previouslyEmployed: false, relatives: false, nonCompete: false, convicted: false,
       englishFluent: true,
-      yearsExperience: '7', highestDegree: koDegreeFromCv(_koCv),
+      yearsExperience: '9', highestDegree: koDegreeFromCv(_koCv),
       certifications: ['AWS'],
       salary: String(p.expected_salary || '').trim(),          // as your profile writes it ("£85,000")
       confirmed: false,
@@ -3514,7 +3786,7 @@
           try { input.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', code: 'ArrowDown', bubbles: true, cancelable: true })); } catch (_) {}
         } else koClick(input);
         await sleep(450);
-        const opts = item.type === 'combo' ? comboOptions() : $$('[role="listbox"] [role="option"],[data-automation-id="promptOption"]').filter(isVisible);
+        const opts = item.type === 'combo' ? comboOptions(input) : $$('[role="listbox"] [role="option"],[data-automation-id="promptOption"]').filter(isVisible);
         const texts = opts.map(o => (o.textContent || '').replace(/\s+/g, ' ').trim());
         const want = koPick(texts, item.ko);
         const hit = want && opts[texts.indexOf(want)];
@@ -3552,6 +3824,9 @@
   } catch (_) {}
   function koPageOk() {
     if (_IS_OH_PAGE || _koMasterOff || wdEngineOwns()) return false;
+    /* Only on a job OUR run (or your "Autofill this page") is applying to: another
+       extension's answers and Submit clicks are its own business. */
+    if (!_engagedNow) return false;
     if (CURRENT_ATS) return true;
     return !!document.querySelector('input[type="file"],[data-automation-id^="formField-"]') || /apply|application|career|job|recruit|candidate|vacanc/i.test(location.href);
   }
@@ -3613,13 +3888,15 @@
     gender:       'Prefer not to say',
     ethnicity:    'Prefer not to say',
     race:         'Prefer not to say',
-    years:        '7',           // every years-of-experience question, unless Knockout answers set another number (koFacts)
-    salary:       '80000',
-    salaryRange:  '80000-110000',
-    hourly:       '45',
-    notice:       '2 weeks',
-    availability: 'Immediately',
-    startDate:    '2 weeks from offer',
+    // Your values (CV + settings profile), not generic ones — these are only used when
+    // the profile itself has no answer.
+    years:        '9',           // every years-of-experience question, unless Knockout answers set another number (koFacts)
+    salary:       '60000',
+    salaryRange:  '60000-80000',
+    hourly:       '',
+    notice:       '1 month',
+    availability: '1 month notice',
+    startDate:    '1 month from offer',
     // Professional canned answers — used ONLY if profile has none
     cover: `I am excited to apply for this role. My background and skills make me a strong fit for the position, and I am eager to contribute to your team's continued success. I bring the technical expertise, drive, and collaborative mindset needed to make an immediate impact.`,
     why: 'I admire the company culture and the opportunity to make a meaningful impact through work that aligns with my skills and long-term career goals.',
@@ -4277,7 +4554,31 @@
      "Done", "Save and Submit", "Continue & Submit", etc. */
   const SUBMIT_BTN_RE = /^(submit|submit(\s+(application|now|my\s+application|form|résumé|resume))?|send(\s+(application|your\s+application))?|apply(\s+now)?|finish(\s+application)?|confirm(\s+(and\s+)?submit)?|complete(\s+application)?|done|i['’]m\s+done|save\s+(and|&)\s+submit|continue\s+(and|&)\s+submit)$/i;
 
+  /* A review page shows answers already given. A page with an unanswered
+     required question, or several empty boxes, is a form still to fill —
+     whatever its text says. This test used to be the wording alone, over
+     the whole page: a form with the question "Please confirm your highest
+     level of education" (or a job description saying "please review…")
+     counted as a review page, so the fill was SKIPPED and "Apply Now" /
+     Submit pressed on an empty form. The job then sat with the site's
+     "First Name is required" until the 3-minute cap skipped it. */
+  function unansweredOnPage() {
+    let emptyReq = 0, empty = 0;
+    try {
+      for (const el of $$(FIELD_SEL)) {
+        const t = (el.type || '').toLowerCase();
+        if (t === 'radio' || t === 'checkbox') continue;
+        if (!isVisible(el) || isPageChromeField(el) || isTrapField(el)) continue;
+        if (!failureEmpty(el)) continue;
+        empty++;
+        if (el.required || el.getAttribute('aria-required') === 'true') emptyReq++;
+      }
+    } catch (_) {}
+    return { emptyReq, empty };
+  }
   function isReviewPage() {
+    const un = unansweredOnPage();
+    if (un.emptyReq > 0 || un.empty >= 3) return false;
     const bodyText = (document.body?.innerText || '').slice(0, 8000);
     if (REVIEW_PAGE_RE.test(bodyText)) return true;
     const hdr = document.querySelector('h1,h2,h3,[role="heading"]');
@@ -4371,9 +4672,13 @@
     const desc = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'files');
     if (!desc || !desc.set) return;
     /* The box's own heading: the nearest ancestor (a few levels up) that
-       holds a label-like element, or the group naming it. */
+       holds a label-like element, or the group naming it — never one that
+       also holds another upload box: that heading is the neighbour's (the
+       "Resume/CV *" above made the cover letter look required, and the CV
+       went into it). */
     function head(inp) {
       for (let n = inp.parentElement, i = 0; n && i < 5; n = n.parentElement, i++) {
+        if (n.querySelectorAll('input[type="file"]').length > 1) break;
         const by = n.getAttribute && n.getAttribute('aria-labelledby');
         const named = by && document.getElementById(by.split(/\s+/)[0]);
         if (named) return named.textContent || '';
@@ -4393,16 +4698,45 @@
       if (inp.required || inp.getAttribute('aria-required') === 'true') return true;
       return /\*/.test(head(inp));
     }
+    /* OptimHire writes a cover letter per job and attaches it as plain text, named after its
+       link: "cover-letter.txt". It goes in as a PDF with your name — "Maxmilliam-Okafor-
+       <role>-Cover-Letter.pdf" — when the box takes PDFs; as it came when that fails. */
+    const isText = f => /^text\/plain/i.test(f.type || '') || /\.txt$/i.test(f.name || '');
+    const takesPdf = inp => { const a = (inp.getAttribute('accept') || '').toLowerCase(); return !a || /pdf|\*/.test(a); };
+    function attachAsPdf(inp, f) {
+      (async () => {
+        let out = f;
+        try {
+          const text = await f.text();
+          const lib = await cvLib();
+          const role = String(($('h1') || {}).textContent || document.title || '').replace(/\s+/g, ' ').trim().slice(0, 80);
+          const doc = lib && lib.coverLetter && lib.coverLetter({ text, person: await getProfile(), title: role });
+          if (doc) {
+            const bin = atob(doc.base64), bytes = new Uint8Array(bin.length);
+            for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+            out = new File([bytes], doc.fileName, { type: doc.mime });
+          }
+        } catch (_) {}
+        const dt = new DataTransfer();
+        dt.items.add(out);
+        desc.set.call(inp, dt.files);
+        inp.dispatchEvent(new Event('input', { bubbles: true }));
+        inp.dispatchEvent(new Event('change', { bubbles: true }));
+        LOG(out === f ? `Cover letter box: "${f.name}" attached as it came` : `Cover letter box: "${f.name}" attached as ${out.name}`);
+      })();
+    }
     Object.defineProperty(HTMLInputElement.prototype, 'files', {
       configurable: true,
       enumerable: desc.enumerable,
       get() { return desc.get.call(this); },
       set(list) {
         try {
-          if (this.type === 'file' && list && list.length && COVER_BOX_RE.test(boxText(this)) &&
-              !Array.prototype.some.call(list, f => COVER_FILE_RE.test(f.name || '')) && !required(this)) {
-            LOG(`Cover letter box: not attaching "${list[0].name}" — that's the CV, not a cover letter`);
-            return;
+          if (this.type === 'file' && list && list.length && COVER_BOX_RE.test(boxText(this))) {
+            if (!Array.prototype.some.call(list, f => COVER_FILE_RE.test(f.name || '')) && !required(this)) {
+              LOG(`Cover letter box: not attaching "${list[0].name}" — that's the CV, not a cover letter`);
+              return;
+            }
+            if (list.length === 1 && isText(list[0]) && takesPdf(this)) { attachAsPdf(this, list[0]); return; }
           }
         } catch (_) {}
         desc.set.call(this, list);
@@ -4410,20 +4744,58 @@
     });
   })();
 
-  /* Which job to apply to first (the CSV queue): quickest company ATS first, then ATS sites
-     that need an account, company career sites, job boards, Reed last — lower = sooner.
-     Same order as self.ohJobRank in oh-bg.js. */
+  /* A location as a place: a profile location picked from a suggestion list can be a
+     building in the town ("National University of Ireland, Galway, Ireland") — that
+     part goes ("Galway, Ireland"). */
+  const NOT_A_PLACE_RE = /\b(universit(y|ies)|college|school|academy|institute|campus|hospital|clinic|airport|station|hotel|stadium|museum|library|church|ltd|limited|inc|llc|plc|gmbh|corporation|company|bank|office)\b/i;
+  /* The suggestion to pick for a place: the town itself first ("Galway, County Galway,
+     Ireland"), then another place naming it — never a building in it. null when only
+     buildings match (better left for you than a university as your city). */
+  function bestPlaceOption(opts, val) {
+    const parts = String(val || '').split(',').map(x => x.trim().toLowerCase()).filter(Boolean);
+    const city = parts[0] || '', country = parts.length > 1 ? parts[parts.length - 1] : '';
+    if (!city) return null;
+    const t = o => (o.textContent || '').replace(/\s+/g, ' ').trim().toLowerCase();
+    const places = opts.filter(o => !NOT_A_PLACE_RE.test(t(o).split(',')[0]));
+    return places.find(o => t(o).startsWith(city + ',') && (!country || t(o).endsWith(country))) ||
+           places.find(o => t(o) === city || t(o).startsWith(city + ',') || t(o).startsWith(city + ' ')) ||
+           places.find(o => t(o).includes(city)) || null;
+  }
+  function placeOnly(v) {
+    const parts = String(v || '').split(',').map(x => x.trim()).filter(Boolean);
+    while (parts.length > 1 && NOT_A_PLACE_RE.test(parts[0])) parts.shift();
+    return parts.length === 1 && NOT_A_PLACE_RE.test(parts[0]) ? '' : parts.join(', ');
+  }
+
+  /* Job boards and recruitment sites (eFinancialCareers, Totaljobs, Jobsite, IrishJobs, Built In, Hays…) —
+     the same list as BOARD_HOST_RE in oh-bg.js. */
+  const JOB_BOARD_RANK_RE = new RegExp('(^|\\.)(' + [
+    'linkedin', 'indeed', 'glassdoor', 'ziprecruiter', 'adzuna', 'dice', 'monster', 'totaljobs', 'cwjobs', 'jobsite', 'cv-library',
+    'caterer', 'milkround', 'efinancialcareers', 'efinancial', 'irishjobs', 'jobs\\.ie', 'nijobs', 'recruitireland', 'jobs\\.ac\\.uk',
+    'simplyhired', 'careerbuilder', 'jooble', 'careerjet', 'jora', 'talent\\.com', 'neuvoo', 'lensa', 'snagajob', 'theladders', 'ladders',
+    'hired', 'wellfound', 'angel\\.co', 'otta', 'welcometothejungle', 'builtin[a-z]*', 'stepstone', 'xing', 'seek', 'jobstreet', 'naukri',
+    'foundit', 'bayt', 'gulftalent', 'workinstartups', 'jobserve', 'technojobs', 'jobs\\.theguardian', 'guardianjobs', 'charityjob',
+    'escapethecity', 'idealist', 'remoteok', 'weworkremotely', 'remotive', 'flexjobs', 'himalayas', 'jobgether', 'jobleads', 'jobright',
+    'hiring\\.cafe', 'getwork', 'joblist', 'clearancejobs', 'usajobs', 'civilservicejobs', 'findajob', 'jobs\\.nhs', 'hays', 'michaelpage',
+    'pagepersonnel', 'roberthalf', 'randstad', 'adecco', 'jobteaser', 'gradcracker', 'targetjobs', 'prospects', 'jobindex',
+    'infojobs', 'computrabajo', 'catho', 'bumeran', 'apec', 'jobat', 'jobs\\.ch', 'karriere\\.at', 'pracuj',
+    'jobrapido', 'trovit', 'mitula', 'dailyremote', 'workingnomads', 'nodesk', 'jobbank', 'workopolis', 'eluta',
+  ].join('|') + ')\\.', 'i');
+  /* Which job to apply to first (the CSV queue), lower = sooner: ATS in your order (Greenhouse,
+     Workable, SmartRecruiters, Workday, Oracle, iCIMS, Lever, Ashby, BambooHR…), then company
+     career sites, job boards, Reed last. Same order as self.ohJobRank in oh-bg.js. */
   function jobRank(u) {
     let h = ''; try { h = new URL(u).hostname.toLowerCase(); } catch (_) { return 30; }
     if (/(^|\.)reed\.co\.uk$/.test(h)) return 99;
+    if (/(^|\.)efinancialcareers\.[a-z.]+$/.test(h)) return 100;      // after Reed, last of all
     const boards = [[/(^|\.)linkedin\./, 40], [/(^|\.)indeed\./, 41], [/(^|\.)dice\./, 42], [/(^|\.)ziprecruiter\./, 43], [/(^|\.)adzuna\./, 44],
-      [/(^|\.)(glassdoor|totaljobs|cv-library|monster|jobsite|irishjobs|jobs\.ie|simplyhired|careerbuilder|jooble|hiring\.cafe)\./, 45]];
+      [JOB_BOARD_RANK_RE, 45]];
     for (const [re, r] of boards) if (re.test(h + '.')) return r;
-    const ats = [[/greenhouse\.io|grnh\.se/, 0], [/lever\.co/, 1], [/ashbyhq/, 2], [/workable/, 3], [/smartrecruiters/, 4], [/recruitee/, 5],
-      [/teamtailor/, 6], [/bamboohr/, 7], [/breezy\.hr/, 8], [/jazzhr|resumatorapi|applytojob/, 9], [/pinpointhq/, 10], [/rippling/, 11],
-      [/comeet/, 12], [/personio/, 13], [/jobvite/, 14], [/freshteam|manatal|recooty|gohire|forhyre|homerun|dover|wellfound/, 15],
-      [/myworkdayjobs|myworkdaysite|workdayjobs|\.workday\.com/, 20], [/icims/, 21], [/successfactors|sapsf/, 22], [/oraclecloud/, 23],
-      [/taleo/, 24], [/paylocity|ultipro|ukg\.com|adp\.com|avature|bullhorn/, 25]];
+    const ats = [[/greenhouse\.io|grnh\.se/, 0], [/workable/, 1], [/smartrecruiters/, 2], [/myworkdayjobs|myworkdaysite|myworkday\.com|workdayjobs|\.workday\.com/, 3],
+      [/oraclecloud/, 4], [/icims/, 5], [/lever\.co/, 6], [/ashbyhq/, 7], [/bamboohr/, 8], [/jobvite/, 9], [/teamtailor/, 10], [/recruitee/, 11],
+      [/breezy\.hr/, 12], [/jazzhr|resumatorapi|applytojob/, 13], [/successfactors|sapsf/, 14], [/pinpointhq/, 15], [/rippling/, 16],
+      [/comeet/, 17], [/personio/, 18], [/freshteam|manatal|recooty|gohire|forhyre|homerun|dover|jobs\.gem\.com|join\.com|factorialhr/, 19],
+      [/taleo/, 20], [/paylocity|ultipro|ukg\.com|adp\.com|avature|bullhorn|dayforcehcm|brassring/, 21]];
     const lu = String(u).toLowerCase();
     for (const [re, r] of ats) if (re.test(lu)) return r;
     return 30;
@@ -4569,6 +4941,9 @@
   } catch (_) {}
 
   function guessValue(label, p = {}, inputType = '') {
+    /* An education or job entry's "Start date year" / "End date month" is
+       not "when can you start": "1 month notice" was typed into it. */
+    if (/\b(start|end)\s+(date\s+)?(year|month)\b/i.test(String(label || ''))) return '';
     label = label == null ? '' : String(label);
     const l = label.toLowerCase().replace(/[^a-z0-9 ]/g, ' ');
     const fullName = `${p.first_name||''} ${p.last_name||''}`.trim();
@@ -4646,7 +5021,7 @@
        matched nothing here and returned '', so the field was skipped and
        the form could never be submitted. */
     if (/^location$|\blocation\b|residence|where.*(based|live|located)|current.*(country|city)|country.*and.*city|city.*and.*country/.test(l)) {
-      if (p.location) return p.location;
+      if (p.location && placeOnly(p.location)) return placeOnly(p.location);
       const _city = p.city || 'Dublin';
       const _ctry = p.country || 'Ireland';
       return `${_city}, ${_ctry}`;
@@ -4697,7 +5072,7 @@
                                                           return DEFAULTS.howHeard;
 
     // ── Experience ─────────────────────────────────────────────────────────
-    // Any question asking for a number of years → return 7 (our default)
+    // Any question asking for a number of years → return 9 (our default)
     // This covers text inputs, number inputs, and range dropdowns.
     // The select handler will convert this to the closest range option.
     if (EXP_LABEL_RE.test(l))                             return koFacts().yearsExperience || p.years_experience || DEFAULTS.years;
@@ -4902,6 +5277,35 @@
       'input:not([type=hidden]):not([type=file]):not([type=submit]):not([type=button]),' +
       'textarea'
     ).filter(isVisible);
+
+    /* ── Country dropdown left on the list's first entry ──
+       A plain <select> of countries that nobody answered, or that a filler
+       opened and left, shows the first country in the list — "Afghanistan"
+       went onto a form that way. When your country is known and is in the
+       list, an empty Country dropdown, or one sitting on the first entry,
+       is set to it. Phone-code, nationality and "countries you can work
+       in" dropdowns are left alone. */
+    if (p.country) {
+      const want = String(p.country).trim().toLowerCase();
+      for (const sel of $$('select').filter(isVisible)) {
+        if (sel.disabled || sel.multiple) continue;
+        const lbl = (getLabel(sel) || sel.name || sel.id || '').replace(/\s+/g, ' ').trim();
+        if (!/^country\b|country of residence|country\s*\/\s*region|current country|country you (currently )?(live|reside)/i.test(lbl)) continue;
+        if (/code|phone|dial|citizen|national|authori[sz]|eligible|birth|passport/i.test(lbl)) continue;
+        const real = [...sel.options].filter(o => o.value && !/^(select|choose|please|--)/i.test((o.text || '').trim()));
+        if (real.length < 20) continue;                       // not a list of countries
+        const cur = sel.options[sel.selectedIndex];
+        const onFirst = cur && real[0] && cur.value === real[0].value;
+        if (cur && cur.value && !onFirst) continue;           // someone chose a country: keep it
+        const mine = real.find(o => (o.text || '').trim().toLowerCase() === want) ||
+                     real.find(o => (o.text || '').trim().toLowerCase().startsWith(want));
+        if (!mine || (cur && cur.value === mine.value)) continue;
+        LOG(`sanitize: Country dropdown "${lbl.slice(0, 40)}" was ${cur && cur.value ? '"' + (cur.text || '').trim() + '"' : 'empty'} → ${mine.text.trim()}`);
+        sel.value = mine.value;
+        sel.dispatchEvent(new Event('input', { bubbles: true }));
+        sel.dispatchEvent(new Event('change', { bubbles: true }));
+      }
+    }
 
     /* ── Email + confirm-email correction + empty-required force-fill ──
        Forces every email field — and any confirm/verify/re-enter email
@@ -5349,7 +5753,7 @@
 
       // 3a) Experience range: pick the bracket closest to our years value
       if (!chosen && EXP_LABEL_RE.test(l)) {
-        const targetYears = parseInt((koFacts().yearsExperience || p.years_experience || DEFAULTS.years).toString()) || 7;
+        const targetYears = parseInt((koFacts().yearsExperience || p.years_experience || DEFAULTS.years).toString()) || 9;
         let bestDist = Infinity;
         for (const o of opts) {
           const nums = (o.text.match(/\d+/g) || []).map(Number).filter(Boolean);
@@ -5478,7 +5882,9 @@
         const opts = $$('[role="option"],[class*="react-select__option"],[class*="Select__option"],[class*="select2-results__option"]', listbox)
           .filter(isVisible);
         const vl = val.toLowerCase();
-        const best = opts.find(o => o.textContent.toLowerCase().includes(vl))
+        const isLoc = /location|\bcity\b|\btown\b|residence|where.*(based|live|located)/i.test(lbl);
+        const best = isLoc ? bestPlaceOption(opts, val)
+          : opts.find(o => o.textContent.toLowerCase().includes(vl))
           || opts.find(o => vl.includes(o.textContent.toLowerCase().trim()))
           || opts[0];
         if (best) { realClick(best); await sleep(300); filledCount++; if (lbl) reportFieldFilled(lbl, 'filled'); }
@@ -5616,7 +6022,7 @@
       ['#last_name,input[id*="last_name"],input[name*="last_name"]',       p.last_name],
       ['#email,input[type="email"],input[id*="email"]',                    p.email],
       ['#phone,input[type="tel"],input[id*="phone"]',                      p.phone],
-      ['input[id*="location"],input[name*="location"]',                    p.city || p.location || ''],
+      ['input[id*="location"],input[name*="location"]',                    p.city || placeOnly(p.location) || ''],
       ['input[id*="linkedin"],input[name*="linkedin"]',                    p.linkedin_profile_url || ''],
       ['input[id*="website"],input[name*="website"],input[id*="portfolio"]', p.website_url || ''],
       ['input[id*="github"],input[name*="github"]',                        p.github_url || ''],
@@ -5960,8 +6366,9 @@
         } catch (_) { /* cross-origin — expected */ }
       } catch (_) {}
 
-      // After 8 seconds, if iframe is still present and we're not actively filling, force-skip
-      await sleep(8000);
+      // After 25 seconds, if iframe is still present and we're not actively filling, force-skip
+      // (was 8 s — OptimHire is often still writing the answers in it by then)
+      await sleep(25000);
       const still = document.getElementById(IFRAME_ID);
       if (still) {
         if (_fillActive || (_submitAttempted && Date.now() - _submitAttemptTs < 30_000)) {
@@ -5969,7 +6376,7 @@
           _skipScheduled = false;
           return;
         }
-        LOG('Missing-details iframe still present after 8s — force-skipping');
+        LOG('Missing-details iframe still present after 25s — force-skipping');
         await requestSkipCurrent('missing-details iframe stuck');
         // Also remove the iframe so the page is unblocked
         try {
@@ -6031,6 +6438,122 @@
    * treat OptimHire's working indicators and any form-field changes as
    * progress, so we never skip while it's actively applying.
    * ─────────────────────────────────────────────────────────────────────── */
+  /* ── Keep the job tab running ───────────────────────────────────────────
+   * A queue job often runs in a tab nobody is looking at. The browser then
+   * slows that tab's timers (to about once a minute after a few minutes
+   * hidden), may freeze it, and may discard it to save memory. All three
+   * looked like "stuck" to the watchdogs, and jobs were skipped
+   * mid-application.
+   *   hold(on)        while a job runs here the tab may not be discarded
+   *                   (background block 18).
+   *   after/every     a clock that is not slowed: a Worker, or the
+   *                   background worker (OH_TICK) when the site's security
+   *                   policy forbids Workers, else plain timers.
+   *   frozenMs()      time this tab spent frozen; the stuck watchdog does
+   *                   not count it as "no progress".
+   *   setTimeout      while a job runs and the tab is hidden, short waits
+   *                   started by this extension's content scripts (OptimHire's
+   *                   filler included) run on the Worker clock. Only this
+   *                   extension's script world is touched, never the site's.
+   * ─────────────────────────────────────────────────────────────────────── */
+  const OH_CLOCK = (function () {
+    const TOP = window.top === window.self;
+    const _setTimeout = window.setTimeout.bind(window);
+    const _clearTimeout = window.clearTimeout.bind(window);
+    const waiting = new Map();
+    let worker = null, mode = 'timer', nextId = 1, frozen = 0, freezeAt = 0, held = false, jobActive = false;
+
+    function fire(id) {
+      const fn = waiting.get(id);
+      if (!fn) return;
+      waiting.delete(id);
+      try { fn(); } catch (_) {}
+    }
+    function viaBackground(id, ms) {
+      const t0 = Date.now();
+      try {
+        chrome.runtime.sendMessage({ type: 'OH_TICK', ms }, () => {
+          const failed = !!chrome.runtime.lastError;
+          const left = ms - (Date.now() - t0);
+          if (failed) mode = 'timer';
+          if (left > 30) _setTimeout(() => fire(id), left); else fire(id);
+        });
+      } catch (_) { mode = 'timer'; _setTimeout(() => fire(id), ms); }
+    }
+    if (TOP) {
+      try {
+        const src = 'onmessage=function(e){var d=e.data;setTimeout(function(){postMessage(d.id)},d.ms)}';
+        const url = URL.createObjectURL(new Blob([src], { type: 'application/javascript' }));
+        worker = new Worker(url);
+        try { URL.revokeObjectURL(url); } catch (_) {}
+        worker.onmessage = (e) => fire(e.data);
+        worker.onerror = () => {
+          /* The site's security policy refused it — hand what was waiting to
+             the background clock. */
+          worker = null; mode = 'sw';
+          for (const id of Array.from(waiting.keys())) viaBackground(id, 1000);
+        };
+        mode = 'worker';
+      } catch (_) { worker = null; mode = 'sw'; }
+    }
+
+    function after(ms, fn) {
+      ms = Math.max(0, Number(ms) || 0);
+      const id = nextId++;
+      waiting.set(id, fn);
+      if (worker) {
+        try { worker.postMessage({ id, ms }); return id; } catch (_) { worker = null; mode = 'sw'; }
+      }
+      /* The background clock only while a job runs here, so idle tabs do not
+         keep the background worker awake. */
+      if (mode === 'sw' && jobActive && ms <= 25_000) viaBackground(id, ms);
+      else _setTimeout(() => fire(id), ms);
+      return id;
+    }
+    function cancel(id) { waiting.delete(id); }
+    function every(ms, fn) {
+      const tick = () => { try { fn(); } catch (_) {} after(ms, tick); };
+      after(ms, tick);
+    }
+
+    /* Page lifecycle: the browser says when it freezes and resumes a tab. */
+    document.addEventListener('freeze', () => { freezeAt = Date.now(); }, true);
+    document.addEventListener('resume', () => {
+      if (freezeAt) { frozen += Date.now() - freezeAt; freezeAt = 0; }
+    }, true);
+
+    function hold(on) {
+      on = !!on;
+      if (!TOP || on === held) return;
+      held = on;
+      try { Promise.resolve(chrome.runtime.sendMessage({ type: 'OH_TAB_HOLD', hold: on })).catch(() => {}); } catch (_) {}
+    }
+
+    if (TOP && worker) {
+      const fakeIds = new Map();
+      let fake = 1_000_000_000;
+      window.setTimeout = function (fn, ms, ...args) {
+        if (!jobActive || !document.hidden || !worker || typeof fn !== 'function') return _setTimeout(fn, ms, ...args);
+        const n = fake++;
+        fakeIds.set(n, after(ms, () => { fakeIds.delete(n); fn(...args); }));
+        return n;
+      };
+      window.clearTimeout = function (n) {
+        if (fakeIds.has(n)) { cancel(fakeIds.get(n)); fakeIds.delete(n); return; }
+        return _clearTimeout(n);
+      };
+    }
+
+    return {
+      after, cancel, every, hold,
+      setJobActive(on) { jobActive = !!on; },
+      /* true when after() is not slowed in a hidden tab */
+      unslowed: () => mode === 'worker' || (mode === 'sw' && jobActive),
+      frozenMs: () => frozen + (freezeAt ? Date.now() - freezeAt : 0),
+      addFrozen(ms) { if (ms > 0) frozen += ms; },
+    };
+  })();
+
   (function installStuckWatchdog() {
     /* 60s of genuine inactivity = stuck. This is a safety net, NOT the
        throughput driver — OptimHire's full per-job flow (load details →
@@ -6073,9 +6596,26 @@
        ones were OptimHire's resume screen counting down — now pressed at
        once); Workday's many pages plus signing in get longer. */
     const JOB_CAP_MS = /myworkday(jobs|site)\.com$|workday\.com$/i.test(location.hostname) ? 480_000 : 180_000;
-    let _capKey = '', _capStartTs = 0;
+    let _capKey = '', _capStartTs = 0, _beatTs = 0;
+    let _lastCheckTs = Date.now(), _frozenSeen = OH_CLOCK.frozenMs();
 
     async function checkStuck() {
+      /* Time the tab spent frozen is not "no progress". The browser reports
+         most freezes; on the unslowed clock a gap between checks of more
+         than 10 s also means the tab was frozen (on plain timers such a
+         gap is just a hidden tab being slowed, so it is not counted). */
+      const t = Date.now();
+      const gap = t - _lastCheckTs - POLL_MS;
+      _lastCheckTs = t;
+      if (gap > 10_000 && OH_CLOCK.unslowed()) OH_CLOCK.addFrozen(gap);
+      const frozenNow = OH_CLOCK.frozenMs();
+      const thawedMs = frozenNow - _frozenSeen;
+      _frozenSeen = frozenNow;
+      if (thawedMs > 0) {
+        _lastProgressTs += thawedMs;
+        if (_capStartTs) _capStartTs += thawedMs;
+      }
+
       let active = false, jobKey = '';
       try {
         const d = await ST.get([
@@ -6087,6 +6627,8 @@
         jobKey = String(d.csvActiveJobId || d.active_copilot_job_id || '');
       } catch (_) { return; }
 
+      OH_CLOCK.setJobActive(active);
+      OH_CLOCK.hold(active);
       if (!active) { _lastProgressTs = Date.now(); _capKey = ''; return; }
 
       const cur = normalizeUrl(location.href);
@@ -6105,7 +6647,7 @@
       }
 
       /* Any of these counts as progress → reset the inactivity clock */
-      let progressed = false;
+      let progressed = thawedMs > 0;                                      // just woke from a freeze
       if (cur !== _lastUrl) { _lastUrl = cur; progressed = true; }       // navigation
       if (_fillActive) progressed = true;                                 // our autofill
       if (_submitAttempted && now - _submitAttemptTs < 30_000) progressed = true;
@@ -6116,7 +6658,17 @@
       const sig = formSignature();
       if (sig !== _lastFormSignature) { _lastFormSignature = sig; progressed = true; }
 
-      if (progressed) { _lastProgressTs = now; return; }
+      if (progressed) {
+        _lastProgressTs = now;
+        /* Tell the side panel this job is mid-application, so its own skip
+           timers (auto-skip, 25 s watchdog, missing-details, blocked) hold
+           off. The job cap above still ends a form that loops for ever. */
+        if (window.top === window.self && (now - _beatTs >= 5_000 || thawedMs > 0)) {
+          _beatTs = now;
+          Promise.resolve(ST.set({ ohJobActivity: { ts: now, url: cur } })).catch(() => {});
+        }
+        return;
+      }
 
       /* No progress signal at all — has it been long enough? */
       if (now - _lastProgressTs >= STUCK_TIMEOUT_MS) {
@@ -6126,7 +6678,9 @@
       }
     }
 
-    setInterval(checkStuck, POLL_MS);
+    /* On the unslowed clock, so a hidden job tab is still checked (and still
+       tells the side panel it is busy) every 2 s. */
+    OH_CLOCK.every(POLL_MS, checkStuck);
     checkStuck();
   })();
 
@@ -6657,6 +7211,7 @@
        Lever/iCIMS wording added so the user never has to press submit. */
     const T43_TERMINAL_RE = /^(submit\s+application|submit\s+your\s+application|send\s+application|send\s+my\s+application|submit\s+my\s+application|complete\s+application|finish\s+application|submit\s+&\s+apply|submit\s+and\s+apply|submit\s+profile|send\s+profile|submit)$/i;
 
+    const _refillsFor = new Map();
     async function tickGenericSubmit() {
       if (autoSubmitBlockedHere()) return;   // user asked for fill-only here
       if (!await automationActive()) return;
@@ -6674,6 +7229,27 @@
 
       const btn = findBtnByText(T43_TERMINAL_RE);
       if (!btn) return;
+      /* Required questions still unanswered: fill the form (again) before
+         pressing submit — up to twice per page. Submit used to be pressed
+         regardless, and the site answered with a wall of "… is required".
+         After two fills it is pressed as before, as the last resort (our
+         reading of a custom widget may be what is wrong). */
+      if (!requiredFieldsSatisfied()) {
+        if (_fillActive || _autoTriggerRunning || _comboPassRunning) return;   // a fill is still at work
+        const n = _refillsFor.get(location.href) || 0;
+        if (n < 2) {
+          _refillsFor.set(location.href, n + 1);
+          LOG(`Flow: required questions still unanswered — filling the form before submit (${n + 1}/2)`);
+          try {
+            _fillActive = true;
+            await runAtsAutofill();
+            try { await detectAndFixValidationErrors(); } catch (_) {}
+            try { await sanitizeBadFills(); } catch (_) {}
+            try { await answerComboDropdowns(document, await getProfile()); } catch (_) {}
+          } catch (_) {} finally { _fillActive = false; }
+          return;
+        }
+      }
       /* Don't double-submit on the same step */
       const fp = pageFingerprint('submit');
       if (_dismissedFingerprints.has(fp)) return;
@@ -6693,7 +7269,7 @@
        knockout question with no profile data, etc.) we don't need to
        wait the full window — fire the skip MISSING_SKIP_MS after fill
        completes if required-fields-satisfied is still false. */
-    const MISSING_SKIP_MS = 20_000;
+    const MISSING_SKIP_MS = 45_000;   // was 20 s — skipped jobs the panel was still answering
     let _missingSkipFiredForUrl = '';
     async function tickMissingSkip() {
       if (!await automationActive()) return;
@@ -7610,6 +8186,88 @@
       }
     }
     await autoFillPage();
+    /* OptimHire's own pass fills after this one and can leave Country at the default: checked again. */
+    for (const wait of [0, 4000, 9000]) {
+      await sleep(wait);
+      if (CURRENT_ATS !== 'BambooHR' || !(await bambooAddress(p))) break;
+    }
+  }
+
+  /* BambooHR's address. Country and State are its own dropdowns (a button, a menu with a
+     Search box and options, a hidden <select>): typing never reached them, so Country stayed
+     on the default "United States" and the State list was the US one; both menus were left
+     open. ZIP got a place ("Dublin, D…") rather than the postcode. Returns true when it
+     changed something (checked again a little later). */
+  async function bambooAddress(p) {
+    const sq = v => String(v || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+    const label = l => (l.textContent || '').replace(/[*:]/g, ' ').replace(/\s+/g, ' ').trim();
+    const shown = b => (b.textContent || '').replace(/[×✕]/g, '').replace(/\s+/g, ' ').trim();
+    function field(re) {
+      for (const l of $$('label')) {
+        if (!re.test(label(l))) continue;
+        for (let n = l.parentElement, i = 0; n && i < 4; n = n.parentElement, i++) {
+          const toggles = n.querySelectorAll('.fab-Select button, button[aria-haspopup="listbox"]');
+          if (toggles.length > 1) break;
+          if (toggles.length) return { label: l, button: toggles[0], select: n.querySelector('select') };
+          const inp = n.querySelector('input[type="text"], input:not([type])');
+          if (inp && !inp.closest('[data-helium-id]')) return { label: l, input: inp };
+        }
+      }
+      return null;
+    }
+    function menuOf(btn) {
+      const id = btn.getAttribute('data-menu-id') || btn.getAttribute('aria-controls');
+      const m = id && (document.querySelector(`[data-helium-id="${CSS.escape(id)}"]`) || document.getElementById(id));
+      return m && isVisible(m) ? m : null;
+    }
+    function closeMenus() {
+      const t = document.activeElement || document.body;
+      for (const type of ['keydown', 'keyup']) t.dispatchEvent(new KeyboardEvent(type, { key: 'Escape', code: 'Escape', keyCode: 27, bubbles: true }));
+    }
+    /* The option for `want` (exact, then the country's longer name), or null. */
+    function optionFor(opts, want) {
+      const w = sq(want);
+      return opts.find(o => sq(o.textContent) === w) ||
+             opts.find(o => sq(o.textContent).startsWith(w) || sq(o.textContent).includes('republicof' + w)) || null;
+    }
+    async function choose(f, want) {
+      if (!f || !f.button || !want || sq(shown(f.button)) === sq(want)) return false;
+      realClick(f.button);
+      let menu = null;
+      for (let i = 0; i < 10 && !(menu = menuOf(f.button)); i++) await sleep(100);
+      if (!menu) return false;
+      const search = menu.querySelector('input[type="text"], input[type="search"], input:not([type])');
+      if (search) { search.focus(); nativeSet(search, String(want)); await sleep(300); }
+      const opt = optionFor([...menu.querySelectorAll('.fab-MenuOption, [role="option"], [role="menuitem"]')].filter(isVisible), want);
+      if (!opt) { closeMenus(); await sleep(150); if (menuOf(f.button)) realClick(f.button); return false; }
+      realClick(opt);
+      await sleep(300);
+      if (menuOf(f.button)) closeMenus();
+      LOG(`BambooHR: ${label(f.label).slice(0, 30)} → ${shown(f.button)}`);
+      return true;
+    }
+    let changed = false;
+    const country = String(p.country || '').trim();
+    if (await choose(field(/^country\b/i), country)) { changed = true; await sleep(500); }
+    /* State: only what you live in, and only when the list (now this country's) has it. */
+    const st = field(/^(state|province|county|region)\b/i);
+    if (st && st.button) {
+      const want = [p.state, p.county, p.city].map(v => String(v || '').trim()).find(Boolean);
+      if (want && sq(shown(st.button)) !== sq(want) && !sq(shown(st.button)).includes(sq(want))) {
+        if (await choose(st, want)) changed = true;
+        else if (await choose(st, 'County ' + want) || await choose(st, 'Co. ' + want)) changed = true;
+      }
+    }
+    /* ZIP: your postcode; a place typed there loses the place. */
+    const zip = field(/^(zip|postal code|post code|postcode|eircode|zip\s*\/\s*postal code)\b/i);
+    if (zip && zip.input) {
+      const cur = (zip.input.value || '').trim(), mine = String(p.postal_code || '').trim();
+      const want = mine || (/^[^\d,]+,\s*(?=.*\d)/.test(cur) ? cur.replace(/^[^\d,]+,\s*/, '') : '');
+      if (want && sq(cur) !== sq(want)) { nativeSet(zip.input, want); changed = true; LOG(`BambooHR: ZIP → ${want}`); }
+    }
+    /* Never leave a menu open (two were left open over the form). */
+    if ($$('.fab-Select button, button[aria-haspopup="listbox"]').some(b => menuOf(b))) closeMenus();
+    return changed;
   }
 
   /* ── Jobvite autofill ────────────────────────────────────── */
@@ -8156,7 +8814,47 @@
     return fixed;
   }
 
-  const SF_EMPTY_RE = /^(no selection|select( one)?|please select|choose|--+|\s*)$/i;
+  /* ── Answers typed into the wrong box ───────────────────────────────
+     Seen on Greenhouse: "What are your salary expectations?" read "50000YesYes".
+     A filler answered the Yes/No dropdowns below it by typing "Yes" while the
+     salary box still had the focus, so each answer landed on the end of the
+     salary. Any text box whose value is a real answer with Yes / No stuck to
+     its end (no space) gets the stray words taken off; a box holding only
+     "YesYes" keeps one "Yes". Never the box you are typing in, and each wrong
+     value is fixed once, so nothing is fought over. */
+  const _gluedFixed = new WeakMap();
+  const GLUED_RE = /^(.*?[0-9a-z%).])((?:Yes|No|YES|NO){1,6})$/;
+  const REPEAT_RE = /^(Yes|No)(?:\1)+$/i;
+  function isPickerInput(el) {
+    return el.getAttribute('role') === 'combobox' || el.hasAttribute('aria-autocomplete') ||
+      !!el.closest('[role="listbox"],[class*="select__control"],[class*="-control"][class*="css-"],.select2-container,[data-automation-id*="multiselect" i]');
+  }
+  function fixGluedAnswers() {
+    let fixed = 0;
+    for (const el of $$('input[type="text"],input:not([type]),textarea')) {
+      if (el === document.activeElement || el.disabled || el.readOnly || !isVisible(el) || isPickerInput(el)) continue;
+      const cur = String(el.value || '');
+      if (!cur || _gluedFixed.get(el) === cur) continue;
+      let want = null;
+      const rep = cur.trim().match(REPEAT_RE);
+      if (rep) want = rep[1];
+      else {
+        const m = cur.match(GLUED_RE);
+        if (m && m[1].trim()) want = m[1];
+      }
+      if (want == null || want === cur) continue;
+      _gluedFixed.set(el, want);
+      if (nativeSet(el, want)) {
+        fixed++;
+        const label = String(getLabel(el) || el.getAttribute('aria-label') || el.name || '').replace(/\s+/g, ' ').trim();
+        LOG(`Fixed an answer typed into the wrong box: "${label.slice(0, 50)}" was "${cur.slice(0, 40)}", now "${want.slice(0, 40)}"`);
+      }
+    }
+    return fixed;
+  }
+  if (CURRENT_ATS && !_IS_OH_PAGE) setInterval(() => { try { fixGluedAnswers(); } catch (_) {} }, 1500);
+
+  const SF_EMPTY_RE =/^(no selection|select( one)?|please select|choose|--+|\s*)$/i;
   function sfLabel(el) { return String(getLabel(el) || '').replace(/[*:]/g, ' ').replace(/\s+/g, ' ').trim(); }
   function sfSelectEmpty(sel) {
     const o = sel.options[sel.selectedIndex];
@@ -8861,35 +9559,76 @@
 
   /** Inject/update the "Autofill in progress" banner */
   function showAutofillBanner(status, atsName) {
+    if (_masterOff) return;
+    /* A small pill at the top centre of the page. It used to be a bar
+       across the full width of the page, drawn over the site's own header
+       and navigation, and stayed for good when a fill never finished. */
     let banner = document.getElementById('oh-autofill-banner');
     if (!banner) {
       banner = document.createElement('div');
       banner.id = 'oh-autofill-banner';
+      banner.setAttribute('role', 'status');
+      banner.setAttribute('aria-live', 'polite');
       banner.style.cssText = `
-        position:fixed;top:0;left:0;right:0;z-index:2147483647;
-        padding:10px 20px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
-        font-size:13px;font-weight:600;text-align:center;
-        transition:background .3s ease,color .3s ease;pointer-events:none;
-        box-shadow:0 2px 12px rgba(0,0,0,.2);
+        position:fixed;top:12px;left:50%;transform:translateX(-50%);z-index:2147483647;
+        max-width:min(92vw,440px);box-sizing:border-box;padding:8px 16px;border-radius:999px;
+        font:600 12.5px/1.35 -apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
+        color:#fff;text-align:center;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+        transition:background .25s ease,opacity .25s ease;pointer-events:none;
+        box-shadow:0 6px 20px rgba(15,23,42,.28);
       `;
-      document.body.appendChild(banner);
+      (document.body || document.documentElement).appendChild(banner);
     }
-    const name = atsName || CURRENT_ATS || 'ATS';
+    const name = atsName || CURRENT_ATS || 'this';
+    clearTimeout(banner._ohHide);
+    const hideIn = ms => { banner._ohHide = setTimeout(() => { if (banner.parentNode) banner.remove(); }, ms); };
     if (status === 'detecting') {
-      banner.textContent = `🔍 ${name} detected — starting autofill…`;
-      banner.style.background = 'linear-gradient(135deg,#1e40af,#7c3aed)';
-      banner.style.color = '#fff';
+      banner.textContent = `OptimHire: ${name} form found, starting autofill`;
+      banner.style.background = '#4338ca';
+      hideIn(60000);
     } else if (status === 'filling') {
-      banner.textContent = `⚡ Autofill in progress — filling ${name} form…`;
-      banner.style.background = 'linear-gradient(135deg,#2563eb,#7c3aed)';
-      banner.style.color = '#fff';
+      banner.textContent = `OptimHire: filling the ${name} form`;
+      banner.style.background = '#4338ca';
+      hideIn(60000);
     } else if (status === 'done') {
-      banner.textContent = '✅ Autofill complete — please review and submit';
-      banner.style.background = 'linear-gradient(135deg,#059669,#10b981)';
-      banner.style.color = '#fff';
-      setTimeout(() => { if (banner.parentNode) banner.remove(); }, 5000);
+      banner.textContent = 'OptimHire: autofill complete';
+      banner.style.background = '#047857';
+      hideIn(4000);
     }
   }
+
+  /* ── OptimHire's "Action required — open the side panel" notice ──────
+   * OptimHire draws it as a 598×400 box in the middle of the job page with
+   * the whole page dimmed behind it, at the highest layer: the form being
+   * filled could not be seen or checked while it was up. It is kept (its
+   * button still opens the side panel) but as a small card in the bottom
+   * right corner, with no dimming, so it covers nothing of the form. */
+  (function tameSidePanelNotice() {
+    if (window.top !== window.self) return;
+    const CSS = '#optimhire-toast-backdrop{display:none!important}' +
+      '#optimhire-toaster{top:auto!important;left:auto!important;right:16px!important;bottom:16px!important;' +
+      'transform:scale(.5)!important;transform-origin:bottom right!important;' +
+      'box-shadow:0 16px 48px rgba(15,23,42,.35)!important;border-color:#cbd5e1!important}';
+    function tame() {
+      try {
+        const host = document.getElementById('optimhire-toast-shadow-host');
+        if (!host || !host.shadowRoot || host.shadowRoot.getElementById('oh-tame')) return;
+        const st = document.createElement('style');
+        st.id = 'oh-tame';
+        st.textContent = CSS;
+        host.shadowRoot.appendChild(st);
+        /* the host itself was a full-screen layer over the page */
+        host.style.width = '0'; host.style.height = '0'; host.style.top = 'auto'; host.style.left = 'auto';
+        host.style.right = '0'; host.style.bottom = '0';
+      } catch (_) {}
+    }
+    try {
+      tame();
+      new MutationObserver(tame).observe(document.documentElement, { childList: true, subtree: false });
+      const watchBody = () => { if (document.body) new MutationObserver(tame).observe(document.body, { childList: true }); };
+      if (document.body) watchBody(); else document.addEventListener('DOMContentLoaded', watchBody);
+    } catch (_) {}
+  })();
 
   /** Strong "this is a job application form" detector for pages on an
       UNRECOGNISED ATS (CURRENT_ATS is null). Requires 3+ visible inputs
@@ -8916,12 +9655,34 @@
     } catch (_) { return false; }
   }
 
+  /* Which page of which job was just filled: the address with the query
+     that names the job (tracking parameters dropped), plus the job's id. */
+  const AUTO_FILL_AGAIN_MS = 60_000;
+  async function autoFillKey() {
+    let page = location.href;
+    try {
+      const u = new URL(location.href);
+      for (const k of [...u.searchParams.keys()]) {
+        if (/^(utm_|fbclid$|gclid$|ref$|referer$|source$|src$|jr_id$|oga$)/i.test(k)) u.searchParams.delete(k);
+      }
+      u.searchParams.sort();
+      page = u.origin + u.pathname + u.search;
+    } catch (_) {}
+    let job = '';
+    try { const d = await ST.get(['csvActiveJobId', 'active_copilot_job_id']); job = String(d.csvActiveJobId || d.active_copilot_job_id || ''); } catch (_) {}
+    return job + '|' + page;
+  }
+
   /** Run the full auto-trigger flow */
   let _autoTriggered = false;
   let _autoTriggerRunning = false;
 
+  let _foreignNoted = false, _noFormLoggedFor = '';
   async function autoTriggerAutofill() {
     /* Guards */
+    /* Autofill off: no fill when a page opens, even with "Auto-fill on ATS pages" on —
+       it used to fill pages you opened yourself, open the side panel and show its banner. */
+    if (_masterOff || (await ST.get(['ohAutomationDisabled'])).ohAutomationDisabled === true) return;
     if (wdEngineOwns()) return;
     if (_autoTriggerRunning) return;
     if (_autoTriggered)      return;
@@ -8943,21 +9704,34 @@
     if (ohAutoTrigger === false) return; /* user explicitly disabled */
     const active = await isAutomationActive();
     if (ohAutoTrigger !== true && !active) return;   // unset → only during a run
+    /* Another extension is applying on this page: leave it to it (not our run). */
+    if (!active && otherAutomationOnPage()) {
+      if (!_foreignNoted) { _foreignNoted = true; LOG('Another autofill extension is applying on this page — not auto-filling it'); }
+      return;
+    }
     /* "Auto-fill on supported ATS pages" while browsing: a job board's
        search / listing pages are not application forms (Indeed fired here
        while the user was browsing); its own apply step is. During a run,
        only the job's own tab. */
     if (onJobBoard() && !(active && await isActiveJobTab()) && !boardApplyFlowOpen()) return;
 
-    /* URL-dedup: don't fill same page twice */
-    const norm = normalizeUrl(location.href);
-    const { ohAutoFilledUrls = [] } = await ST.get('ohAutoFilledUrls');
-    if (ohAutoFilledUrls.includes(norm)) return;
+    /* Don't fill the same page twice in a row (a quick redirect or a second
+       trigger). This used to be a permanent list of addresses with the
+       query string removed — so every Greenhouse embedded form
+       (/embed/job_app?for=<company>&token=<job>) was one entry, and after
+       the first one was filled no later one ever was: those jobs sat
+       untouched until the 3-minute cap skipped them (24 of 43 stalls in
+       one audit). A page filled on an earlier try was also never filled
+       again. Now: the address keeps the part that names the job, the job's
+       id is part of the key, and an entry lasts a minute. */
+    const fillKey = await autoFillKey();
+    const { ohAutoFilledAt = {} } = await ST.get('ohAutoFilledAt');
+    if (Date.now() - (ohAutoFilledAt[fillKey] || 0) < AUTO_FILL_AGAIN_MS) return;
 
     /* ── Is this actually an application page? ── */
     if (!isApplicationPage()) {
       /* Silent: don't show any banner — just wait for DOM changes */
-      LOG(`Auto-trigger: ${CURRENT_ATS} page, but no application form yet`);
+      if (_noFormLoggedFor !== location.href) { _noFormLoggedFor = location.href; LOG(`Auto-trigger: ${CURRENT_ATS} page, but no application form yet`); }
       return;
     }
 
@@ -8989,10 +9763,15 @@
       await sleep(1000); await sanitizeBadFills();
       _fillActive = false;
 
-      /* Remember */
-      ohAutoFilledUrls.push(norm);
-      while (ohAutoFilledUrls.length > 500) ohAutoFilledUrls.shift();
-      await ST.set({ ohAutoFilledUrls });
+      /* Remember (for a minute) */
+      try {
+        const now = Date.now();
+        const { ohAutoFilledAt: seen = {} } = await ST.get('ohAutoFilledAt');
+        for (const k of Object.keys(seen)) if (now - seen[k] > AUTO_FILL_AGAIN_MS) delete seen[k];
+        seen[fillKey] = now;
+        await ST.set({ ohAutoFilledAt: seen });
+        ST.remove('ohAutoFilledUrls');           // the old permanent list
+      } catch (_) {}
 
       showAutofillBanner('done');
       LOG('Auto-trigger: complete');
@@ -9024,6 +9803,19 @@
   if (CURRENT_ATS || _looksApplyPage) {
     /* First attempt after 2.5 s (most SPAs have rendered by then) */
     sleep(2500).then(() => autoTriggerAutofill());
+
+    /* …and again every 4 s for the page's first 2 minutes while nothing has
+       been filled. One try was all a page got: when that try came before
+       the run's flags, the job-tab pin or the form itself were in place,
+       the form was never filled and the job sat until the 3-minute cap.
+       Each try is a few cheap checks; it stops at the first fill. */
+    let _retryHref = location.href, _retrySince = Date.now();
+    setInterval(() => {
+      if (location.href !== _retryHref) { _retryHref = location.href; _retrySince = Date.now(); }
+      if (_autoTriggered || _autoTriggerRunning) return;
+      if (Date.now() - _retrySince > 120_000) return;
+      autoTriggerAutofill();
+    }, 4000);
 
     /* ── SPA navigation watcher (URL changes without full reload) ── */
     let _lastHref = location.href;
@@ -9544,7 +10336,7 @@
   (function installQueueRunner() {
     const POLL_MS         = 2_000;
     const JOB_TIMEOUT_MS  = 180_000;  // 3 min hard cap per job
-    const WD_JOB_TIMEOUT_MS = 480_000; // Workday: many steps plus the account
+    const WD_JOB_TIMEOUT_MS = 240_000; // Workday: many steps plus the account
     const NO_FORM_GRACE_MS = 18_000;  // if no fillable form by now → unsupported, skip
     const SUBMIT_GRACE_MS = 8_000;    // wait this long after submit before declaring success
     const CONFIRM_WAIT_MS = 30_000;   // keep looking for a REAL confirmation this long after submit
@@ -9785,10 +10577,11 @@
           LOG(`[Queue Runner] on job: ${job.title || job.url}`);
         }
 
-        /* Workday: the Workday engine applies (sign-in, CV, every step,
-           Submit) and says how it went; this only reads its result. */
+        /* Workday: the Workday engine does Apply and the sign-in / account; the
+           application pages after that are filled here like any other ATS
+           (formsToOptimHire). Its result, when it ran to the end, is read here. */
         const wde = window.__ohWdEngine;
-        if (wde && wde.isWorkday && wde.isWorkday()) {
+        if (wde && wde.isWorkday && wde.isWorkday() && !(wde.formsToOptimHire && wde.formsToOptimHire())) {
           const r = wde.queueResult(job.id);
           if (r) {
             if (r.outcome === 'submitted') {
