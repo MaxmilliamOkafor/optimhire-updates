@@ -2612,11 +2612,31 @@
   var QC_CSS = [
     '#oh-queue-card{--qc-bg:#12141c;--qc-raise:#1a1d27;--qc-line:#262a36;--qc-text:#e6e8ef;--qc-muted:#8b91a3;',
     '--qc-accent:#6d5efc;--qc-accent-2:#5a4bea;--qc-ok:#3ecf8e;--qc-warn:#f5b44a;--qc-bad:#f26d6d;',
-    'position:fixed;bottom:10px;left:10px;right:10px;z-index:2147483646;box-sizing:border-box;padding:14px;',
-    'max-height:calc(100vh - 20px);overflow-y:auto;overscroll-behavior:contain;scrollbar-width:thin;',
+    'position:fixed;bottom:8px;left:8px;right:8px;z-index:2147483646;box-sizing:border-box;padding:12px 14px;',
+    'max-height:min(72vh,calc(100vh - 64px));overflow-y:auto;overscroll-behavior:contain;scrollbar-width:thin;',
     'background:var(--qc-bg);border:1px solid var(--qc-line);border-radius:14px;box-shadow:0 10px 30px rgba(0,0,0,.45);',
     'font:12px/1.4 Inter,-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;color:var(--qc-text);-webkit-font-smoothing:antialiased}',
     '#oh-queue-card *{box-sizing:border-box}',
+    /* Compact dock: the title row, the run and what it is doing now. The rest opens with the chevron. */
+    '#oh-queue-card:not(.qc-open) .qc-more{display:none}',
+    '#oh-queue-card:not(.qc-open) .qc-head{margin-bottom:8px}',
+    '#oh-queue-card:not(.qc-open) .qc-run,#oh-queue-card:not(.qc-open) .qc-live{margin-bottom:0}',
+    '#oh-queue-card:not(.qc-open) .qc-run+.qc-live{margin-top:8px}',
+    '#oh-queue-card:not(.qc-open) .qc-idle{display:block}',
+    '#oh-queue-card .qc-idle{display:none;font-size:11.5px;color:var(--qc-muted)}',
+    '#oh-queue-card .qc-head{cursor:pointer;user-select:none}',
+    '#oh-queue-card #oh-qc-collapse svg{transition:transform .2s}',
+    '#oh-queue-card.qc-open #oh-qc-collapse svg{transform:rotate(180deg)}',
+    '#oh-queue-card details.qc-fold{margin:2px 0 6px;border:1px solid var(--qc-line);border-radius:10px}',
+    '#oh-queue-card details.qc-fold>summary{display:flex;align-items:center;gap:8px;padding:8px 10px;cursor:pointer;list-style:none;font-size:12px;font-weight:600}',
+    '#oh-queue-card details.qc-fold>summary::-webkit-details-marker{display:none}',
+    '#oh-queue-card details.qc-fold>summary small{flex:1;font-weight:400;font-size:10.5px;color:var(--qc-muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}',
+    '#oh-queue-card details.qc-fold>summary svg{width:12px;height:12px;color:var(--qc-muted);transition:transform .2s}',
+    '#oh-queue-card details.qc-fold[open]>summary svg{transform:rotate(90deg)}',
+    '#oh-queue-card details.qc-fold>.qc-acct{margin:0;padding:0 10px 8px}',
+    '#oh-queue-card details.qc-fold .qc-acct-box{border:0;padding:0;background:transparent}',
+    '#oh-queue-card .qc-links{flex-wrap:wrap}',
+    '@media (prefers-reduced-motion:reduce){#oh-queue-card *{transition:none!important;animation:none!important}}',
     '#oh-queue-card button{font:inherit;color:inherit;margin:0}',
     '#oh-queue-card svg{width:14px;height:14px;flex:none}',
     '#oh-queue-card .qc-head{display:flex;align-items:center;gap:8px;margin-bottom:12px}',
@@ -2685,7 +2705,7 @@
     '#oh-queue-card .qc-acct-row>label{flex:0 0 62px;font-size:11.5px;font-weight:600;color:var(--qc-text)}',
     '#oh-queue-card .qc-acct-field{flex:1;min-width:0;display:flex;flex-direction:column;gap:5px}',
     '#oh-queue-card .qc-acct-in{position:relative;display:flex}',
-    '#oh-queue-card .qc-acct input[type=email],#oh-queue-card .qc-acct input[type=password],#oh-queue-card .qc-acct input[type=text]{width:100%;box-sizing:border-box;padding:6px 28px 6px 8px;border-radius:8px;border:1px solid rgba(255,255,255,.14);background:rgba(0,0,0,.25);color:var(--qc-text);font-size:11.5px}',
+    '#oh-queue-card .qc-acct input[type=email],#oh-queue-card .qc-acct input[type=password],#oh-queue-card .qc-acct input[type=tel],#oh-queue-card .qc-acct input[type=text]{width:100%;box-sizing:border-box;padding:6px 28px 6px 8px;border-radius:8px;border:1px solid rgba(255,255,255,.14);background:rgba(0,0,0,.25);color:var(--qc-text);font-size:11.5px}',
     '#oh-queue-card .qc-acct input:disabled{opacity:.6}',
     '#oh-queue-card .qc-acct-eye{position:absolute;right:4px;top:50%;transform:translateY(-50%);border:0;background:transparent;color:var(--qc-muted);cursor:pointer;padding:2px}',
     '#oh-queue-card .qc-acct-eye svg{width:14px;height:14px;display:block}',
@@ -2856,6 +2876,7 @@
       var ICON = {
         log: '<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3 4h10M3 8h10M3 12h6" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" fill="none"/></svg>',
         x: '<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M4 4l8 8M12 4l-8 8" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" fill="none"/></svg>',
+        chev: '<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M4 10l4-4 4 4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" fill="none"/></svg>',
         bolt: '<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M9 1.5L3.5 9H8l-1 5.5L12.5 7H8z" fill="currentColor"/></svg>',
         send: '<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M2 8l11-5-4 11-2-4.5z" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round" fill="none"/></svg>',
         arrow: '<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M6 4l4 4-4 4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" fill="none"/></svg>',
@@ -2865,13 +2886,14 @@
         '<div class="qc-head">' +
           '<div class="qc-title">Job Queue</div>' +
           '<span id="oh-qc-indicator" class="qc-chip" style="display:none"><i></i>Running</span>' +
-          '<button id="oh-qc-collapse" class="qc-icon" title="Hide" aria-label="Hide">' + ICON.x + '</button>' +
+          '<button id="oh-qc-collapse" class="qc-icon" title="Show or hide settings" aria-label="Show or hide settings" aria-expanded="false">' + ICON.chev + '</button>' +
         '</div>' +
-        '<div id="oh-qc-stats" class="qc-stats">' +
+        '<div id="oh-qc-idle" class="qc-idle">Not running. Open for settings and the Queue Manager.</div>' +
+        '<div class="qc-more"><div id="oh-qc-stats" class="qc-stats">' +
           '<div class="qc-stat"><b id="oh-qc-pending">0</b><span>Pending</span></div>' +
           '<div class="qc-stat qc-ok"><b id="oh-qc-applied">0</b><span>Applied</span></div>' +
           '<div class="qc-stat qc-bad"><b id="oh-qc-failed">0</b><span>Failed</span></div>' +
-        '</div>' +
+        '</div></div>' +
         /* Live OptimHire run: where it is in its queue, as it applies. */
         '<div id="oh-qc-run" class="qc-run" style="display:none">' +
           '<div class="qc-run-top"><span id="oh-qc-run-label">OptimHire queue</span><b id="oh-qc-run-pos">—</b></div>' +
@@ -2890,6 +2912,7 @@
             '<div id="oh-qc-form-stats" class="qc-run-tally"></div>' +
           '</div>' +
         '</div>' +
+        '<div class="qc-more" style="margin-top:12px">' +
         '<div class="qc-row">' +
           '<button id="oh-qc-open" class="qc-btn qc-primary">Open Queue Manager</button>' +
           '<button id="oh-qc-debug" class="qc-btn qc-square" title="Debug log" aria-label="Debug log">' + ICON.log + '</button>' +
@@ -2919,8 +2942,8 @@
         '<div class="qc-sep"></div>' +
         /* Applications Account: the e-mail + password new accounts on application
            sites are made with (Workday: one per employer) and signed in with. */
+        '<details class="qc-fold" id="oh-qc-acct-fold"><summary>Applications account<small>E-mail, phone and password for job sites</small>' + ICON.arrow + '</summary>' +
         '<div class="qc-acct">' +
-          '<div class="qc-acct-title">Applications Account</div>' +
           '<div class="qc-acct-sub">Used to create and sign in to accounts on application sites (each Workday employer needs one).</div>' +
           '<div class="qc-acct-box">' +
             '<div class="qc-acct-row"><label for="oh-qc-acct-email">Email</label>' +
@@ -2947,14 +2970,14 @@
               '</div></div>' +
           '</div>' +
           '<div id="oh-qc-acct-saved" class="qc-acct-saved"></div>' +
-        '</div>' +
+        '</div></details>' +
         '<div class="qc-sep"></div>' +
         '<div id="oh-qc-truth" class="qc-foot" title="OptimHire’s ‘X applied’ counter also counts skips. This counts real submission confirmations.">Results: — submitted · — skipped</div>' +
         '<div class="qc-links">' +
           '<button id="oh-qc-qamem" class="qc-link" title="Answers learned from applications confirmed as submitted. Review or forget them.">Remembered answers ' + ICON.arrow + '</button>' +
           '<button id="oh-qc-auditx" class="qc-link" title="Download ONE file with everything: every log, each job and what happened, your settings, the details forms get, open tabs — for a full audit (passwords and login tokens removed)">' + ICON.down + 'Export audit file</button>' +
           '<button id="oh-qc-export" class="qc-link" title="Download every job OptimHire\'s queue has handed out so far as one CSV — title, company, full job link, status, dates (opens in Excel / Sheets; re-importable into the Queue Manager)">' + ICON.down + 'Export CSV</button>' +
-        '</div>';
+        '</div></div>';
       /* Always append to <body> as a fixed overlay — never insert as a
          sibling of #__plasmo (that risked disturbing React). */
       document.body.appendChild(card);
@@ -3077,27 +3100,42 @@
       if (fillBtn) fillBtn.addEventListener('click', function () { autofillActiveTab(false); });
       var fillSubmitBtn = document.getElementById('oh-qc-fillsubmit');
       if (fillSubmitBtn) fillSubmitBtn.addEventListener('click', function () { autofillActiveTab(true); });
-      /* × collapses the card to a small re-open pill in the corner. */
+      /* The card is a dock at the bottom of the panel. Closed (the default)
+         it shows the run and what it is doing now; the chevron or the title
+         row opens the settings. It used to open full height over the whole
+         panel — OptimHire's own card (sign-in, status, its buttons) was
+         hidden under it and unreachable. The panel underneath is given
+         bottom room equal to the dock, so all of it scrolls clear. */
       var collapse = document.getElementById('oh-qc-collapse');
-      if (collapse) collapse.addEventListener('click', function (e) {
-        e.stopPropagation();
-        card.style.display = 'none';
-        var pill = document.getElementById('oh-qc-pill');
-        if (!pill) {
-          pill = document.createElement('div');
-          pill.id = 'oh-qc-pill';
-          pill.title = 'Show Job Queue';
-          pill.textContent = 'Job Queue';
-          pill.className = 'qc-pill';
-          pill.addEventListener('click', function () {
-            card.style.display = '';
-            pill.remove();
-          });
-          document.body.appendChild(pill);
-        } else {
-          pill.style.display = '';
-        }
-      });
+      function setOpen(open) {
+        card.classList.toggle('qc-open', !!open);
+        if (collapse) collapse.setAttribute('aria-expanded', open ? 'true' : 'false');
+        try { localStorage.setItem('ohQcOpen', open ? '1' : '0'); } catch (_) {}
+      }
+      var wasOpen = false;
+      try { wasOpen = localStorage.getItem('ohQcOpen') === '1'; } catch (_) {}
+      setOpen(wasOpen);
+      var head = card.querySelector('.qc-head');
+      if (head) head.addEventListener('click', function (e) { e.stopPropagation(); setOpen(!card.classList.contains('qc-open')); });
+      document.addEventListener('keydown', function (e) { if (e.key === 'Escape' && card.classList.contains('qc-open')) setOpen(false); });
+      function syncIdle() {
+        var idle = document.getElementById('oh-qc-idle'), run = document.getElementById('oh-qc-run'), live = document.getElementById('oh-qc-live');
+        if (idle) idle.style.display = ((run && run.style.display !== 'none') || (live && live.style.display !== 'none')) ? 'none' : '';
+      }
+      function reserve() {
+        try {
+          syncIdle();
+          var closedH = card.classList.contains('qc-open') ? (card._closedH || 120) : card.getBoundingClientRect().height;
+          if (!card.classList.contains('qc-open')) card._closedH = closedH;
+          var st = document.getElementById('oh-qc-room');
+          if (!st) { st = document.createElement('style'); st.id = 'oh-qc-room'; (document.head || document.documentElement).appendChild(st); }
+          var css = 'body{padding-bottom:' + Math.round(closedH + 20) + 'px!important;box-sizing:border-box}';
+          if (st.textContent !== css) st.textContent = css;
+        } catch (_) {}
+      }
+      try { new ResizeObserver(reserve).observe(card); } catch (_) {}
+      try { new MutationObserver(reserve).observe(card, { attributes: true, subtree: true, attributeFilter: ['style', 'class'] }); } catch (_) {}
+      reserve();
       return card;
     }
 
@@ -3419,7 +3457,7 @@
       'body{padding-top:' + BAR_H + 'px!important}' +
       '.h-screen,[style*="height: 100vh"]{height:calc(100vh - ' + BAR_H + 'px)!important}' +
       /* The Job Queue card (docked at the bottom) grows up to just below the bar, never over it. */
-      '#oh-queue-card{max-height:calc(100vh - 20px - ' + BAR_H + 'px)!important}';
+      '#oh-queue-card{max-height:min(72vh,calc(100vh - 20px - ' + BAR_H + 'px))!important}';
     (document.head || document.documentElement).appendChild(css);
 
     var bar = document.createElement('button');

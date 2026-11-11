@@ -9560,35 +9560,75 @@
   /** Inject/update the "Autofill in progress" banner */
   function showAutofillBanner(status, atsName) {
     if (_masterOff) return;
+    /* A small pill at the top centre of the page. It used to be a bar
+       across the full width of the page, drawn over the site's own header
+       and navigation, and stayed for good when a fill never finished. */
     let banner = document.getElementById('oh-autofill-banner');
     if (!banner) {
       banner = document.createElement('div');
       banner.id = 'oh-autofill-banner';
+      banner.setAttribute('role', 'status');
+      banner.setAttribute('aria-live', 'polite');
       banner.style.cssText = `
-        position:fixed;top:0;left:0;right:0;z-index:2147483647;
-        padding:10px 20px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
-        font-size:13px;font-weight:600;text-align:center;
-        transition:background .3s ease,color .3s ease;pointer-events:none;
-        box-shadow:0 2px 12px rgba(0,0,0,.2);
+        position:fixed;top:12px;left:50%;transform:translateX(-50%);z-index:2147483647;
+        max-width:min(92vw,440px);box-sizing:border-box;padding:8px 16px;border-radius:999px;
+        font:600 12.5px/1.35 -apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
+        color:#fff;text-align:center;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+        transition:background .25s ease,opacity .25s ease;pointer-events:none;
+        box-shadow:0 6px 20px rgba(15,23,42,.28);
       `;
-      document.body.appendChild(banner);
+      (document.body || document.documentElement).appendChild(banner);
     }
-    const name = atsName || CURRENT_ATS || 'ATS';
+    const name = atsName || CURRENT_ATS || 'this';
+    clearTimeout(banner._ohHide);
+    const hideIn = ms => { banner._ohHide = setTimeout(() => { if (banner.parentNode) banner.remove(); }, ms); };
     if (status === 'detecting') {
-      banner.textContent = `🔍 ${name} detected — starting autofill…`;
-      banner.style.background = 'linear-gradient(135deg,#1e40af,#7c3aed)';
-      banner.style.color = '#fff';
+      banner.textContent = `OptimHire: ${name} form found, starting autofill`;
+      banner.style.background = '#4338ca';
+      hideIn(60000);
     } else if (status === 'filling') {
-      banner.textContent = `⚡ Autofill in progress — filling ${name} form…`;
-      banner.style.background = 'linear-gradient(135deg,#2563eb,#7c3aed)';
-      banner.style.color = '#fff';
+      banner.textContent = `OptimHire: filling the ${name} form`;
+      banner.style.background = '#4338ca';
+      hideIn(60000);
     } else if (status === 'done') {
-      banner.textContent = '✅ Autofill complete — please review and submit';
-      banner.style.background = 'linear-gradient(135deg,#059669,#10b981)';
-      banner.style.color = '#fff';
-      setTimeout(() => { if (banner.parentNode) banner.remove(); }, 5000);
+      banner.textContent = 'OptimHire: autofill complete';
+      banner.style.background = '#047857';
+      hideIn(4000);
     }
   }
+
+  /* ── OptimHire's "Action required — open the side panel" notice ──────
+   * OptimHire draws it as a 598×400 box in the middle of the job page with
+   * the whole page dimmed behind it, at the highest layer: the form being
+   * filled could not be seen or checked while it was up. It is kept (its
+   * button still opens the side panel) but as a small card in the bottom
+   * right corner, with no dimming, so it covers nothing of the form. */
+  (function tameSidePanelNotice() {
+    if (window.top !== window.self) return;
+    const CSS = '#optimhire-toast-backdrop{display:none!important}' +
+      '#optimhire-toaster{top:auto!important;left:auto!important;right:16px!important;bottom:16px!important;' +
+      'transform:scale(.5)!important;transform-origin:bottom right!important;' +
+      'box-shadow:0 16px 48px rgba(15,23,42,.35)!important;border-color:#cbd5e1!important}';
+    function tame() {
+      try {
+        const host = document.getElementById('optimhire-toast-shadow-host');
+        if (!host || !host.shadowRoot || host.shadowRoot.getElementById('oh-tame')) return;
+        const st = document.createElement('style');
+        st.id = 'oh-tame';
+        st.textContent = CSS;
+        host.shadowRoot.appendChild(st);
+        /* the host itself was a full-screen layer over the page */
+        host.style.width = '0'; host.style.height = '0'; host.style.top = 'auto'; host.style.left = 'auto';
+        host.style.right = '0'; host.style.bottom = '0';
+      } catch (_) {}
+    }
+    try {
+      tame();
+      new MutationObserver(tame).observe(document.documentElement, { childList: true, subtree: false });
+      const watchBody = () => { if (document.body) new MutationObserver(tame).observe(document.body, { childList: true }); };
+      if (document.body) watchBody(); else document.addEventListener('DOMContentLoaded', watchBody);
+    } catch (_) {}
+  })();
 
   /** Strong "this is a job application form" detector for pages on an
       UNRECOGNISED ATS (CURRENT_ATS is null). Requires 3+ visible inputs

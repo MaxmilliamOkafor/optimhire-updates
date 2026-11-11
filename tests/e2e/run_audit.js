@@ -28,6 +28,7 @@ const PW='Sup3r$ecretPw!9', WDPW='OhWorkdayPw#77';
   const sp=await ctx.newPage(); await sp.goto(`chrome-extension://${id}/sidepanel.html`); await sleep(3000);
   check(await sp.evaluate(()=>!!document.getElementById('oh-qc-audit')&&!!document.getElementById('oh-qc-auditx')),'card has "Audit" and "Export audit file"');
   const opened=ctx.waitForEvent('page',{timeout:8000}).catch(()=>null);
+  await sp.evaluate(()=>{const c=document.getElementById('oh-queue-card'); if(c) c.classList.add('qc-open'); const f=document.getElementById('oh-qc-acct-fold'); if(f) f.open=true;}); // the card is a closed dock by default: open it
   await sp.click('#oh-qc-audit');
   const dbg=await opened; await sleep(1500);
   const until=await get('ohDebugUntil');

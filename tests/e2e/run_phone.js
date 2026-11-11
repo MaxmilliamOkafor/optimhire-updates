@@ -37,6 +37,7 @@ const site=https.createServer({key:fs.readFileSync(path.join(__dirname,'oh_key.p
   const sp=await ctx.newPage(); await sp.goto(`chrome-extension://${id}/sidepanel.html`); await sleep(3000);
   const note1=await sp.evaluate(()=>document.getElementById('oh-qc-acct-phone-note').textContent);
   check(/Using \+353 871234567 from your OptimHire details/.test(note1),`card: "${note1}"`);
+  await sp.evaluate(()=>{const c=document.getElementById('oh-queue-card'); if(c) c.classList.add('qc-open'); const f=document.getElementById('oh-qc-acct-fold'); if(f) f.open=true;}); // the card is a closed dock by default: open it
   await sp.fill('#oh-qc-acct-phone','+44 7700 900123'); await sp.press('#oh-qc-acct-phone','Tab'); await sleep(800);
   check(await get('ohMyPhone')==='+44 7700 900123','typed on the card → saved');
   v=await job(2);
