@@ -9602,25 +9602,45 @@
    * the whole page dimmed behind it, at the highest layer: the form being
    * filled could not be seen or checked while it was up. It is kept (its
    * button still opens the side panel) but as a small card in the bottom
-   * right corner, with no dimming, so it covers nothing of the form. */
+   * right corner, with no dimming, so it covers nothing of the form.
+   *
+   * 2.10.6 added a second one the same shape: "Get tailored resume & cover
+   * letter — We can't autofill this application yet", a 440 px box over a
+   * dimmed page at the highest layer, shown on job pages OptimHire cannot
+   * fill itself — exactly the forms this patch fills. Same treatment: a
+   * small card in the corner (its buttons and × still work), no dimming,
+   * and the page under it stays clickable. It can be drawn inside a job
+   * site's form frame too, so this runs in every frame. */
   (function tameSidePanelNotice() {
-    if (window.top !== window.self) return;
-    const CSS = '#optimhire-toast-backdrop{display:none!important}' +
-      '#optimhire-toaster{top:auto!important;left:auto!important;right:16px!important;bottom:16px!important;' +
-      'transform:scale(.5)!important;transform-origin:bottom right!important;' +
-      'box-shadow:0 16px 48px rgba(15,23,42,.35)!important;border-color:#cbd5e1!important}';
+    const HOSTS = {
+      'optimhire-toast-shadow-host':
+        '#optimhire-toast-backdrop{display:none!important}' +
+        '#optimhire-toaster{top:auto!important;left:auto!important;right:16px!important;bottom:16px!important;' +
+        'transform:scale(.5)!important;transform-origin:bottom right!important;' +
+        'box-shadow:0 16px 48px rgba(15,23,42,.35)!important;border-color:#cbd5e1!important}',
+      'optimhire-tailor-resume-modal':
+        '.oh-modal-backdrop{inset:auto 16px 16px auto!important;padding:0!important;background:transparent!important;' +
+        'display:block!important;pointer-events:none!important}' +
+        '.oh-modal{pointer-events:auto!important;width:440px!important;max-width:calc(100vw - 32px)!important;' +
+        'transform:scale(.6)!important;transform-origin:bottom right!important;' +
+        'box-shadow:0 16px 48px rgba(15,23,42,.35)!important;border:1px solid #cbd5e1!important}',
+    };
+    const isTop = window.top === window.self;
     function tame() {
-      try {
-        const host = document.getElementById('optimhire-toast-shadow-host');
-        if (!host || !host.shadowRoot || host.shadowRoot.getElementById('oh-tame')) return;
-        const st = document.createElement('style');
-        st.id = 'oh-tame';
-        st.textContent = CSS;
-        host.shadowRoot.appendChild(st);
-        /* the host itself was a full-screen layer over the page */
-        host.style.width = '0'; host.style.height = '0'; host.style.top = 'auto'; host.style.left = 'auto';
-        host.style.right = '0'; host.style.bottom = '0';
-      } catch (_) {}
+      for (const id in HOSTS) {
+        try {
+          if (!isTop && id === 'optimhire-toast-shadow-host') continue;
+          const host = document.getElementById(id);
+          if (!host || !host.shadowRoot || host.shadowRoot.getElementById('oh-tame')) continue;
+          const st = document.createElement('style');
+          st.id = 'oh-tame';
+          st.textContent = HOSTS[id];
+          host.shadowRoot.appendChild(st);
+          /* the host itself can be a full-screen layer over the page */
+          host.style.width = '0'; host.style.height = '0'; host.style.top = 'auto'; host.style.left = 'auto';
+          host.style.right = '0'; host.style.bottom = '0';
+        } catch (_) {}
+      }
     }
     try {
       tame();
