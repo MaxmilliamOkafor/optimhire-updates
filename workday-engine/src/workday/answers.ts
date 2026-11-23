@@ -72,6 +72,9 @@ function countryInText(text: string, p: Profile): string | null {
 
 function authorizedFor(label: string, ctx: AnswerCtx): boolean {
   const p = ctx.profile;
+  // [oh] Never needing sponsorship means authorised in any country: "authorised to work in
+  // Australia?" was No for a job outside your listed countries while sponsorship was No.
+  if (!p.answers.needsSponsorship) return true;
   const c = countryInText(label, p) ?? countryInText(ctx.job?.location ?? "", p) ?? p.personal.address.country;
   return p.answers.authorizedCountries.some((a) => similarity(a, c) >= 0.85);
 }
@@ -106,7 +109,12 @@ function optionFor(answer: string, options: string[]): string | null {
   return score >= 0.6 ? best : null;
 }
 
+/** [oh] An ADDITIONAL / second / dual citizenship, nationality or residency, or one of a
+ *  sanctioned country: No (these were left to guesswork, and "Yes" opens follow-ups). */
+const EXTRA_CITIZEN_RX = /\b(additional|second|dual|another|other|multiple|more than one|any other)\b.{0,40}\b(citizenships?|nationalit(y|ies)|permanent residen(cy|ce|t)|residenc(y|ies))\b|\b(citizenships?|nationalit(y|ies)|permanent residen(cy|ce))\b.{0,40}\b(of )?(any|an|another) other countr|\b(citizen|national|resident|citizenship|nationality|residency)\w*\b.{0,80}\b(iran|cuba|syria|north korea|crimea|sanctioned countr)/iu;
+
 const RULES: Rule[] = [
+  [EXTRA_CITIZEN_RX, () => "No"],
   [Q.sponsorship, (_l, c) => yesNo(c.profile.answers.needsSponsorship)],
   [Q.authorized, (l, c) => yesNo(authorizedFor(l, c))],
   [Q.adult, () => "Yes"],
