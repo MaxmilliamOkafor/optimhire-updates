@@ -3382,6 +3382,12 @@
       driversLicence: null, clearance: false,
       previouslyEmployed: false, relatives: false, nonCompete: false, convicted: false,
       englishFluent: true,
+      /* You never need visa sponsorship: every "will you require
+         sponsorship?" is No and every "are you authorised to work?" is Yes,
+         wherever the job is. It used to follow the job's country — a job
+         outside Ireland got "Yes, I will require sponsorship". Saved
+         noSponsorship:false brings back the per-country answers. */
+      noSponsorship: true,
       yearsExperience: '9', highestDegree: koDegreeFromCv(_koCv),
       certifications: ['AWS'],
       salary: String(p.expected_salary || '').trim(),          // as your profile writes it ("£85,000")
@@ -3448,11 +3454,14 @@
   }
   function koCanWork(country) {
     const f = koFacts();
+    if (f.noSponsorship !== false) return true;
     if (!country) return f.workCountries.length ? true : null;     // not said: the job is where you live
     return f.workCountries.includes(country);
   }
   function koSlug(s) { return String(s || '').toLowerCase().replace(/\b(inc|ltd|llc|plc|gmbh|limited|group|corp(oration)?|company|co)\b\.?/g, '').replace(/[^a-z0-9]+/g, ''); }
 
+  const KO_EXTRA_CITIZEN_RE = /\b(additional|second|dual|another|other|multiple|more than one|any other)\b.{0,40}\b(citizenships?|nationalit(y|ies)|permanent residen(cy|ce|t)|residenc(y|ies))\b|\b(citizenships?|nationalit(y|ies)|permanent residen(cy|ce))\b.{0,40}\b(of )?(any|an|another) other countr/;
+  const KO_SANCTIONED_CITIZEN_RE = /\b(citizen|national|resident|citizenship|nationality|residency)\w*\b.{0,80}\b(iran|cuba|syria|north korea|crimea|sanctioned countr)/;
   /* What a knockout question asks, and your answer to it. */
   function koAnswer(label) {
     const raw = String(label || '').replace(/\s+/g, ' ').replace(/\*+\s*$/, '').trim();
@@ -3463,6 +3472,12 @@
     const asks = /\?|^(are|do|does|will|would|can|could|is|have|has|did|were)\b/.test(l);
     const country = koCountry(raw) || jobCountry();
     const where = country ? `job in ${country}` : 'where you live';
+    /* Citizenship questions that are not about the right to work: an
+       ADDITIONAL / second / dual citizenship, nationality or permanent
+       residency, or one of a sanctioned country. These were answered "Yes"
+       (any question with "citizenship" in it was), which opens follow-ups
+       like "in which country did you obtain it first?". Your answer: No. */
+    if (asks && (KO_EXTRA_CITIZEN_RE.test(l) || KO_SANCTIONED_CITIZEN_RE.test(l))) return yn(false, 'other citizenship', 'your answer');
     const authQ = /(authori[sz]ed|eligible|permitted|entitled|allowed) to (work|be employed|accept employment)|(legally|lawfully) able to work|right to work|work authori[sz]ation|work eligibility|employment eligibility|eligible for employment|lawfully (work|employed)|work permit\b|(have|hold) an? (valid |current )?(work |employment )?visa\b/.test(l);
     const sponsorQ = (/sponsor/.test(l) || (/\bvisa\b|h-?1b|immigration/.test(l) && /(require|need|will you|support|assist|transfer)/.test(l))) &&
                      !/without (the need for |requiring |needing )?(any |a )?(visa |employer |company )?sponsorship/.test(l);
@@ -5104,7 +5119,13 @@
 
     if (/authoriz|eligible|work.*right|right.*work|legally.*work|permit.*work|legally.*authoriz|entitled.*work/.test(l))
                                                           return DEFAULTS.authorized;
-    if (/us.*citizen|citizen.*us|citizen.*united.?states/.test(l))  return p.is_us_citizen || 'Yes';
+    /* An additional / dual citizenship, or one of a sanctioned country: No. */
+    if (KO_EXTRA_CITIZEN_RE.test(l) || KO_SANCTIONED_CITIZEN_RE.test(l)) return 'No';
+    /* "Which country did you obtain citizenship in first?": your citizenship if your profile has one. */
+    if (/(which|what) country\b.{0,60}\b(citizenship|nationality)|country of (citizenship|nationality)/.test(l)) return p.citizenship || p.nationality || '';
+    /* US citizen: your profile's answer; "Yes" was claimed for everyone. */
+    if (/\bu\.?s\.? citizen|citizen of the (us|u\.s\.|united states)|united states citizen|american citizen/.test(l))
+      return p.is_us_citizen || (p.country && !/united states|^usa?$|america/i.test(String(p.country)) ? 'No' : '');
     if (/citizen|residency|permanent.?resident|green.?card|irish.?citizen|eu.?citizen/.test(l))
                                                           return 'Yes';
     if (/require.*sponsor|need.*visa|visa.*sponsor|future.*visa|work.*visa|need.*permit|sponsorship.*required|require.*visa/i.test(l))

@@ -20,6 +20,7 @@
 
   /* key, question, hint, options (value → text) */
   var ITEMS = [
+    ['noSponsorship', 'Never need visa sponsorship', 'Yes: every sponsorship question is No and every “authorised to work?” is Yes, for a job in any country. No: answered per job from the countries above'],
     ['relocate', 'Willing to relocate', 'Also used for on-site jobs in a country you would move to'],
     ['onsite', 'Work on-site / in the office', ''],
     ['hybrid', 'Work hybrid', ''],
@@ -37,6 +38,7 @@
     ['previouslyEmployed', 'Worked for the company before', 'Companies on your CV are recognised either way'],
   ];
   var DEFAULTS = {
+    noSponsorship: true,
     relocate: true, onsite: true, hybrid: true, remote: true, over18: true, backgroundCheck: true, drugTest: true,
     essentialFunctions: true, driversLicence: null, clearance: false, englishFluent: true, convicted: false,
     nonCompete: false, relatives: false, previouslyEmployed: false,
