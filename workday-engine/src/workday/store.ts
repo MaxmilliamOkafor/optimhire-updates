@@ -97,7 +97,16 @@ export function normalizeProfile(p: Partial<Profile> | undefined): Profile {
     education: (p.education ?? []).map((e, i) => ({ ...e, id: e.id || `e${i + 1}` })),
     skills: p.skills ?? [],
     certifications: p.certifications ?? [],
-    languages: p.languages ?? [],
+    // [oh] One entry per language: a CV listing "English" twice ("English (native)" and
+    // "English") added it twice and Workday refused the page ("Duplicate language entries
+    // are not allowed"). The native / first entry is kept.
+    languages: (p.languages ?? []).filter((l, i, all) => {
+      const k = String(l?.language || "").toLowerCase().replace(/\s*\(.*\)\s*/g, "").trim();
+      if (!k) return false;
+      const first = all.findIndex((x) => String(x?.language || "").toLowerCase().replace(/\s*\(.*\)\s*/g, "").trim() === k);
+      const native = all.findIndex((x) => x?.native && String(x?.language || "").toLowerCase().replace(/\s*\(.*\)\s*/g, "").trim() === k);
+      return i === (native >= 0 ? native : first);
+    }),
   };
 }
 

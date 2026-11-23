@@ -113,8 +113,19 @@ function optionFor(answer: string, options: string[]): string | null {
  *  sanctioned country: No (these were left to guesswork, and "Yes" opens follow-ups). */
 const EXTRA_CITIZEN_RX = /\b(additional|second|dual|another|other|multiple|more than one|any other)\b.{0,40}\b(citizenships?|nationalit(y|ies)|permanent residen(cy|ce|t)|residenc(y|ies))\b|\b(citizenships?|nationalit(y|ies)|permanent residen(cy|ce))\b.{0,40}\b(of )?(any|an|another) other countr|\b(citizen|national|resident|citizenship|nationality|residency)\w*\b.{0,80}\b(iran|cuba|syria|north korea|crimea|sanctioned countr)/iu;
 
+/** [oh] Name prefix (Mr / Ms / Mx): from the gender in your profile; Mx when it isn't male or
+ *  female; nothing when the form has no fitting option. A required Prefix left empty held the page. */
+const PREFIX_RX = /^\s*(name )?(prefix|salutation|honorific|title prefix)\b/iu;
+function prefixFor(gender: string): string | null {
+  const g = String(gender || "").toLowerCase();
+  if (/^(male|man|m)$/.test(g)) return "Mr";
+  if (/^(female|woman|f)$/.test(g)) return "Ms";
+  return "Mx";
+}
+
 const RULES: Rule[] = [
   [EXTRA_CITIZEN_RX, () => "No"],
+  [PREFIX_RX, (_l, c) => prefixFor(c.profile.eeo.gender)],
   [Q.sponsorship, (_l, c) => yesNo(c.profile.answers.needsSponsorship)],
   [Q.authorized, (l, c) => yesNo(authorizedFor(l, c))],
   [Q.adult, () => "Yes"],

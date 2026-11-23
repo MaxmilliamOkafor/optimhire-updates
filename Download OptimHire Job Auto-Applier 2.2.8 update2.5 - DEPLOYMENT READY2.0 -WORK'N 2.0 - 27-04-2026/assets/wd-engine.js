@@ -1543,7 +1543,16 @@
       education: (p.education ?? []).map((e, i) => ({ ...e, id: e.id || `e${i + 1}` })),
       skills: p.skills ?? [],
       certifications: p.certifications ?? [],
-      languages: p.languages ?? []
+      // [oh] One entry per language: a CV listing "English" twice ("English (native)" and
+      // "English") added it twice and Workday refused the page ("Duplicate language entries
+      // are not allowed"). The native / first entry is kept.
+      languages: (p.languages ?? []).filter((l, i, all) => {
+        const k = String(l?.language || "").toLowerCase().replace(/\s*\(.*\)\s*/g, "").trim();
+        if (!k) return false;
+        const first = all.findIndex((x) => String(x?.language || "").toLowerCase().replace(/\s*\(.*\)\s*/g, "").trim() === k);
+        const native = all.findIndex((x) => x?.native && String(x?.language || "").toLowerCase().replace(/\s*\(.*\)\s*/g, "").trim() === k);
+        return i === (native >= 0 ? native : first);
+      })
     };
   }
   async function getProfile() {
@@ -1940,8 +1949,16 @@
     return score >= 0.6 ? best : null;
   }
   var EXTRA_CITIZEN_RX = /\b(additional|second|dual|another|other|multiple|more than one|any other)\b.{0,40}\b(citizenships?|nationalit(y|ies)|permanent residen(cy|ce|t)|residenc(y|ies))\b|\b(citizenships?|nationalit(y|ies)|permanent residen(cy|ce))\b.{0,40}\b(of )?(any|an|another) other countr|\b(citizen|national|resident|citizenship|nationality|residency)\w*\b.{0,80}\b(iran|cuba|syria|north korea|crimea|sanctioned countr)/iu;
+  var PREFIX_RX = /^\s*(name )?(prefix|salutation|honorific|title prefix)\b/iu;
+  function prefixFor(gender) {
+    const g = String(gender || "").toLowerCase();
+    if (/^(male|man|m)$/.test(g)) return "Mr";
+    if (/^(female|woman|f)$/.test(g)) return "Ms";
+    return "Mx";
+  }
   var RULES = [
     [EXTRA_CITIZEN_RX, () => "No"],
+    [PREFIX_RX, (_l, c) => prefixFor(c.profile.eeo.gender)],
     [Q.sponsorship, (_l, c) => yesNo(c.profile.answers.needsSponsorship)],
     [Q.authorized, (l, c) => yesNo(authorizedFor(l, c))],
     [Q.adult, () => "Yes"],
@@ -2319,7 +2336,7 @@ OPTIONS: ${JSON.stringify(options.slice(0, 150))}`
     await fill(ctx, "address1", me.address.line1);
     await fill(ctx, "address2", me.address.line2);
     await fill(ctx, "city", me.address.city);
-    await fill(ctx, "region", me.address.region);
+    await fill(ctx, "region", me.address.region || countyFor(me.address.city, me.address.country));
     await fill(ctx, "postal", me.address.postalCode);
     await fill(ctx, "phoneType", me.phone.deviceType || "Mobile");
     const code = field("phoneCode");
@@ -2336,6 +2353,24 @@ OPTIONS: ${JSON.stringify(options.slice(0, 150))}`
     await fill(ctx, "phoneNumber", nationalNumber(me.phone.number, me.phone.countryCode));
     const email = field("email");
     if (email && !readValue(containerOf(email))) await fill(ctx, "email", me.email);
+  }
+  function countyFor(city, country) {
+    const c = String(city || "").toLowerCase().replace(/\bcity\b|,.*$/g, "").trim();
+    const k = String(country || "").toLowerCase();
+    if (!c) return "";
+    if (/ireland|^ie$/.test(k) && !/northern/.test(k)) {
+      const IE = { dublin: "Dublin", "dun laoghaire": "Dublin", swords: "Dublin", tallaght: "Dublin", cork: "Cork", galway: "Galway", limerick: "Limerick", waterford: "Waterford", kilkenny: "Kilkenny", sligo: "Sligo", athlone: "Westmeath", drogheda: "Louth", dundalk: "Louth", navan: "Meath", bray: "Wicklow", wexford: "Wexford", ennis: "Clare", tralee: "Kerry", letterkenny: "Donegal", carlow: "Carlow", naas: "Kildare", maynooth: "Kildare", mullingar: "Westmeath", portlaoise: "Laois", tullamore: "Offaly" };
+      return IE[c] || "";
+    }
+    if (/united kingdom|^uk$|^gb$|england|scotland|wales|britain/.test(k)) {
+      const UK = { london: "Greater London", manchester: "Greater Manchester", birmingham: "West Midlands", leeds: "West Yorkshire", sheffield: "South Yorkshire", liverpool: "Merseyside", bristol: "Bristol", newcastle: "Tyne and Wear", nottingham: "Nottinghamshire", cambridge: "Cambridgeshire", oxford: "Oxfordshire", reading: "Berkshire", edinburgh: "City of Edinburgh", glasgow: "Glasgow City", cardiff: "Cardiff", belfast: "Antrim" };
+      return UK[c] || "";
+    }
+    return "";
+  }
+  function rolesWithDates(work) {
+    const ok = work.filter((w) => w.start && (w.current || w.end));
+    return ok.length ? ok : work;
   }
   async function fillWork(ctx, block, w) {
     await fill(ctx, "jobTitleF", w.title, block);
@@ -2369,8 +2404,11 @@ OPTIONS: ${JSON.stringify(options.slice(0, 150))}`
       handled.add(c);
       await pace(ctx);
       let ok = await writeValue(c, e.school);
-      if (!ok && kindOf(c) === "multiselect") {
-        for (const other of ["Other", "Andere", "Sonstige", "Autre", "Otro", "Outro", "Altro", "Overig", "Inne"]) if (ok = await multiselectPick(c, other, { min: 0.8 })) break;
+      if (!ok && (kindOf(c) === "multiselect" || kindOf(c) === "dropdown")) {
+        for (const other of ["Other", "Andere", "Sonstige", "Autre", "Otro", "Outro", "Altro", "Overig", "Inne"]) {
+          ok = kindOf(c) === "multiselect" ? await multiselectPick(c, other, { min: 0.8 }) : await selectDropdown(c, other, 0.8);
+          if (ok) break;
+        }
       }
       if (!ok) ctx.flag(`School: ${e.school}`, "Not in the tenant's school list");
     }
@@ -2455,11 +2493,13 @@ OPTIONS: ${JSON.stringify(options.slice(0, 150))}`
     await hooks.beforeExperience?.();
     const p = ctx.profile;
     const work = section("workSection", /work experience|employment history|berufserfahrung|expérience professionnelle|experiencia (laboral|profesional)|experiência profissional|esperienza (lavorativa|professionale)|werkervaring|doświadczenie zawodowe|職歴|工作经历/iu);
-    if (work && p.work.length) {
-      const bs = await ensureBlockCount(ctx, work, "jobTitleF", p.work.length);
-      for (let i = 0; i < Math.min(bs.length, p.work.length); i++) await fillWork(ctx, bs[i], p.work[i]);
-      await verifyBlocks(ctx, work, "jobTitleF", p.work, fillWork);
-      ctx.log(`Work experience: ${p.work.length} role(s) filled`);
+    const roles = rolesWithDates(p.work);
+    if (roles.length < p.work.length) ctx.log(`Work experience: ${p.work.length - roles.length} role(s) without dates left out (Workday requires From / To)`);
+    if (work && roles.length) {
+      const bs = await ensureBlockCount(ctx, work, "jobTitleF", roles.length);
+      for (let i = 0; i < Math.min(bs.length, roles.length); i++) await fillWork(ctx, bs[i], roles[i]);
+      await verifyBlocks(ctx, work, "jobTitleF", roles, fillWork);
+      ctx.log(`Work experience: ${roles.length} role(s) filled`);
       await markCurrentRole(ctx, work);
     } else if (work) {
       await markCurrentRole(ctx, work);
