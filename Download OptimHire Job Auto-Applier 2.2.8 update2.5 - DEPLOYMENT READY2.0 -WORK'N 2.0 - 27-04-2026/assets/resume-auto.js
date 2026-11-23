@@ -13,7 +13,8 @@
  * tailored CV is still made and used; nothing is skipped.
  *
  * Also loaded by the cover-letter screen (tabs/coverLetter.html), whose
- * "Apply Now" counted down 180 s: pressed once the AI letter is written.
+ * "Apply Now" (called "Submit" from OptimHire 2.10.9) counted down 180 s:
+ * pressed once the AI letter is written.
  */
 (function () {
   'use strict';
@@ -58,7 +59,7 @@
     [/^Optimi[sz]e My Resume$/i, 'Optimize My Resume', 500],
     [/^Continue$/i,              'Continue',           700],
     [/^Save\s*&\s*Next/i,        'Save & Next',        700],
-    [/^Apply Now$/i,             'Apply Now',          700,
+    [/^(Apply Now|Submit)$/i,    'Submit (cover letter)', 700,   // "Apply Now" until 2.10.6, "Submit" from 2.10.9
       function (shownFor) { return (letterLength() >= 150 && !generating()) || shownFor > 45000; }],
   ];
   var FALLBACK_MS = 60000;          // no step reached in this long → use the original CV
