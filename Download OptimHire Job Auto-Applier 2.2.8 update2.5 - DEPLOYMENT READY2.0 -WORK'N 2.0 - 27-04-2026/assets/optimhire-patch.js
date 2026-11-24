@@ -2592,6 +2592,19 @@
     const REPORT_AFTER_MS = 8_000;
     let _tries = 0, _launches = 0, _fills = 0, _forUrl = '', _lastTry = 0, _readySince = 0;
     let _signalTs = 0, _busy = false, _confirmedTs = 0, _reportedFor = '', _noLaunchLoggedFor = '', _gaveUpFor = '';
+    let _urlSince = Date.now(), _closedFor = '';
+    const CLOSED_JOB_RE = new RegExp([
+      'no longer (accepting|taking|receiving) (applications|applicants|candidates)',
+      '(is )?no longer (accepting|open for) applications',
+      '(this|the) (job|position|posting|role|vacancy|opening|requisition|listing)( posting| ad)? (is|has been) (no longer (available|open|active|live)|closed|filled|expired|removed|taken down)',
+      '(this|the) (job|position|posting|role|vacancy|opening|listing)( posting| ad)? has (expired|closed)',
+      'applications (are|have) (now )?closed',
+      'application (deadline|period|window) has (passed|ended|closed)',
+      "the (job|position|page|posting) you('re| are) looking for (is no longer|has been (filled|closed|removed)|no longer exists)",
+      'this job (has )?expired on',
+    ].join('|'), 'i');
+    /* Short wording, trusted only on a near-empty page. */
+    const CLOSED_JOB_SHORT_RE = /\b(job|posting|position|vacancy) (not found|unavailable|closed|expired)\b/i;
 
     function ohSaysReady(st) {
       if (!st || st.isActive !== true) return false;
@@ -2716,6 +2729,33 @@
         .filter(el => isVisible(el) && !isPageChromeField(el));
     }
 
+    /* A job page that says the job is closed. OptimHire only knows the
+       wording its server sends for each site, so on other sites a closed
+       job sat there until its timer ran out. Checked only when no
+       application form is open, so a line in a footer can't trigger it. */
+    function closedJobText() {
+      const t = String((document.body && document.body.innerText) || '').slice(0, 6000).replace(/\s+/g, ' ');
+      if (!t) return '';
+      const m = t.match(CLOSED_JOB_RE) || (t.length < 1500 ? t.match(CLOSED_JOB_SHORT_RE) : null);
+      return m ? m[0] : '';
+    }
+    async function reportClosed(why) {
+      if (_closedFor === location.href) return;
+      _closedFor = location.href;
+      try {
+        const d = await ST.get(['isManuallyStartJob', 'autoApplyState']);
+        if (d.isManuallyStartJob || !(d.autoApplyState && d.autoApplyState.isActive)) {
+          LOG(`Job closed: the page says "${why}"`);
+          return;
+        }
+        chrome.runtime.sendMessage({
+          type: 'COMPLEX_FORM_ERROR', errorType: 'jobClosed',
+          message: `Job posting has closed: ${why}`, url: location.href,
+        }).catch(() => {});
+        LOG(`Job closed: the page says "${why}", so OptimHire moves on to the next job`);
+      } catch (_) {}
+    }
+
     /* We saw the confirmation, but OptimHire's own success check missed it
        and the panel still says "Review and submit". Tell it, so the run
        moves on instead of stalling on an application that already went. */
@@ -2744,6 +2784,7 @@
       if (location.href !== _forUrl) {
         _forUrl = location.href;
         _tries = 0; _launches = 0; _fills = 0; _confirmedTs = 0; _readySince = 0;
+        _urlSince = Date.now();
       }
       if (autoSubmitBlockedHere()) return;   // user asked for fill-only here
       if (_fillActive) return;
@@ -2764,6 +2805,13 @@
       if (!mayAutomate(d)) return;
       /* Confine the DOM work to the tab that IS the current job. */
       if (IN_FRAME ? !isPingedJobTab() : !(await isActiveJobTab())) return;
+
+      /* Closed job (after the page has had 5 s to load): skip it now. */
+      if (!IN_FRAME && _tries === 0 && now - _urlSince > 5000 && _closedFor !== location.href &&
+          !applicationDialog() && !applicationFields(document).length) {
+        const why = closedJobText();
+        if (why) { await reportClosed(why); return; }
+      }
 
       const pageReady = !IN_FRAME && READY_RE.test((document.body && document.body.innerText || '').slice(0, 4000));
       const ready = signalled || ohSaysReady(d && d.autoApplyState) || pageReady;
