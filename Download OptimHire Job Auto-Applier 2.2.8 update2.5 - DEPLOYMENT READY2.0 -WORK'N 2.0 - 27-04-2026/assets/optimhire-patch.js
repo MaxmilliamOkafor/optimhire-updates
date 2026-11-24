@@ -834,6 +834,16 @@
              opts.find(o => txt(o).includes(want));
       if (!best && /^(yes|no)\b/.test(want)) best = opts.find(o => new RegExp('^' + want.split(' ')[0] + '\\b').test(txt(o)));
     }
+    /* A list of name prefixes (Mr, Ms, Mx, Dr…) under a "Title" label: the
+       prefix, not the job title the label suggested (which matched none). */
+    if (!best && opts.length) {
+      const hon = opts.filter(o => HONORIFIC_RE.test(txt(o)));
+      if (hon.length >= 2 && hon.length >= opts.length * 0.6) {
+        const w = prefixOf(null).toLowerCase();
+        best = hon.find(o => txt(o).replace(/\.$/, '') === w) || null;
+        fallbackFirst = false;
+      }
+    }
     /* Nothing matched a required question. The first option used to be
        taken whatever it said — "Afghanistan" for the country you live in,
        "Less than high school" for your education, the first university in
@@ -4955,7 +4965,37 @@
     });
   } catch (_) {}
 
+  /* The county a city is in, for Irish and UK addresses ('' when not known).
+     Irish / UK forms ask "County" and the profile rarely has one: the
+     field was left empty and the form refused ("County is required"). */
+  function countyOf(city, country) {
+    const c = String(city || '').toLowerCase().replace(/\bcity\b|,.*$/g, '').trim();
+    const k = String(country || '').toLowerCase();
+    if (!c) return '';
+    if (/ireland|^ie$/.test(k) && !/northern/.test(k)) {
+      const IE = { dublin: 'Dublin', 'dun laoghaire': 'Dublin', swords: 'Dublin', tallaght: 'Dublin', cork: 'Cork', galway: 'Galway', limerick: 'Limerick', waterford: 'Waterford', kilkenny: 'Kilkenny', sligo: 'Sligo', athlone: 'Westmeath', drogheda: 'Louth', dundalk: 'Louth', navan: 'Meath', bray: 'Wicklow', wexford: 'Wexford', ennis: 'Clare', tralee: 'Kerry', letterkenny: 'Donegal', carlow: 'Carlow', naas: 'Kildare', maynooth: 'Kildare', mullingar: 'Westmeath', portlaoise: 'Laois', tullamore: 'Offaly' };
+      return IE[c] || '';
+    }
+    if (/united kingdom|^uk$|^gb$|england|scotland|wales|britain/.test(k)) {
+      const UK = { london: 'Greater London', manchester: 'Greater Manchester', birmingham: 'West Midlands', leeds: 'West Yorkshire', sheffield: 'South Yorkshire', liverpool: 'Merseyside', bristol: 'Bristol', newcastle: 'Tyne and Wear', nottingham: 'Nottinghamshire', cambridge: 'Cambridgeshire', oxford: 'Oxfordshire', reading: 'Berkshire', edinburgh: 'City of Edinburgh', glasgow: 'Glasgow City', cardiff: 'Cardiff', belfast: 'Antrim' };
+      return UK[c] || '';
+    }
+    return '';
+  }
+  /* Name prefix: Mr / Ms from the gender in your profile, Mx otherwise
+     (your profile says "prefer not to say", pronouns they/them). */
+  function prefixOf(p) {
+    const g = String((p && (p.gender || p.sex)) || (_koProfile && (_koProfile.gender || _koProfile.sex)) || '').toLowerCase().trim();
+    if (/^(male|man|m)$/.test(g)) return 'Mr';
+    if (/^(female|woman|f)$/.test(g)) return 'Ms';
+    return 'Mx';
+  }
+  const PREFIX_LABEL_RE = /^\s*(name\s+)?(prefix|salutation|honorific)\b|^\s*title\s*\(\s*(mr|ms|mrs)/i;
+  const HONORIFIC_RE = /^(mr|mrs|ms|miss|mx|dr|prof|sir|rev)\.?$/i;
+
   function guessValue(label, p = {}, inputType = '') {
+    /* "Prefix" / "Salutation" (Mr / Ms / Mx): never your job title. */
+    if (PREFIX_LABEL_RE.test(String(label || ''))) return prefixOf(p);
     /* An education or job entry's "Start date year" / "End date month" is
        not "when can you start": "1 month notice" was typed into it. */
     if (/\b(start|end)\s+(date\s+)?(year|month)\b/i.test(String(label || ''))) return '';
@@ -5043,7 +5083,9 @@
     }
     if (/^city$|city\b|current.?location|location.*city/.test(l))
                                                           return p.city          || 'Dublin';
-    if (/state|province/.test(l))                         return p.state         || '';
+    /* County / region: yours, else (Ireland, UK) the county of your city. */
+    if (/\bcounty\b|^region\b/.test(l))                     return p.county || p.state || countyOf(p.city, p.country);
+    if (/state|province/.test(l))                         return p.state || (/ireland|united kingdom|^uk$|britain|england|scotland|wales/i.test(String(p.country || '')) ? countyOf(p.city, p.country) : '');
     if (/zip|postal/.test(l))                             return p.postal_code   || p.zip || '';
     if (/^country/.test(l))                               return p.country       || 'Ireland';
     if (/address/.test(l))                                return p.address       || p.street || '';
@@ -5053,7 +5095,8 @@
                                                           return p.stackoverflow_url || '';
     if (/twitter|x\.com|x.?handle/.test(l))              return p.twitter_url   || '';
     if (/website|portfolio|personal.?site/.test(l))       return p.website_url   || '';
-    if (/university|school|college|education/.test(l))    return p.school        || p.university || '';
+    /* School: yours, else the one on your CV (left empty, a required School held the form). */
+    if (/university|school|college|education/.test(l))    return p.school || p.university || (factualComboAnswers('school', p)[0] || '');
     if (/\bdegree\b|qualification.*level|level.*qualification/.test(l))
                                                           return p.degree        || "Bachelor's";
     /* "Field of Study" / "Major" / "Discipline" are REQUIRED on many ATSes
@@ -5586,6 +5629,16 @@
    * Uses: exact match → starts-with → contains → first non-empty.
    */
   function bestSelectOption(sel, target, labelHint = '') {
+    {
+      /* Options that are name prefixes (Mr, Mrs, Ms, Mx, Dr…): the prefix,
+         not what a "Title" label made of it (your job title matched none). */
+      const all = $('option', sel).filter(o => o.value && o.value !== '' && String(o.text || '').trim());
+      const hon = all.filter(o => HONORIFIC_RE.test(String(o.text).trim()));
+      if (hon.length >= 2 && hon.length >= all.length * 0.6) {
+        const want = prefixOf(null).toLowerCase();
+        return hon.find(o => String(o.text).trim().replace(/\.$/, '').toLowerCase() === want) || null;
+      }
+    }
     if (!target) return null;
     const t = String(target).toLowerCase();
     const opts = $$('option', sel).filter(o => o.value && o.value !== '');
