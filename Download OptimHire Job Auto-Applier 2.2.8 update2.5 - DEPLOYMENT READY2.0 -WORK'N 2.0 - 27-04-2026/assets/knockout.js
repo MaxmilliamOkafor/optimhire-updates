@@ -25,6 +25,10 @@
     ['onsite', 'Work on-site / in the office', ''],
     ['hybrid', 'Work hybrid', ''],
     ['remote', 'Work remotely', ''],
+    ['travel', 'Willing to travel', ''],
+    ['shifts', 'Work shifts, weekends, on-call or another time zone’s hours', ''],
+    ['startSoon', 'Can start soon', '“Can you start within N weeks / immediately?”'],
+    ['anyEmploymentType', 'Open to contract, part-time or fixed-term work', ''],
     ['over18', '18 or older', ''],
     ['backgroundCheck', 'Agree to a background / reference check', ''],
     ['drugTest', 'Agree to a drug screen', ''],
@@ -39,7 +43,7 @@
   ];
   var DEFAULTS = {
     noSponsorship: true,
-    relocate: true, onsite: true, hybrid: true, remote: true, over18: true, backgroundCheck: true, drugTest: true,
+    relocate: true, onsite: true, hybrid: true, remote: true, travel: true, shifts: true, startSoon: true, anyEmploymentType: true, over18: true, backgroundCheck: true, drugTest: true,
     essentialFunctions: true, driversLicence: null, clearance: false, englishFluent: true, convicted: false,
     nonCompete: false, relatives: false, previouslyEmployed: false,
   };

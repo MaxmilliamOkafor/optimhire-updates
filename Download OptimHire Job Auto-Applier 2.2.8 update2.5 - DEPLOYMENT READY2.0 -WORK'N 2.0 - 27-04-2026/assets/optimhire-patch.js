@@ -3436,6 +3436,7 @@
       workCountries: home ? [home] : [],
       euWide: false,
       relocate: true, remote: true, hybrid: true, onsite: true,
+      travel: true, shifts: true, startSoon: true, anyEmploymentType: true,
       over18: true, backgroundCheck: true, drugTest: true, essentialFunctions: true,
       driversLicence: null, clearance: false,
       previouslyEmployed: false, relatives: false, nonCompete: false, convicted: false,
@@ -3544,6 +3545,22 @@
       return yn(can == null ? null : !can, 'sponsorship', where, { canWork: can });
     }
     if (authQ) { const can = koCanWork(country); return yn(can, 'authorisation', where, { canWork: can }); }
+    /* "Are you a Canadian citizen?" / "Do you hold a green card?": the
+       fallback said "Yes" to every one, which a background check then
+       contradicts. Yes for a citizenship your profile has, No for another
+       country's, not answered when your profile doesn't say. */
+    if (asks && /\b(citizens?|citizenship|nationals?|green card|permanent residen(t|ce|cy))\b/.test(l)) {
+      const p = _koProfile || {};
+      const DEMONYM = { american: 'united states', 'u.s.': 'united states', us: 'united states', british: 'united kingdom', uk: 'united kingdom', irish: 'ireland', canadian: 'canada',
+        australian: 'australia', german: 'germany', french: 'france', dutch: 'netherlands', spanish: 'spain', portuguese: 'portugal', italian: 'italy', polish: 'poland',
+        swedish: 'sweden', swiss: 'switzerland', indian: 'india', nigerian: 'nigeria', singaporean: 'singapore', 'south african': 'south africa', 'new zealand': 'new zealand', emirati: 'united arab emirates' };
+      const dm = l.match(/\b(american|u\.s\.|us|british|uk|irish|canadian|australian|german|french|dutch|spanish|portuguese|italian|polish|swedish|swiss|indian|nigerian|singaporean|south african|new zealand|emirati)\s+(citizen|national|permanent resident)/);
+      const of = /green card/.test(l) ? 'united states' : dm ? DEMONYM[dm[1]] : koCountry(raw);
+      const mine = [p.citizenship, p.nationality].map(x => koCanon(x || '')).filter(Boolean);
+      const home = koCanon(p.country || '');
+      if (of && mine.includes(of)) return yn(true, 'citizenship', 'your profile');
+      if (of && (mine.length || home) && of !== home) return yn(false, 'citizenship', 'your profile');
+    }
     if (/relocat/.test(l) && !/assist|package|support|expense|allowance|bonus|cost|reimburs/.test(l)) return yn(f.relocate, 'relocation', 'your answer');
     if (/convicted|felony|pleaded guilty|criminal (offen[cs]e|conviction)|unspent conviction/.test(l)) return yn(f.convicted, 'conviction', 'your answer');
     if (/background (check|screen|investigation)|reference check|criminal (background|record) check|credit check|dbs check|pre-employment screening/.test(l)) return yn(f.backgroundCheck, 'background check', 'your answer');
@@ -3565,6 +3582,15 @@
       const away = !!(country && koCanWork(country) === false);
       return yn(away ? f.relocate : /hybrid/.test(l) ? f.hybrid : f.onsite, /hybrid/.test(l) ? 'hybrid' : 'on-site', away ? where : 'your answer');
     }
+    /* Travel, shifts / weekends / on-call / overtime / another time zone's
+       hours, start date, contract or part-time work. The fallback typed "25"
+       into "Are you willing to travel?" and "Day" into "Can you work a
+       flexible schedule?", which reads as No: an automatic rejection. */
+    if (asks && /\btravel(l?ing)?\b/.test(l) && !/expense|reimburs|allowance|cost|time zone|timezone/.test(l)) return yn(f.travel, 'travel', 'your answer');
+    if (asks && /\b(shifts?|rotating|weekends?|evenings?|nights?|on-?call|overtime|flexible (hours|schedule)|work schedule|((time ?zone|est|pst|cet|gmt|pacific|eastern|central|us|uk) (business |working )?hours)|overlap)\b/.test(l)) return yn(f.shifts, 'schedule', 'your answer');
+    if (asks && /\b(start|join|begin|available)\b.{0,60}\b(immediately|asap|within|in the next|\d+ (days?|weeks?|months?)|notice)\b/.test(l)) return yn(f.startSoon, 'start date', 'your answer');
+    if (asks && /\b(contract|contractor|temporary|temp|fixed[- ]term|part[- ]time|full[- ]time|freelance|1099|c2c|w-?2)\b/.test(l) &&
+        /\b(open|willing|interested|comfortable|ok|okay|able|accept|consider|available)\b/.test(l)) return yn(f.anyEmploymentType, 'employment type', 'your answer');
     /* Certifications you hold ("Do you hold an AWS Certified … certification?"). */
     if (/certif|accredit/.test(l) && !/^(which|what|list|please list|name|describe|tell us)\b/.test(l) && /(do you (hold|have|possess)|are you .{0,20}certified|have you (earned|obtained|achieved|passed)|hold an?|possess an?)/.test(l)) {
       const held = f.certifications.find(c => new RegExp(`(^|[^a-z0-9])${c.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}([^a-z0-9]|$)`, 'i').test(l) ||
