@@ -3511,6 +3511,49 @@
     _jobCountryFor = location.href; _jobCountry = c;
     return c;
   }
+  /* The pay range the job posting states ("$120,000 – $150,000",
+     "€60k-€75k"), or null. Kept for the apply pages that follow it. */
+  let _jobPayFor = '', _jobPay = null;
+  const PAY_NUM = '(\\d{2,3}(?:[,.]\\d{3})*(?:\\.\\d+)?)\\s?(k)?';
+  const PAY_CUR = '(?:([$€£])|\\b(USD|EUR|GBP|CAD|AUD)\\s?)';
+  const PAY_RE = new RegExp(PAY_CUR + '\\s?' + PAY_NUM + '\\s*(?:-|–|—|to)\\s*(?:[$€£]|USD|EUR|GBP|CAD|AUD)?\\s?' + PAY_NUM, 'i');
+  function payNum(s, k) { const n = Number(String(s).replace(/[,.](?=\d{3}\b)/g, '')); return k ? n * 1000 : n; }
+  function payRange(text) {
+    const m = String(text || '').match(PAY_RE);
+    if (!m) return null;
+    const lo = payNum(m[3], m[4]), hi = payNum(m[5], m[6] || m[4]);
+    if (!(lo >= 10000 && hi >= lo && hi < 5e6)) return null;          // hourly / monthly: not this
+    return { lo, hi, cur: (m[1] || m[2] || '').toUpperCase() };
+  }
+  function jobPay() {
+    if (_jobPayFor === location.href) return _jobPay;
+    let r = payRange(((document.body && document.body.innerText) || '').slice(0, 20000));
+    try {
+      const base = location.hostname + location.pathname.replace(/\/(apply|application|applyManually|autofillWithResume)\b.*$/i, '');
+      if (r) sessionStorage.setItem('ohKoPay', JSON.stringify({ base, r }));
+      else {
+        const s = JSON.parse(sessionStorage.getItem('ohKoPay') || 'null');
+        if (s && (location.hostname + location.pathname).startsWith(s.base)) r = s.r;
+      }
+    } catch (_) {}
+    _jobPayFor = location.href; _jobPay = r;
+    return r;
+  }
+  const CUR_OF = { '$': '$', USD: '$', CAD: '$', AUD: '$', '€': '€', EUR: '€', '£': '£', GBP: '£' };
+  /* Your salary answer for this job. Above the posted range, an ATS filters
+     the application out before anyone reads it, so it is held to the top
+     of the range; in the range (or below it) it stays yours. */
+  function koSalaryFor(mine) {
+    const r = jobPay();
+    if (!r) return mine || '';
+    const m = String(mine || '');
+    const n = koNum(m)[0];
+    const val = n == null ? null : (/\dk\b/i.test(m) && n < 1000 ? n * 1000 : n);
+    const myCur = (m.match(/[$€£]|USD|EUR|GBP|CAD|AUD/i) || [''])[0].toUpperCase();
+    const sameCur = !myCur || !r.cur || CUR_OF[myCur] === CUR_OF[r.cur];
+    if (val != null && sameCur && val <= r.hi) return m;
+    return String(r.hi);
+  }
   function koCanWork(country) {
     const f = koFacts();
     if (f.noSponsorship !== false) return true;
@@ -3614,7 +3657,10 @@
     }
     if (/highest (level of )?(education|degree|qualification)|education level|level of education/.test(l) && f.highestDegree) return { kind: 'degree level', answer: f.highestDegree, why: 'from your CV' };
     /* Salary. */
-    if (/salary|compensation expectation|pay (expectation|range)|desired (pay|rate)|expected (pay|ctc)/.test(l) && f.salary) return { kind: 'salary', answer: f.salary, why: 'your expectation' };
+    if (/salary|compensation expectation|pay (expectation|range)|desired (pay|rate)|expected (pay|ctc)/.test(l) && !/hourly|per hour|day rate|daily rate|currency/.test(l)) {
+      const s = koSalaryFor(f.salary);
+      if (s) return { kind: 'salary', answer: s, why: s === f.salary ? 'your expectation' : 'top of the posted range' };
+    }
     return null;
   }
 
