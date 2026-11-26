@@ -17,7 +17,7 @@
             "128": "icon128.plasmo.3c1ed2d2.png"
         }
     },
-    "version": "2.10.9",
+    "version": "2.11.0",
     "name": "OptimHire: FREE Job Autofill & Auto-Apply",
     "description": "FREE job autofill on 50+ boards. Auto-apply to matching jobs with tailored resumes and cover letters.Free to start,no card required.",
     "background": {
@@ -107,10 +107,10 @@
         },
         {
             "matches": [
-                "<all_urls>"
+                "https://*.optimhire.com/*"
             ],
             "js": [
-                "autofill.73df3a6d.js"
+                "optimhire-auth.0a577e02.js"
             ],
             "all_frames": false,
             "run_at": "document_end",
@@ -118,10 +118,10 @@
         },
         {
             "matches": [
-                "https://*.optimhire.com/*"
+                "<all_urls>"
             ],
             "js": [
-                "optimhire-auth.0a577e02.js"
+                "autofill.73df3a6d.js"
             ],
             "all_frames": false,
             "run_at": "document_end",
