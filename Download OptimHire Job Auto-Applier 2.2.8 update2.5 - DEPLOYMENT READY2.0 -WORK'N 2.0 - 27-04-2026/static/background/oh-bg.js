@@ -1310,7 +1310,7 @@ loadHandoff();
   var OH_API_GET_RE = /^https:\/\/(www\.)?optimhire\.com\/api\/v1\/candidate\/[^/?#]+(\/application)?(?:[?#]|$)/i;
   var START_ACTIONS = { START_JOB_APPLICATION_VIA_WEB: 1, START_PAGE_AUTOFILL: 1 };
   var NOTES = { STARTED_LOADING_SCREEN: 1, SIDE_PANEL_RELOAD: 1, SIDE_PANEL_MANUAL_RELOAD: 1 };
-  var MOVED_ON = { SIDE_PANEL_RELOAD: 1, SIDE_PANEL_MANUAL_RELOAD: 1, RELOAD_SIDE: 1, PILOT_STOP: 1, AUTO_APPLY_COMPLETE: 1,
+  var MOVED_ON = { SIDE_PANEL_RELOAD: 1, SIDE_PANEL_MANUAL_RELOAD: 1, RELOAD_SIDE: 1, AUTO_APPLY_COMPLETE: 1,
                    AUTO_APPLY_STATE_UPDATE: 1, MANUALLY_APPLY_STATE_UPDATE: 1 };
   var ohListeners = [], capturing = true;
   var lastStart = null, watch = null, tries = 0, triedTs = 0;
@@ -1319,6 +1319,8 @@ loadHandoff();
   /* The start request as it came (only what reaches OptimHire — a Workday page press doesn't, 15). */
   ev.addListener(function (msg, sender) {
     if (msg && START_ACTIONS[msg.action]) lastStart = { msg: msg, sender: sender, ts: Date.now() };
+    /* You pressed Stop: nothing is started again. */
+    else if (msg && /^(AUTO_APPLY_STOP|MANUAL_APPLY_STOP|STOP_ALL_PROCESSES)$/.test(msg.type || '')) { lastStart = null; watch = null; tries = 0; }
   });
   /* OptimHire's own handlers (added while index.js loads), to hand that request to again. */
   var prevAdd = ev.addListener;
@@ -1346,6 +1348,12 @@ loadHandoff();
     if (type === 'STARTED_LOADING_SCREEN') {
       if (Date.now() - triedTs > 120000) tries = 0;      // a new start, not one we restarted
       watch = { since: Date.now() };
+    } else if (type === 'PILOT_STOP') {
+      /* OptimHire (2.10.6+) stops the run it is starting when it cannot open its side panel —
+         Chrome allows that only right after a real click, so a press by the automation or a
+         restart from here is stopped the moment it begins. That is not your Stop: the start goes
+         on, and so does the watch. A stop at any other time ends it. */
+      if (!(lastStart && Date.now() - lastStart.ts < 5000)) { watch = null; tries = 0; }
     } else if (type && MOVED_ON[type]) { watch = null; tries = 0; }
     var p = realSend.apply(rt, arguments);
     if (type && NOTES[type] && p && typeof p.then === 'function') {
@@ -1407,6 +1415,7 @@ loadHandoff();
           tries++; triedTs = Date.now();
           tell('"Loading your Job" for ' + s + ' s: optimhire.com did not hand out the job — starting it again (' + tries + '/' + TRIES + ')', false);
           var st = lastStart;
+          st.ts = Date.now();                                            // this restart is the start now
           ohListeners.forEach(function (fn) { try { fn.call(null, st.msg, st.sender, function () {}); } catch (_) {} });
           return;
         } else {

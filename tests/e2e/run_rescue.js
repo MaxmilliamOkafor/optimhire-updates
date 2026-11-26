@@ -40,6 +40,7 @@ async function scenario(name, setup, expect){
   mode=setup.mode||'ok'; failLeft=setup.failLeft||0; profileCalls=0; jobCalls=0;
   const t0=Date.now();
   await pg.evaluate(()=>{ chrome.runtime.sendMessage({action:'START_JOB_APPLICATION_VIA_WEB',jobId:'J1'}).catch(()=>{}); });
+  if(setup.stopAfter){ await sleep(setup.stopAfter); await pg.evaluate(()=>{ for(const type of ['AUTO_APPLY_STOP','STOP_ALL_PROCESSES','MANUAL_APPLY_STOP']) chrome.runtime.sendMessage({type}).catch(()=>{}); }); }
   const get=k=>pg.evaluate(k=>new Promise(r=>chrome.storage.local.get(k,d=>r(d[k]))),k);
   let started=false, reset=false;
   for(let i=0;i<(setup.waitS||60);i++){ await sleep(1000);
@@ -65,7 +66,11 @@ async function scenario(name, setup, expect){
   await scenario('fails for good',{mode:'500',failLeft:999,waitS:90,quietAfter:12000},o=>{
     check(!o.started&&o.reset,'optimhire.com never hands out the job: after the restarts the panel is reset, not left spinning');
     check(o.rescue&&o.rescue.final&&/after 3 tries/.test(o.rescue.msg),'…and the card says why');
-    check(o.callsAtEnd>=7&&o.callsAtEnd<=9&&profileCalls===o.callsAtEnd,`3 starts (each asking up to 3 times), then it stops asking: ${o.callsAtEnd} requests, none in the 12 s after`); });
+    const starts=o.seen.filter(t=>t==='STARTED_LOADING_SCREEN').length;
+    check(starts===3&&profileCalls===o.callsAtEnd,`3 starts, then it stops asking: started ${starts}×, ${o.callsAtEnd} profile requests (OptimHire also re-reads it after a stop), none in the 12 s after`); });
+  await scenario('you press Stop',{mode:'500',failLeft:999,waitS:35,stopAfter:4000},o=>{
+    const starts=o.seen.filter(t=>t==='STARTED_LOADING_SCREEN').length;
+    check(!o.started&&starts===1&&!(o.rescue&&/starting it again/.test(o.rescue.msg)),`you press Stop while it is stuck: nothing is started again (started ${starts}×)`); });
   await scenario('signed out',{signedIn:false,waitS:40},o=>{
     check(!o.started&&o.reset&&o.rescue&&/signed out of optimhire\.com/.test(o.rescue.msg),'signed out of optimhire.com: panel reset, the card says sign in'); });
   console.log(bad?`\n${bad} FAILED`:'\nALL PASS'); api.close(); jobs.close(); process.exit(bad?1:0);
