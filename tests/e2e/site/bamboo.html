@@ -1,0 +1,43 @@
+<!doctype html><html><head><meta charset="utf-8"><title>Software Engineer - Nylon Technology</title>
+<style>.fab-Select{display:inline-block} .menu{position:absolute;background:#222;color:#eee;max-height:200px;overflow:auto;border:1px solid #555} .fab-MenuOption{padding:4px 8px}</style></head><body>
+<h1>Software Engineer</h1>
+<form id="f">
+ <div class="fab-FormField"><label for="firstName">First Name*</label><input id="firstName" name="firstName"></div>
+ <div class="fab-FormField"><label for="lastName">Last Name*</label><input id="lastName" name="lastName"></div>
+ <div class="fab-FormField"><label for="email">Email*</label><input id="email" name="email"></div>
+ <div class="fab-FormField"><label for="city">City*</label><input id="city" name="city"></div>
+ <div class="fab-FormField"><label>State*</label><div class="fab-Select" id="stateSel"><button type="button" aria-haspopup="listbox" data-menu-id="m-state">–Select–</button><select name="stateId" hidden></select></div></div>
+ <div class="fab-FormField"><label for="zip">ZIP*</label><input id="zip" name="zip" value="Dublin, D08 XY12"></div>
+ <div class="fab-FormField"><label>Country*</label><div class="fab-Select" id="countrySel"><button type="button" aria-haspopup="listbox" data-menu-id="m-country">United States</button><select name="countryId" hidden></select></div></div>
+ <div class="fab-FormField"><label for="cl">Cover Letter*</label><input type="file" id="cl" name="coverLetterFileId" accept=".pdf,.doc,.docx,.txt" required></div>
+ <div class="fab-FormField"><label for="cv">Resume*</label><input type="file" id="cv" name="resumeFileId" accept=".pdf,.doc,.docx" required></div>
+ <button type="submit">Submit Application</button>
+</form>
+<script>
+const US=['Alabama','Alaska','American Samoa','Arizona','Arkansas','California','Colorado'];
+const IE=['Carlow','Cavan','Clare','Cork','Dublin','Galway','Kerry'];
+const COUNTRIES=['United States','Canada','Australia','Afghanistan','Albania','Germany','Ireland','Italy','United Kingdom'];
+const lists={ 'm-country':COUNTRIES, 'm-state':US };
+window.__events=[];
+function setup(id,btnSel){
+  const wrap=document.getElementById(id), btn=wrap.querySelector('button'), sel=wrap.querySelector('select'), mid=btn.dataset.menuId;
+  function fillSelect(){ sel.innerHTML=lists[mid].map(o=>`<option>${o}</option>`).join(''); }
+  fillSelect();
+  btn.addEventListener('click',()=>{ const open=document.querySelector(`[data-helium-id="${mid}"]`); if(open){open.remove();return;}
+    const m=document.createElement('div'); m.className='menu'; m.dataset.heliumId=mid; m.setAttribute('role','listbox');
+    const r=btn.getBoundingClientRect(); m.style.left=r.left+'px'; m.style.top=(r.bottom+window.scrollY)+'px';
+    const box=document.createElement('div'); m.appendChild(box);
+    const s=document.createElement('input'); s.type='text'; s.placeholder='Search...';
+    function draw(){ box.innerHTML=''; lists[mid].filter(o=>o.toLowerCase().includes(s.value.toLowerCase())).forEach(o=>{
+      const d=document.createElement('div'); d.className='fab-MenuOption'; d.setAttribute('role','option'); d.textContent=o;
+      d.addEventListener('click',()=>{ btn.textContent=o; sel.value=o; m.remove(); window.__events.push(mid+'='+o);
+        if(mid==='m-country'){ lists['m-state']=o==='Ireland'?IE:US; document.querySelector('#stateSel button').textContent='–Select–'; document.querySelector('#stateSel select').innerHTML=lists['m-state'].map(x=>`<option>${x}</option>`).join(''); } });
+      box.appendChild(d); }); }
+    s.addEventListener('input',draw); draw(); m.appendChild(s); document.body.appendChild(m); });
+}
+setup('countrySel'); setup('stateSel');
+document.addEventListener('keydown',e=>{ if(e.key==='Escape') document.querySelectorAll('[data-helium-id]').forEach(m=>m.remove()); },true);
+document.getElementById('f').addEventListener('submit',e=>e.preventDefault());
+// like OptimHire's question pass: a menu opened and left open
+setTimeout(()=>document.querySelector('#stateSel button').click(),300);
+</script></body></html>

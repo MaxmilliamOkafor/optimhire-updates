@@ -1,0 +1,13 @@
+<!doctype html><html><head><meta charset="utf-8"><title>Job Application for Engineer at Strive</title></head><body>
+<h1>Engineer</h1>
+<form id="application-form">
+  <div class="field"><label for="first_name">First Name*</label><input id="first_name" name="first_name" required></div>
+  <div class="field"><label for="email">Email*</label><input id="email" type="email" required></div>
+  <div class="field phone-field"><label for="phone">Phone*</label>
+    <div class="phone-input"><input id="phone" type="tel" aria-required="true" required autocomplete="tel"></div>
+    <div id="phone-err" class="helper-text helper-text--error">Phone is required.</div></div>
+  <button type="submit">Submit application</button>
+</form>
+<script>document.getElementById('application-form').addEventListener('submit',e=>e.preventDefault());
+document.getElementById('phone').addEventListener('input',e=>{document.getElementById('phone-err').hidden=!!e.target.value;});</script>
+</body></html>

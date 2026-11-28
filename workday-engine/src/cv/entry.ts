@@ -6,6 +6,7 @@
 import { cvText } from "./cvtext.js";
 import { parseCv, type CvProfile } from "./cvparse.js";
 import { profileFromCv, tailoredCv, type JobText, type Person } from "./tailorcv.js";
+import { coverLetterPdf } from "./coverletter.js";
 import type { Profile } from "../workday/types.js";
 
 (window as unknown as { __ohCv: unknown }).__ohCv = {
@@ -19,5 +20,9 @@ import type { Profile } from "../workday/types.js";
   tailor(input: { profile?: Profile; cv?: CvProfile; person?: Person; job: JobText }) {
     const p = input.profile ?? (input.cv ? profileFromCv(input.cv, input.person || {}) : null);
     return p ? tailoredCv(p, input.job) : null;
+  },
+  /** A plain-text cover letter (OptimHire's cover-letter.txt) as a PDF, or null. */
+  coverLetter(input: { text: string; person?: Person; title?: string }) {
+    return coverLetterPdf(input.text, input.person || {}, input.title || "");
   },
 };

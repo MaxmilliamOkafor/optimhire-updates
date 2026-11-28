@@ -69,6 +69,13 @@ export const SUBMITTED_RX = rx([
   "応募が完了", "ご応募ありがとう", "申请已提交", "感谢您的申请",
 ]);
 
+/** Workday's own error page ("Something went wrong. Please refresh the page") — a reload usually clears it. */
+export const SOMETHING_WRONG_RX = rx([
+  "something went wrong\\.? please refresh", "something went wrong\\.? please try again", "etwas ist schiefgelaufen",
+  "une erreur s'est produite\\.? veuillez actualiser", "algo salió mal", "algo deu errado", "qualcosa è andato storto",
+  "er is iets misgegaan", "coś poszło nie tak",
+]);
+
 /** Workday blocks a second application to the same job ("You've already applied for this job"). */
 export const ALREADY_APPLIED_RX = rx([
   "(you'?ve|you have) already applied", "already applied (for|to) this (job|position|role)", "already submitted an application",

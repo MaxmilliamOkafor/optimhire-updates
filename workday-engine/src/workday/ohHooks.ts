@@ -40,6 +40,9 @@ export interface EngineHooks {
   onPage?: (run: RunState) => void;
   /** Awaited before My Experience is filled (e.g. your work history is still being read from your CV). */
   beforeExperience?: () => Promise<void>;
+  /** The application's own pages (CV, My Information… Review) are reached: true = the host's own
+   *  filler takes them from here and this run ends quietly. */
+  handOff?: (run: RunState) => Promise<boolean>;
 }
 
 export const hooks: EngineHooks = {};

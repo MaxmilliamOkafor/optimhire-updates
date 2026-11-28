@@ -201,6 +201,7 @@ export type PageKind =
   | "review"
   | "submitted"
   | "candidateHome"
+  | "somethingWrong"
   | "unknown";
 
 export type RunStatus = "idle" | "running" | "paused" | "review" | "done" | "error" | "filled"; // [oh] filled: assist mode
@@ -235,6 +236,8 @@ export interface RunState {
   authAttempts: number;
   /** Account-creation attempts this run. */
   createAttempts: number;
+  /** [oh] "Verify your account" was answered with a password reset by email this run (tried once). */
+  verifyReset?: boolean;
   updatedAt: number;
 }
 

@@ -5,7 +5,7 @@
  * outright (chrome.storage.local.ohKnockout): the countries you can work in
  * without sponsorship, relocation / on-site, background checks, age, licence,
  * convictions… plus the certifications you hold (AWS by default), years of
- * experience (7 unless you set another number — every years question uses
+ * experience (9 unless you set another number — every years question uses
  * it), highest degree (from your CV) and salary (from your profile). assets/optimhire-patch.js answers
  * every knockout question with these (per the job's country), corrects wrong
  * answers any filler left, and holds Submit until they are right; the
@@ -20,10 +20,15 @@
 
   /* key, question, hint, options (value → text) */
   var ITEMS = [
+    ['noSponsorship', 'Never need visa sponsorship', 'Yes: every sponsorship question is No and every “authorised to work?” is Yes, for a job in any country. No: answered per job from the countries above'],
     ['relocate', 'Willing to relocate', 'Also used for on-site jobs in a country you would move to'],
     ['onsite', 'Work on-site / in the office', ''],
     ['hybrid', 'Work hybrid', ''],
     ['remote', 'Work remotely', ''],
+    ['travel', 'Willing to travel', ''],
+    ['shifts', 'Work shifts, weekends, on-call or another time zone’s hours', ''],
+    ['startSoon', 'Can start soon', '“Can you start within N weeks / immediately?”'],
+    ['anyEmploymentType', 'Open to contract, part-time or fixed-term work', ''],
     ['over18', '18 or older', ''],
     ['backgroundCheck', 'Agree to a background / reference check', ''],
     ['drugTest', 'Agree to a drug screen', ''],
@@ -37,7 +42,8 @@
     ['previouslyEmployed', 'Worked for the company before', 'Companies on your CV are recognised either way'],
   ];
   var DEFAULTS = {
-    relocate: true, onsite: true, hybrid: true, remote: true, over18: true, backgroundCheck: true, drugTest: true,
+    noSponsorship: true,
+    relocate: true, onsite: true, hybrid: true, remote: true, travel: true, shifts: true, startSoon: true, anyEmploymentType: true, over18: true, backgroundCheck: true, drugTest: true,
     essentialFunctions: true, driversLicence: null, clearance: false, englishFluent: true, convicted: false,
     nonCompete: false, relatives: false, previouslyEmployed: false,
   };
@@ -121,7 +127,7 @@
       return '<div class="ko-q">' + esc(it[1]) + (it[2] ? '<small>' + esc(it[2]) + '</small>' : '') + '</div>' + seg(it[0], v, it[3]);
     }).join('');
     $('koYears').value = ko.yearsExperience != null && ko.yearsExperience !== '' ? ko.yearsExperience : '';
-    $('koYears').placeholder = '7 (default)';
+    $('koYears').placeholder = '9 (default)';
     $('koCerts').value = Array.isArray(ko.certifications) ? ko.certifications.join(', ') : 'AWS';
     $('koDegree').value = ko.highestDegree || '';
     $('koDegree').placeholder = cv.degree ? cv.degree + ' (CV)' : 'e.g. BSc Computer Science';
@@ -129,7 +135,7 @@
     var ps = profileSalary(d);
     $('koSalary').placeholder = ps ? ps + ' (profile)' : 'e.g. 60000';
     $('koCvNote').textContent = 'Every years-of-experience question uses this number — "How many years…?", a range such as "5-7 years", or ' +
-      '"Do you have 5+ years…?" (Yes when it is at least 5). Left empty: 7. Degree comes from your CV and salary from your profile when left empty.';
+      '"Do you have 5+ years…?" (Yes when it is at least 5). Left empty: 9. Degree comes from your CV and salary from your profile when left empty.';
     var badge = $('koBadge');
     if (badge) badge.textContent = ko.confirmed ? '' : '!';
   }

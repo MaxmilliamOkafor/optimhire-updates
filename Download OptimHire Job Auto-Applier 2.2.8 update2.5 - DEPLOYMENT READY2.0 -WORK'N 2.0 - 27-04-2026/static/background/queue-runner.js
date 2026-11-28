@@ -24,6 +24,14 @@
     conc: 'ohJobQueueConcurrency', adv: 'ohJobQueueAdvanceReq', tabs: 'ohQueueTabs', prefer: 'ohPreferAts', owner: 'ohJobQueueOwnerTab',
   };
   var MAX_OPEN_ATTEMPTS = 3;
+  /* Backstop, checked every minute: a job still "running" this long after its tab opened has its
+     tab closed, is marked failed and the next job opens. The job page's own limits (3 min, 8 on
+     Workday) normally end it first, but only while its script runs on a page that still matches
+     the CSV link: after a redirect (Citi → Workday, a board → the company site), a login wall, an
+     error page or a hung tab, nothing ended the job and the queue stood still. */
+  var JOB_HARD_CAP_MS = 6 * 60 * 1000;
+  var WD_JOB_HARD_CAP_MS = 14 * 60 * 1000;
+  var WD_URL_RE = /myworkday(jobs|site)?\.com|workdayjobs\.com|\.workday\.com/i;
   var MAX_CONCURRENCY = 8;
   var TERMINAL = { applied: 1, failed: 1, skipped: 1 };
   var ALARM = 'ohQueueBeat';
@@ -46,7 +54,7 @@
   }
 
   /* ── order: quickest company ATS first, then account ATS, career sites, job boards, Reed last ──
-     self.ohJobRank (oh-bg.js): Greenhouse 0, Lever 1 … Workday 20 … career sites 30, boards 40+, Reed 99. */
+     self.ohJobRank (oh-bg.js): Greenhouse 0, Workable 1, SmartRecruiters 2, Workday 3 … other ATS up to 21, career sites 30, boards 40+, Reed 99. */
   function tier(url) { return typeof self.ohJobRank === 'function' ? self.ohJobRank(url) : 30; }
   function pickNext(q, ok, preferAts) {
     if (!preferAts) { for (var i = 0; i < q.length; i++) if (ok(q[i])) return q[i]; return null; }
@@ -70,6 +78,66 @@
     } catch (_) { return ''; }
   }
   function normUrl(u) { try { return new URL(u).href; } catch (_) { return String(u || ''); } }
+
+  /* Closed postings skipped before a tab is opened (about one posting in six has closed by the
+     time it is applied to; each cost a tab and a minute or more). One plain request, and only a
+     clear sign the site itself gives counts — measured on real postings by AIHawk
+     (github.com/feder-cr/Jobs_Applier_AI_Agent, MIT, src/aihawk/liveness.py):
+       Workday   the job's JSON (/wday/cxs/<tenant>/<site>/job/<path>) answers 403 with errorCode S22
+       Lever     the posting answers 404
+       Ashby     404 with the board's own page, titled "Jobs"
+       Workable  sent on to apply.workable.com/oops
+       BambooHR  the job's JSON (/careers/<id>/detail) answers 404, or is sent on to the list of jobs
+       Paylocity sent on to /Recruiting/Jobs/JobNotFound
+     Anything else — an error, a timeout, a captcha, another vendor — is not closed, and the job is
+     opened as always. (Greenhouse's "?error=true" is not used: some of those jobs are open through
+     the company's embedded form — oh-bg.js 19.) Returns why it is closed, or ''. */
+  async function postingClosed(url) {
+    var u; try { u = new URL(url); } catch (_) { return ''; }
+    var host = u.hostname.toLowerCase(), path = u.pathname;
+    var ctl = typeof AbortController === 'function' ? new AbortController() : null;
+    var timer = setTimeout(function () { try { if (ctl) ctl.abort(); } catch (_) {} }, 8000);
+    async function ask(where, init) {
+      return fetch(where, Object.assign({ credentials: 'omit', cache: 'no-store', signal: ctl ? ctl.signal : undefined }, init || {}));
+    }
+    try {
+      if (/\.myworkdayjobs\.com$/.test(host)) {
+        var m = /^\/(?:[a-z]{2}-[A-Z]{2}\/)?([^/]+)\/job\/(.+?)\/?$/.exec(path.replace(/\/(apply|applyManually)(\/.*)?$/i, ''));
+        if (!m) return '';
+        var res = await ask('https://' + host + '/wday/cxs/' + host.split('.')[0] + '/' + m[1] + '/job/' + m[2], { headers: { Accept: 'application/json' } });
+        if (res.status !== 403) return '';
+        var body = null; try { body = await res.json(); } catch (_) {}
+        return body && String(body.errorCode || '') === 'S22' ? 'Workday says the job is no longer posted' : '';
+      }
+      if (/^jobs(\.eu)?\.lever\.co$/.test(host)) {
+        var lr = await ask(u.origin + path.replace(/\/apply\/?$/, ''));
+        return lr.status === 404 ? 'Lever: the posting is gone (404)' : '';
+      }
+      if (host === 'jobs.ashbyhq.com') {
+        var ar = await ask(u.origin + path.replace(/\/application\/?$/, ''));
+        if (ar.status !== 404) return '';
+        var t = /<title[^>]*>([\s\S]*?)<\/title>/i.exec(await ar.text());
+        return t && t[1].trim() === 'Jobs' ? 'Ashby: the posting is gone' : '';
+      }
+      if (host === 'apply.workable.com') {
+        var wr = await ask(url);
+        return /^https:\/\/apply\.workable\.com\/oops/i.test(wr.url) ? 'Workable: the posting is gone' : '';
+      }
+      if (/\.bamboohr\.com$/.test(host) && host !== 'www.bamboohr.com') {
+        var b = /^\/careers\/(\d+)/.exec(path);
+        if (!b) return '';
+        var br = await ask('https://' + host + '/careers/' + b[1] + '/detail');
+        var bu = new URL(br.url);
+        if (br.status === 404) return 'BambooHR: the posting is gone (404)';
+        return (bu.hostname === 'www.bamboohr.com' || /^\/careers\/?$/.test(bu.pathname)) ? 'BambooHR: sent on to the list of jobs' : '';
+      }
+      if (host === 'recruiting.paylocity.com') {
+        var pr = await ask(url);
+        return /\/recruiting\/jobs\/jobnotfound/i.test(pr.url) ? 'Paylocity: Job Not Found' : '';
+      }
+    } catch (_) { return ''; } finally { clearTimeout(timer); }
+    return '';
+  }
 
   /* Write job changes into whatever is stored NOW. A result the job's own tab
      already wrote (applied / failed / skipped) is never undone. */
@@ -130,6 +198,23 @@
     var conc = Math.min(MAX_CONCURRENCY, Math.max(1, parseInt(d[K.conc], 10) || 1));
     var map = await liveTabs(d[K.tabs] || {});
     var changes = {}, now = Date.now();
+    for (var si = 0; si < q.length; si++) {
+      var sj = q[si];
+      if (sj.status !== 'running' || !(sj.id in map) || !sj.lastActionTs) continue;
+      var cap = WD_URL_RE.test(String(sj.url || '')) ? WD_JOB_HARD_CAP_MS : JOB_HARD_CAP_MS;
+      if (now - sj.lastActionTs < cap) continue;
+      var stuckTab = map[sj.id];
+      var mins = Math.round((now - sj.lastActionTs) / 60000);
+      log('timed out after ' + mins + ' min, moving on: ' + (sj.title || sj.url));
+      changes[sj.id] = { status: 'failed', lastError: 'timed out after ' + mins + ' min with no result from the job page', lastActionTs: now };
+      sj.status = 'failed';
+      delete map[sj.id];
+      if (stuckTab != null && stuckTab !== -1) {
+        await releaseFocus(stuckTab);
+        chrome.tabs.remove(stuckTab, function () { void chrome.runtime.lastError; });
+      }
+    }
+    if (Object.keys(changes).length) await set({ [K.tabs]: map });
     q.forEach(function (j) {
       /* "running" with no tab: its tab was lost (closed, crashed) — back in line. */
       if (j.status === 'running' && !(j.id in map)) { changes[j.id] = { status: 'pending' }; j.status = 'pending'; }
@@ -149,6 +234,14 @@
       if (!cand) break;
       var url = safeUrl(cand.url);
       if (!url) { cand.status = 'failed'; await writeJobs({ [cand.id]: { status: 'failed', lastError: 'missing URL', lastActionTs: Date.now() } }); continue; }
+      var closed = await postingClosed(url);
+      if (closed) {
+        cand.status = 'failed';
+        log('closed, not opened: ' + (cand.title || url) + ' — ' + closed);
+        await writeJobs({ [cand.id]: { status: 'failed', lastError: 'posting closed — ' + closed, closed: true, lastActionTs: Date.now() } });
+        guard--;                                           // the slot is still free
+        continue;
+      }
       cand.status = 'running';
       cand.attempts = (cand.attempts || 0) + 1;
       map[cand.id] = -1;                                   // reserved before the tab exists
