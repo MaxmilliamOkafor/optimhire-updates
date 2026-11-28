@@ -479,6 +479,10 @@
    * edit of our value with the same value again. */
   const FIGHT_MAX = 3;
   const _ourWrites = new WeakMap();   // el → Map(value → times typed)
+  /* Set while repairPrefills() puts back a value the site REPLACED with a different one (a CV
+     parser's phone): that is not a fight — the repair compares by digits / letters only, so a
+     mere reformat is never repaired, and it repairs a box twice at most. */
+  let _repairing = false;
   function wroteBefore(el, val) {
     const m = _ourWrites.get(el);
     return !!(m && m.has(val));
@@ -490,6 +494,7 @@
     if (!n) return true;
     const cur = (el.value || '').trim();
     if (cur === val.trim()) return false;                    // ours, still there
+    if (cur && _repairing) return true;                      // a different value, put right (bounded)
     if (cur) {                                               // the site changed it
       /* …except a value that was doubled up ("Dublin, Ireland, Dublin,
          Ireland"): put it right, once. */
@@ -560,9 +565,28 @@
     return true;
   }
 
+  /* Buttons this script never presses, on any site (after the site notes of AIHawk,
+     github.com/feder-cr/Jobs_Applier_AI_Agent, MIT): signing in, applying or importing through
+     another service ("Apply with LinkedIn", "Sign in with Google", Dropbox / Google Drive), the
+     site's own fill-from-CV ("Autofill my application", "Autofill with Resume", "Use My Last
+     Application") — it overwrites what was filled — and "Paste resume" / "Write it here instead". */
+  const NEVER_CLICK_RE = /\b(apply|sign[\s-]?in|log[\s-]?in|sign[\s-]?up|register|continue|connect|import|upload)(\s+(now|instantly|easily|quickly))?\s+(with|using|via|from|through)\s+(your\s+)?(linked\s?in|google|indeed|apple|facebook|github|microsoft|seek|xing|dropbox|google drive|one\s?drive)\b|\bauto[\s-]?fill\s+(my\s+application|application|with\s+(my\s+)?(resume|cv)|from\s+(my\s+)?(resume|cv))\b|\buse\s+my\s+last\s+application\b|\bpaste\s+(your\s+|my\s+)?(resume|cv)\b|\bwrite\s+it\s+here\s+instead\b/i;
+  const _neverLogged = new WeakSet();
+  function neverClick(el) {
+    try {
+      const aid = (el.getAttribute && el.getAttribute('data-automation-id')) || '';
+      if (/^(autofillWithResume|useMyLastApplication|SignInWithGoogle|linkedInSignIn)/i.test(aid)) return true;
+      const own = String(el.innerText || el.value || '').replace(/\s+/g, ' ').trim();
+      const t = [own.length <= 160 ? own : '', el.getAttribute && el.getAttribute('aria-label'), el.getAttribute && el.getAttribute('title')].filter(Boolean).join(' ');
+      if (!NEVER_CLICK_RE.test(t)) return false;
+      if (!_neverLogged.has(el)) { _neverLogged.add(el); LOG(`Not pressing "${t.slice(0, 60)}" — never sign in / apply through another service or the site's fill-from-CV`); }
+      return true;
+    } catch (_) { return false; }
+  }
+
   /** Real pointer-events click sequence (unchanged proven behaviour). */
   function realClick(el) {
-    if (!el || _masterOff) return;
+    if (!el || _masterOff || neverClick(el)) return;
     el.dispatchEvent(new MouseEvent('mouseover', { bubbles: true }));
     el.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
     el.dispatchEvent(new MouseEvent('mouseup',   { bubbles: true }));
@@ -4183,8 +4207,9 @@
                            (z.closest && (z.closest('.field,[class*="field" i],fieldset,[class*="upload" i]') || z).innerText || '').slice(0, 200)]
                           .filter(Boolean).join(' ');
     for (const zone of zones) {
+      if (attached) break;                                          // one CV per form
       const zt = zoneText(zone);
-      if (NOT_RESUME_RE.test(zt)) continue;
+      if (NOT_RESUME_RE.test(zt) || AUTOFILL_UPLOAD_RE.test(zt)) continue;   // not the site's fill-from-CV box
       if (zones.length > 1 && !RESUME_INPUT_RE.test(zt)) continue;
       let inp = zone.querySelector('input[type="file"]');
       if (!inp) {
@@ -4194,7 +4219,7 @@
         inp = zone.querySelector('input[type="file"]') ||
               querySelectorWithShadow('input[type="file"]', zone);
       }
-      if (!inp || (inp.files && inp.files.length > 0)) continue;
+      if (!inp || (inp.files && inp.files.length > 0) || autofillUploadBox(inp)) continue;
       const file = await fetchResumeFile(url, fname);
       if (!file) break;
       try {
@@ -4651,8 +4676,29 @@
     '[role="dialog"]', '[role="alertdialog"]',
   ].join(',');
 
+  /* Declined where the banner lets you (necessary cookies only), as AIHawk's site notes do —
+     Workable's "Cookie Consent", OneTrust's "Reject all", Cookiebot's "Weigeren", Recruitee's
+     "Agree to necessary"; accepted only where a banner has no such button. Either way the banner
+     stops covering the form's buttons. */
+  const COOKIE_DECLINE_RE = /^(decline( all)?( cookies)?|reject( all)?( cookies)?|deny( all)?|only (necessary|essential)( cookies)?|(use )?(necessary|essential) (cookies )?only|agree to necessary|accept (only )?(necessary|essential)( cookies)?( only)?|weigeren|alle ablehnen|ablehnen|nur notwendige( cookies)?|refuser( tout)?|tout refuser|continuer sans accepter|rechazar( todo| todas)?|rifiuta( tutto| tutti)?)$/i;
+  function declineCookieBanner() {
+    const direct = document.querySelector('#onetrust-reject-all-handler, #CybotCookiebotDialogBodyButtonDecline');
+    if (direct && direct.getClientRects().length) { direct.click(); return true; }
+    for (const banner of document.querySelectorAll(COOKIE_CONTAINER_SEL)) {
+      if (!banner.offsetParent && banner.getClientRects().length === 0) continue;
+      const own = ((banner.id || '') + ' ' + (typeof banner.className === 'string' ? banner.className : '') + ' ' + (banner.getAttribute('aria-label') || '')).toLowerCase();
+      if (!/cookie|consent|gdpr|privacy/.test(own) && !/cookie/i.test((banner.innerText || '').slice(0, 400))) continue;   // a cookie banner, not any dialog
+      for (const btn of banner.querySelectorAll('button, [role="button"], a[href]')) {
+        const txt = String(btn.innerText || btn.textContent || btn.getAttribute('aria-label') || '').replace(/\s+/g, ' ').trim();
+        if (txt.length <= 40 && COOKIE_DECLINE_RE.test(txt) && btn.getClientRects().length) { btn.click(); return true; }
+      }
+    }
+    return false;
+  }
+
   function dismissCookieBanner() {
     try {
+      if (declineCookieBanner()) return true;
       const banners = document.querySelectorAll(COOKIE_CONTAINER_SEL);
       for (const banner of banners) {
         if (!banner.offsetParent && banner.getClientRects().length === 0) continue;
@@ -4885,9 +4931,19 @@
           }
         } catch (_) {}
         desc.set.call(this, list);
+        try { if (this.type === 'file' && list && list.length) afterCvUpload(); } catch (_) {}
       },
     });
   })();
+
+  /* A file just went into a box (ours or OptimHire's filler): on sites that then fill the form
+     from the CV (Lever, Ashby, Workable…), put your details back once the site has done it. */
+  let _afterUploadTimer = null;
+  function afterCvUpload() {
+    if (_masterOff || !PREFILL_REPAIR_ATS.includes(CURRENT_ATS)) return;
+    clearTimeout(_afterUploadTimer);
+    _afterUploadTimer = setTimeout(() => { repairPrefills().catch(() => {}); }, 3500);
+  }
 
   /* A location as a place: a profile location picked from a suggestion list can be a
      building in the town ("National University of Ireland, Galway, Ireland") — that
@@ -5041,14 +5097,40 @@
     return (await tailoredResumeFile(url, filename)) || rawResumeFile(url, filename);
   }
 
+  /* Upload boxes that READ the CV to fill the form for you — Ashby's "Autofill from resume",
+     SmartRecruiters' "apply with resume", "Import resume from…": the CV never goes there (the
+     site would overwrite the filled form with what it read). The box's own words and those of
+     its section, up to the nearest container that holds another upload box. */
+  const AUTOFILL_UPLOAD_RE = /auto[\s_-]?fill|apply[\s_-]*with[\s_-]*(resume|cv)|import[\s_-]*(resume|cv|from)|parse[\s_-]*(your\s+|my\s+)?(resume|cv)|quick[\s_-]*apply/i;
+  function autofillUploadBox(inp) {
+    try {
+      let t = [inp.name, inp.id, inp.getAttribute('aria-label'), getLabel(inp)].filter(Boolean).join(' ');
+      for (let n = inp.parentElement, i = 0; n && i < 4; n = n.parentElement, i++) {
+        if (n.querySelectorAll('input[type="file"]').length > 1) break;
+        t += ' ' + [n.id, typeof n.className === 'string' ? n.className : '', n.getAttribute('data-testid') || ''].join(' ') +
+             ' ' + String(n.innerText || '').slice(0, 200);
+      }
+      return AUTOFILL_UPLOAD_RE.test(t);
+    } catch (_) { return false; }
+  }
+  /* The real CV box, where the site has one known for it (site notes as above). */
+  const KNOWN_CV_SEL = ['#_systemfield_resume', '#resume-upload-input', 'input#resume', 'input[name="resume"]', 'input[name="candidate.cv"]',
+    '#resumator-resume-value', '#candidate_resume_remote_url', '#doc-input-cv', '[data-automation-id="file-upload-input-ref"]',
+    'input[id="PortalProfileFields.Resume_File"]'].join(',');
+
   async function tryResumeUpload(p = {}) {
     const url = p.resume_url || p.resumeUrl || p.resume;
     if (!url) return 0;
-    const fileInputs = Array.from(document.querySelectorAll('input[type="file"]'));
+    let fileInputs = Array.from(document.querySelectorAll('input[type="file"]')).filter(i => !autofillUploadBox(i));
     if (!fileInputs.length) return 0;
+    /* The site's known CV box first; one CV per form (it used to go into every box named "resume"). */
+    const known = fileInputs.filter(i => i.matches(KNOWN_CV_SEL));
+    if (known.length) fileInputs = known.concat(fileInputs.filter(i => !known.includes(i)));
+    if (known.some(i => i.files && i.files.length)) return 0;
     let attached = 0;
     const fname = (p.first_name || 'resume') + '_' + (p.last_name || 'file') + '.pdf';
     for (const inp of fileInputs) {
+      if (attached) break;
       if (inp.files && inp.files.length > 0) continue;
       const hint = [
         inp.name, inp.id, inp.getAttribute('aria-label') || '',
@@ -8190,8 +8272,8 @@
     };
     const clickNow = () => {
       const btn = $$('button,a').find(el =>
-        /apply on company site|apply externally|apply now/i.test(el.textContent) ||
-        el.getAttribute('data-testid') === 'company-site-apply-button'
+        (/apply on company site|apply externally|apply now/i.test(el.textContent) ||
+         el.getAttribute('data-testid') === 'company-site-apply-button') && !neverClick(el)
       );
       if (btn) { LOG('Indeed: clicking Apply on company site'); realClick(btn); }
 
@@ -8296,7 +8378,7 @@
     const tryClick = () => {
       if (clicked) return;
       const btn = $$('a,button').find(el =>
-        /apply directly|apply now|apply for this/i.test(el.textContent)
+        /apply directly|apply now|apply for this/i.test(el.textContent) && !neverClick(el)
       );
       if (btn) {
         clicked = true;
@@ -8347,7 +8429,7 @@
 
     // Try to click continue/next on single-page Ashby forms
     const submitBtn = $$('button[type="submit"],button').find(el =>
-      isVisible(el) && /submit|apply|send.*application/i.test(el.textContent)
+      isVisible(el) && /submit|apply|send.*application/i.test(el.textContent) && !neverClick(el)
     );
     if (submitBtn && !autoSubmitBlockedHere()) { await sleep(400); realClick(submitBtn); }
   }
@@ -8662,13 +8744,20 @@
     const p = await getProfile();
     LOG('Paylocity: filling');
 
+    /* "Fill out application with my resume" starts ticked: the site would then overwrite the
+       form from the CV (name in capitals, a mangled phone). Untick it. (Site notes after AIHawk.) */
+    const fromCv = document.getElementById('useAttachedResumeToFillOutApplication');
+    if (fromCv && fromCv.checked) { realClick(fromCv); if (fromCv.checked) { fromCv.checked = false; fromCv.dispatchEvent(new Event('change', { bubbles: true })); } LOG('Paylocity: unticked "Fill out application with my resume"'); }
+    /* Its phone boxes refuse spaces ("Invalid phone number format"): +447700900123. */
+    const phone = String(p.phone || '').replace(/[^\d+]/g, '');
+
     const PAY_MAP = [
-      ['input[id*="FirstName"],input[name*="FirstName"],input[placeholder*="First Name"]', p.first_name],
-      ['input[id*="LastName"],input[name*="LastName"],input[placeholder*="Last Name"]',     p.last_name],
-      ['input[type="email"],input[id*="Email"],input[name*="Email"]',                       p.email],
-      ['input[type="tel"],input[id*="Phone"],input[name*="Phone"]',                         p.phone],
-      ['input[id*="City"],input[name*="City"]',                                             p.city],
-      ['input[id*="Zip"],input[id*="PostalCode"],input[name*="Zip"]',                      p.postal_code || ''],
+      ['input[id="info.firstName"],input[id*="FirstName" i],input[name*="FirstName" i],input[placeholder*="First Name" i]', p.first_name],
+      ['input[id="info.lastName"],input[id*="LastName" i],input[name*="LastName" i],input[placeholder*="Last Name" i]',     p.last_name],
+      ['input[id="info.email"],input[type="email"],input[id*="Email" i],input[name*="Email" i]',                         p.email],
+      ['input[id="info.cellPhone"],input[id="info.phone"],input[type="tel"],input[id*="Phone" i],input[name*="Phone" i]', phone],
+      ['input[id="public-site-address-city"],input[id*="City" i],input[name*="City" i]',                                  p.city],
+      ['input[id="public-site-address-zip"],input[id*="Zip" i],input[id*="PostalCode" i],input[name*="Zip" i]',           String(p.postal_code || '').slice(0, 10)],
       ['input[id*="LinkedIn"],input[name*="LinkedIn"]',                                    p.linkedin_profile_url || ''],
       ['textarea[id*="CoverLetter"],textarea[id*="Summary"]',                               p.cover_letter || DEFAULTS.cover],
     ];
@@ -8968,10 +9057,16 @@
      Paylocity's parser wrote the name in capitals and the phone as
      "+353: 0874261508"; SAP SuccessFactors and BrassRing loaded an old
      name, phone and London address. On the sites that prefill like this,
-     a filled identity box is compared with your profile and corrected —
-     once per box, so a site that reformats the value is not fought. */
-  const PREFILL_REPAIR_ATS = ['SuccessFactors', 'BrassRing', 'Paylocity', 'ADP', 'iCIMS', 'OracleCloud', 'Taleo', 'ZohoRecruit', 'JOIN', 'Dayforce'];
-  const _prefillRepaired = new WeakSet();
+     a filled identity box is compared with your profile and corrected.
+     Again after the CV upload on sites that fill the form from the CV (a
+     box changed after ours), but twice per box at most, so a site that
+     reformats the value is not fought. */
+  const PREFILL_REPAIR_ATS = ['SuccessFactors', 'BrassRing', 'Paylocity', 'ADP', 'iCIMS', 'OracleCloud', 'Taleo', 'ZohoRecruit', 'JOIN', 'Dayforce',
+    /* These fill the form from the CV once it is uploaded, and get the name, phone or city wrong at times. */
+    'Lever', 'Ashby', 'Workable', 'SmartRecruiters', 'BreezyHR', 'Teamtailor', 'Recruitee', 'Personio'];
+  /* field → { n: times repaired, v: what was put there }: a field is put right again only when its
+     value changed after ours (a site filling the form from the CV after the upload), twice at most. */
+  const _prefillRepaired = new WeakMap();
   function nationalDigits(v, dial) {
     let d = String(v || '').replace(/\D/g, '');
     if (dial && d.startsWith(dial) && d.length > dial.length + 6) d = d.slice(dial.length);
@@ -8992,14 +9087,18 @@
     ];
     let fixed = 0;
     for (const el of $$('input[type="text"],input[type="tel"],input:not([type])')) {
-      if (_prefillRepaired.has(el) || !isVisible(el) || el.disabled || el.readOnly || isTrapField(el)) continue;
+      const done = _prefillRepaired.get(el);
+      if ((done && (done.n >= 2 || done.v === (el.value || '').trim())) || !isVisible(el) || el.disabled || el.readOnly || isTrapField(el)) continue;
       const cur = (el.value || '').trim();
       if (!cur) continue;
       const label = String(getLabel(el) || el.getAttribute('aria-label') || el.getAttribute('placeholder') || '').replace(/[*:]/g, ' ').replace(/\s+/g, ' ').trim();
       const rule = label && RULES.find(r => r.rx.test(label));
       if (!rule || !rule.want || rule.same(cur, String(rule.want).trim())) continue;
-      _prefillRepaired.add(el);
-      if (nativeSet(el, String(rule.want).trim())) {
+      _prefillRepaired.set(el, { n: ((done && done.n) || 0) + 1, v: String(rule.want).trim() });
+      _repairing = true;
+      let put = false;
+      try { put = nativeSet(el, String(rule.want).trim()); } finally { _repairing = false; }
+      if (put) {
         fixed++;
         LOG(`Prefill repaired: "${label.slice(0, 40)}" was "${cur.slice(0, 40)}"`);
         await sleep(40);
@@ -9338,7 +9437,7 @@
             await sleep(5000);
             const href = location.href.toLowerCase();
             const body = document.body?.textContent?.toLowerCase() || '';
-            const isSuccess = /\/thanks|\/thank-you|\/success|\/confirmation|\/complete|\/submitted|\/applied|\/done/.test(href) ||
+            const isSuccess = /\/thanks|\/thank-you|\/success|\/confirmation|\/complete|\/submitted|\/applied|\/done|[?&]leverappid=/.test(href) ||
               /application submitted|thank you for applying|we.ve received|successfully submitted/.test(body);
             if (isSuccess) { report('done'); } else { report('failed', errType); }
           }
@@ -9353,6 +9452,7 @@
       '/thanks', '/thank-you', '/success', '/confirmation',
       '/complete', '/submitted', '/application-submitted',
       '/applied', '/done', '/thank_you',
+      'leverappid=',                       // Lever, sent on to the company's own site after a send
     ];
     const checkSuccess = () => {
       const href = location.href.toLowerCase();
@@ -9553,7 +9653,7 @@
         const href = location.href.toLowerCase();
         const body = document.body?.textContent?.toLowerCase() || '';
         const isSuccess =
-          /\/thanks|\/thank-you|\/success|\/confirmation|\/complete|\/submitted|\/applied|\/done|\/thank_you/.test(href) ||
+          /\/thanks|\/thank-you|\/success|\/confirmation|\/complete|\/submitted|\/applied|\/done|\/thank_you|[?&]leverappid=/.test(href) ||
           /application submitted|thank you for applying|application received|we.ve received your|your application has been|successfully submitted|application complete|thanks for applying|we have received/.test(body) ||
           !!document.querySelector('#application_confirmation,.application-confirmation,.confirmation-text,[data-automation-id="congratulationsMessage"],[data-automation-id="confirmationMessage"],.posting-confirmation');
 
