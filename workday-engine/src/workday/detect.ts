@@ -95,6 +95,8 @@ export function detectPage(): PageKind {
 
   if (SUBMITTED_RX.test(body) && !next)
     return "submitted";
+  // [oh] After a send the address leaves /apply for /jobTasks/completed/application (AIHawk's Workday notes).
+  if (/\/jobTasks\/completed(\/|$)/i.test(location.pathname)) return "submitted";
 
   if (anyAid("verifyPassword") || anyAid("createAccountSubmit")) return "createAccount";
   if (anyAid("signInSubmit") || (anyAid("password") && anyAid("email"))) return "signIn";
@@ -188,4 +190,24 @@ export function errorMessages(): { text: string; el: HTMLElement }[] {
     if (t && !out.some((o) => o.text === t)) out.push({ text: t, el: e });
   }
   return out;
+}
+
+/**
+ * [oh] Is this posting closed? One request to the JSON the Workday page itself reads
+ * (/wday/cxs/<tenant>/<site>/job/<path>): a closed job answers 403 with errorCode "S22", an open
+ * one 200 with jobPostingInfo — measured on real postings by AIHawk
+ * (github.com/feder-cr/Jobs_Applier_AI_Agent, MIT). true / false, or null when it cannot tell.
+ */
+export async function postingClosed(): Promise<boolean | null> {
+  const m = /^\/(?:[a-z]{2}-[A-Z]{2}\/)?([^/]+)\/job\/(.+?)\/?$/.exec(location.pathname.replace(/\/(apply|applyManually|autofillWithResume|useMyLastApplication)(\/.*)?$/i, ""));
+  if (!m || !/\.myworkdayjobs\.com$/i.test(location.hostname)) return null;
+  try {
+    const res = await fetch(`/wday/cxs/${location.hostname.split(".")[0]}/${m[1]}/job/${m[2]}`, { headers: { Accept: "application/json" }, credentials: "same-origin" });
+    if (res.status === 200) return /jobPostingInfo/.test(await res.text()) ? false : null;
+    if (res.status !== 403) return null;
+    const body = await res.json().catch(() => null);
+    return body && String(body.errorCode || "") === "S22" ? true : null;
+  } catch {
+    return null;
+  }
 }

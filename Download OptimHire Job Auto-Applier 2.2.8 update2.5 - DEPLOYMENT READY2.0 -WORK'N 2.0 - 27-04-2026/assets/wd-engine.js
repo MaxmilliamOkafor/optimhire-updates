@@ -798,7 +798,11 @@
     if (el.matches("input, textarea")) return el;
     return q('textarea, input:not([type="hidden"]):not([type="checkbox"]):not([type="radio"]):not([type="file"])', el);
   }
+  function isBotTrap(el) {
+    return el.getAttribute("data-automation-id") === "beecatcher" || /robots only|do not enter if you'?re human/i.test(el.getAttribute("aria-label") || "");
+  }
   function setNativeValue(el, value) {
+    if (value && isBotTrap(el)) return;
     const proto = el instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
     const setter = Object.getOwnPropertyDescriptor(proto, "value").set;
     el.focus();
@@ -820,7 +824,7 @@
   }
   async function setText(target, value) {
     const el = inputIn(target);
-    if (!el || el.disabled || el.readOnly) return false;
+    if (!el || el.disabled || el.readOnly || isBotTrap(el)) return false;
     const max = Number(el.getAttribute("maxlength")) || 0;
     const v = max > 0 ? value.slice(0, max) : value;
     if (el.value === v) return true;
@@ -1361,6 +1365,7 @@
     if (SOMETHING_WRONG_RX.test(body) && !qa('[data-automation-id^="formField-"]').some(isVisible)) return "somethingWrong";
     if (SUBMITTED_RX.test(body) && !next)
       return "submitted";
+    if (/\/jobTasks\/completed(\/|$)/i.test(location.pathname)) return "submitted";
     if (anyAid("verifyPassword") || anyAid("createAccountSubmit")) return "createAccount";
     if (anyAid("signInSubmit") || anyAid("password") && anyAid("email")) return "signIn";
     if (anyAid("signInWithEmail") && !anyAid("progressActive")) return "signIn";
@@ -1445,6 +1450,19 @@
       if (t && !out.some((o) => o.text === t)) out.push({ text: t, el: e });
     }
     return out;
+  }
+  async function postingClosed() {
+    const m = /^\/(?:[a-z]{2}-[A-Z]{2}\/)?([^/]+)\/job\/(.+?)\/?$/.exec(location.pathname.replace(/\/(apply|applyManually|autofillWithResume|useMyLastApplication)(\/.*)?$/i, ""));
+    if (!m || !/\.myworkdayjobs\.com$/i.test(location.hostname)) return null;
+    try {
+      const res = await fetch(`/wday/cxs/${location.hostname.split(".")[0]}/${m[1]}/job/${m[2]}`, { headers: { Accept: "application/json" }, credentials: "same-origin" });
+      if (res.status === 200) return /jobPostingInfo/.test(await res.text()) ? false : null;
+      if (res.status !== 403) return null;
+      const body = await res.json().catch(() => null);
+      return body && String(body.errorCode || "") === "S22" ? true : null;
+    } catch {
+      return null;
+    }
   }
 
   // src/workday/types.ts
@@ -2980,6 +2998,7 @@ OPTIONS: ${JSON.stringify(options.slice(0, 150))}`
         if (ctx.job) chrome.runtime.sendMessage({ type: "wd:jobCaptured", job: ctx.job }).catch(() => {
         });
         await waitForExternalDocs(ctx);
+        if (await postingClosed() === true) throw new NeedsHuman("This job is closed — Workday says it is no longer posted.");
         const apply = byAid("applyButton") ?? qa("a, button").find((b) => isVisible(b) && APPLY_TEXT_RX.test(text(b))) ?? null;
         if (!apply) throw new NeedsHuman("No Apply button on this posting (it may be closed).");
         ctx.log(`Applying: ${ctx.job?.title ?? "job"}`);
@@ -3122,15 +3141,16 @@ OPTIONS: ${JSON.stringify(options.slice(0, 150))}`
     await humanClick(btn);
     await sleep(500);
     const moved = () => detectPage() !== "review" || errorMessages().length > 0;
-    if (!await waitFor(moved, 3e3, 200).then(() => true, () => false)) {
+    if (!await waitFor(moved, 1e4, 250).then(() => true, () => false)) {
       const again = nextButton();
-      if (again && isSubmitButton(again)) {
+      const busy = !!again && (again.hasAttribute("disabled") || again.getAttribute("aria-disabled") === "true" || qa('[data-automation-id*="loading" i], [data-automation-id*="spinner" i], [role="progressbar"]').some(isVisible));
+      if (again && isSubmitButton(again) && !busy) {
         ctx.log("Submit click didn't register — retrying with a native click", "warn");
         again.click();
         await sleep(500);
       }
     }
-    const outcome = await waitFor(() => detectPage() === "submitted" ? "done" : errorMessages().length ? "error" : null, 3e4, 250).catch(
+    const outcome = await waitFor(() => detectPage() === "submitted" ? "done" : errorMessages().length ? "error" : null, 6e4, 250).catch(
       () => "timeout"
     );
     if (outcome === "done" || outcome === "timeout" && detectPage() !== "review" && !errorMessages().length) {
@@ -4128,7 +4148,7 @@ OPTIONS: ${JSON.stringify(options.slice(0, 150))}`
     let errorType = "failure";
     let missingQuestions = [];
     if (/captcha/i.test(reason)) errorType = "captcha";
-    else if (/no apply button|may be closed|already applied/i.test(reason)) errorType = "jobClosed";
+    else if (/no apply button|may be closed|job is closed|already applied/i.test(reason)) errorType = "jobClosed";
     else if (run.flags.length) {
       errorType = "missing-questions";
       missingQuestions = run.flags.map((f) => ({ question: f.label, name: f.label, reason: f.reason }));

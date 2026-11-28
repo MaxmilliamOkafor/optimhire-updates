@@ -10,7 +10,7 @@
  */
 import { Aborted, NeedsHuman, byAid, humanClick, isVisible, labelOf, qa, setAbort, sleep, text, waitFor, waitStable } from "./dom.js";
 import { enableTrustedFallback, readValue } from "./controls.js";
-import { activeStepName, detectPage, errorMessages, isSubmitButton, jobKeyFor, nextButton, reqIdFromUrl, scrapeJob, tenantHost } from "./detect.js";
+import { activeStepName, detectPage, errorMessages, isSubmitButton, jobKeyFor, nextButton, postingClosed, reqIdFromUrl, scrapeJob, tenantHost } from "./detect.js";
 import { ALREADY_APPLIED_RX, APPLY_TEXT_RX } from "./i18n.js";
 import { handleCreateAccount, handleSignIn } from "./auth.js";
 import { addFlag, type Ctx } from "./context.js";
@@ -233,6 +233,8 @@ async function handlePage(ctx: Ctx, page: PageKind): Promise<StepResult> {
     case "jobPosting": {
       if (ctx.job) chrome.runtime.sendMessage({ type: "wd:jobCaptured", job: ctx.job }).catch(() => {});
       await waitForExternalDocs(ctx);
+      // [oh] A closed job is told by Workday's own JSON, not only by a missing Apply button.
+      if ((await postingClosed()) === true) throw new NeedsHuman("This job is closed — Workday says it is no longer posted.");
       const apply = byAid("applyButton") ?? qa("a, button").find((b) => isVisible(b) && APPLY_TEXT_RX.test(text(b))) ?? null;
       if (!apply) throw new NeedsHuman("No Apply button on this posting (it may be closed).");
       ctx.log(`Applying: ${ctx.job?.title ?? "job"}`);
@@ -386,16 +388,22 @@ async function submitApplication(ctx: Ctx, btn: HTMLElement): Promise<StepResult
   await sleep(500);
   // Same failure as "Add Another": Workday can swallow the synthetic click. If the
   // page hasn't moved and shows no errors, re-find Submit and click it natively.
+  // [oh] But Review can stay on screen, Submit button and all, for some seconds after a send
+  // that went through (AIHawk's Workday notes: read as a refusal just before the address moved
+  // on). So the second click waits 10 s, and only for a Submit button that is not busy.
   const moved = () => detectPage() !== "review" || errorMessages().length > 0;
-  if (!(await waitFor(moved, 3000, 200).then(() => true, () => false))) {
+  if (!(await waitFor(moved, 10000, 250).then(() => true, () => false))) {
     const again = nextButton();
-    if (again && isSubmitButton(again)) {
+    const busy = !!again && (again.hasAttribute("disabled") || again.getAttribute("aria-disabled") === "true" ||
+                             qa('[data-automation-id*="loading" i], [data-automation-id*="spinner" i], [role="progressbar"]').some(isVisible));
+    if (again && isSubmitButton(again) && !busy) {
       ctx.log("Submit click didn't register — retrying with a native click", "warn");
       again.click();
       await sleep(500);
     }
   }
-  const outcome = await waitFor(() => (detectPage() === "submitted" ? "done" : errorMessages().length ? "error" : null), 30000, 250).catch(
+  // [oh] Only errors shown on the page mean it was not received; a slow Review is given a minute.
+  const outcome = await waitFor(() => (detectPage() === "submitted" ? "done" : errorMessages().length ? "error" : null), 60000, 250).catch(
     () => "timeout" as const
   );
   // Gone from Review with no error shown: Workday took it, whatever page it shows next.

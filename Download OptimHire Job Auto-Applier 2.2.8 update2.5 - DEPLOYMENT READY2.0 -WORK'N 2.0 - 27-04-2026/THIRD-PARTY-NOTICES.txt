@@ -8,7 +8,17 @@ which upload box takes the CV and which reads it to fill the form (Ashby, SmartR
 the buttons never to press (sign in / apply through another service, the site's own
 fill-from-CV), sites that fill the form from the CV after the upload (Lever, Ashby, Workable…),
 Paylocity's "Fill out application with my resume" box and phone format, declining cookie
-banners, and Lever's LeverAppId confirmation. No AIHawk code is included.
+banners, and Lever's LeverAppId confirmation.
+
+static/background/queue-runner.js skips closed postings before opening them by the signals
+AIHawk measured on real postings (src/aihawk/liveness.py): Workday's job JSON answering 403 with
+errorCode S22, Lever's 404, Ashby's 404 "Jobs" page, Workable's /oops, BambooHR's job JSON,
+Paylocity's JobNotFound. The Workday engine (assets/wd-engine.js, built from workday-engine/)
+follows AIHawk's Workday notes (src/aihawk/plugins/workday.md): the same closed-job check, the
+robots-only "beecatcher" box never typed into, /jobTasks/completed as a sent application, and a
+Review page that stays on screen for some seconds after a send that went through.
+
+No AIHawk code is included.
 
 MIT License
 

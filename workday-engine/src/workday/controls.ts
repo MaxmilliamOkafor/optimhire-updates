@@ -58,7 +58,14 @@ function inputIn(el: HTMLElement): HTMLInputElement | HTMLTextAreaElement | null
 }
 
 /** Native value setter + the events React's onChange listens for. */
+/** [oh] Workday's robots-only box on its sign-in and account forms (data-automation-id "beecatcher",
+ *  name "website", "This input is for robots only…"): anything typed there marks the visitor a bot. */
+export function isBotTrap(el: Element): boolean {
+  return el.getAttribute("data-automation-id") === "beecatcher" || /robots only|do not enter if you'?re human/i.test(el.getAttribute("aria-label") || "");
+}
+
 export function setNativeValue(el: HTMLInputElement | HTMLTextAreaElement, value: string) {
+  if (value && isBotTrap(el)) return;
   const proto = el instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
   const setter = Object.getOwnPropertyDescriptor(proto, "value")!.set!;
   el.focus();
@@ -84,7 +91,7 @@ async function trustedType(el: HTMLInputElement | HTMLTextAreaElement, value: st
 
 export async function setText(target: HTMLElement, value: string): Promise<boolean> {
   const el = inputIn(target);
-  if (!el || el.disabled || el.readOnly) return false;
+  if (!el || el.disabled || el.readOnly || isBotTrap(el)) return false;
   const max = Number(el.getAttribute("maxlength")) || 0;
   const v = max > 0 ? value.slice(0, max) : value;
   if (el.value === v) return true;
